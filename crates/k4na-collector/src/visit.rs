@@ -1,0 +1,190 @@
+//! Building one visit: accepted frames, raw sampling and final record.
+
+use std::time::Duration;
+
+use k4na_core::aggregate::{PushOutcome, VisitAccumulator};
+use k4na_core::model::{RadioState, RawFrameRecord, TileRef, VisitRecord, VisitStatus};
+use k4na_core::time::Timestamp;
+use k4na_core::units::BinGeometry;
+use k4na_protocol::PanId;
+
+use crate::spectrum::ReceivedFrame;
+
+pub fn new_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// Deterministic raw sampling: the first accepted frame on a pan, then the
+/// first accepted frame at least `interval` after the previous sample.
+#[derive(Debug, Clone)]
+pub struct RawSampler {
+    interval: Option<Duration>,
+    last_mono_ns: Option<u64>,
+}
+
+impl RawSampler {
+    pub fn new(interval_ms: u64) -> Self {
+        Self {
+            interval: (interval_ms > 0).then(|| Duration::from_millis(interval_ms)),
+            last_mono_ns: None,
+        }
+    }
+
+    pub fn policy(&self) -> String {
+        match self.interval {
+            Some(i) => format!(
+                "first accepted frame then >= {} ms apart per pan; deterministic; expendable under storage pressure",
+                i.as_millis()
+            ),
+            None => "disabled".into(),
+        }
+    }
+
+    pub fn due(&mut self, at: Timestamp) -> bool {
+        let Some(interval) = self.interval else { return false };
+        let due = self
+            .last_mono_ns
+            .is_none_or(|last| at.mono_ns.saturating_sub(last) >= interval.as_nanos() as u64);
+        if due {
+            self.last_mono_ns = Some(at.mono_ns);
+        }
+        due
+    }
+}
+
+#[derive(Debug)]
+pub struct VisitBuilder {
+    pub visit_id: String,
+    pub session_id: String,
+    pub pan: PanId,
+    pub started: Timestamp,
+    pub band_id: Option<String>,
+    pub tile: Option<TileRef>,
+    pub requested_vfo_hz: Option<u64>,
+    pub requested_span_hz: Option<u32>,
+    pub usable_fraction: f64,
+    pub settle_ms: u64,
+    pub settle_discarded: u32,
+    pub rejected: u32,
+    pub flags: Vec<String>,
+    max_frames: usize,
+    acc: Option<VisitAccumulator>,
+}
+
+impl VisitBuilder {
+    pub fn new(session_id: &str, pan: PanId, started: Timestamp, usable_fraction: f64, max_frames: usize) -> Self {
+        Self {
+            visit_id: new_id(),
+            session_id: session_id.to_owned(),
+            pan,
+            started,
+            band_id: None,
+            tile: None,
+            requested_vfo_hz: None,
+            requested_span_hz: None,
+            usable_fraction,
+            settle_ms: 0,
+            settle_discarded: 0,
+            rejected: 0,
+            flags: Vec::new(),
+            max_frames,
+            acc: None,
+        }
+    }
+
+    pub fn geometry(&self) -> Option<BinGeometry> {
+        self.acc.as_ref().map(VisitAccumulator::geometry)
+    }
+
+    pub fn frames(&self) -> usize {
+        self.acc.as_ref().map_or(0, VisitAccumulator::frame_count)
+    }
+
+    pub fn first_frame(&self) -> Option<Timestamp> {
+        self.acc.as_ref().and_then(VisitAccumulator::first_frame)
+    }
+
+    pub fn last_frame(&self) -> Option<Timestamp> {
+        self.acc.as_ref().and_then(VisitAccumulator::last_frame)
+    }
+
+    /// Accepts a frame. The first frame fixes the visit's observed geometry.
+    pub fn accept(&mut self, rf: &ReceivedFrame) -> PushOutcome {
+        let acc = self.acc.get_or_insert_with(|| {
+            VisitAccumulator::new(self.pan, BinGeometry::from_header(rf.frame.header()), self.max_frames)
+        });
+        let outcome = acc.push(&rf.frame, rf.at);
+        if outcome != PushOutcome::Accepted {
+            self.rejected += 1;
+        }
+        outcome
+    }
+
+    pub fn flag(&mut self, f: &str) {
+        if !self.flags.iter().any(|x| x == f) {
+            self.flags.push(f.to_owned());
+        }
+    }
+
+    pub fn raw_record(&self, rf: &ReceivedFrame, policy: &str) -> RawFrameRecord {
+        let h = rf.frame.header();
+        RawFrameRecord {
+            session_id: self.session_id.clone(),
+            visit_id: Some(self.visit_id.clone()),
+            received: rf.at,
+            pan: h.pan,
+            sequence: h.sequence,
+            center_hz: h.center_hz,
+            sample_rate_hz: h.sample_rate_hz,
+            sampling_policy: policy.to_owned(),
+            bytes: rf.frame.raw().to_vec(),
+        }
+    }
+
+    /// Finalizes into a record, or `None` if no frame was ever accepted
+    /// (callers record a gap event instead: no data is not a low reading).
+    pub fn finish(
+        mut self,
+        ended: Timestamp,
+        status: VisitStatus,
+        end_reason: &str,
+        radio_state: RadioState,
+    ) -> Option<VisitRecord> {
+        let acc = self.acc.take()?;
+        let geometry = acc.geometry();
+        let first = acc.first_frame();
+        let last = acc.last_frame();
+        let stats = acc.finish();
+        if stats.as_ref().is_some_and(|s| s.identical_frames) {
+            self.flag("identical_frames_possible_freeze");
+        }
+        if stats.as_ref().is_some_and(|s| s.sequence_repeats > 0) {
+            self.flag("repeated_sequence_bytes");
+        }
+        Some(VisitRecord {
+            visit_id: self.visit_id,
+            session_id: self.session_id,
+            pan: self.pan,
+            band_id: self.band_id,
+            tile: self.tile,
+            requested_vfo_hz: self.requested_vfo_hz,
+            requested_span_hz: self.requested_span_hz,
+            geometry,
+            usable_fraction: self.usable_fraction,
+            full: geometry.full_range(),
+            usable: geometry.usable_range(self.usable_fraction),
+            started: self.started,
+            first_frame: first,
+            last_frame: last,
+            ended,
+            settle_ms: self.settle_ms,
+            settle_discarded_frames: self.settle_discarded,
+            rejected_frames: self.rejected,
+            status,
+            flags: self.flags,
+            end_reason: end_reason.to_owned(),
+            radio_state,
+            stats,
+        })
+    }
+}

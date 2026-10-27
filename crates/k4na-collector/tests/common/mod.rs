@@ -1,0 +1,86 @@
+#![allow(dead_code, clippy::unwrap_used)]
+
+use std::path::Path;
+use std::sync::Arc;
+
+use k4na_collector::net::{BoxStream, ConnectFuture, Connector};
+use k4na_collector::runtime::{RunContext, Stop, TokioClock};
+use k4na_collector::store_task::StoreHandle;
+use k4na_core::Config;
+use k4na_core::config::Mode;
+use k4na_core::time::{Clock, NS_PER_SEC};
+use k4na_sim::{SimRadio, serve_cat, serve_pan};
+use k4na_store::{FsSpaceProbe, Store, StoreOptions};
+
+pub const T0: i64 = 1_793_059_200 * NS_PER_SEC; // 2026-10-27T00:00:00Z
+
+#[derive(Debug, Clone, Copy)]
+pub enum Port {
+    Cat,
+    Pan,
+}
+
+/// Connects to the simulator through an in-memory duplex stream.
+#[derive(Debug, Clone)]
+pub struct SimConnector {
+    pub radio: SimRadio,
+    pub port: Port,
+}
+
+impl Connector for SimConnector {
+    fn connect(&self) -> ConnectFuture<'_> {
+        Box::pin(async move {
+            let (client, server) = tokio::io::duplex(256 * 1024);
+            let radio = self.radio.clone();
+            match self.port {
+                Port::Cat => tokio::spawn(serve_cat(radio, server)),
+                Port::Pan => tokio::spawn(serve_pan(radio, server)),
+            };
+            Ok(Box::new(client) as BoxStream)
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!("sim:{:?}", self.port)
+    }
+}
+
+pub fn config(root: &Path, mode: &str) -> Config {
+    let text = include_str!("../../../../config/example.toml")
+        .replace("mode = \"survey\"", &format!("mode = \"{mode}\""))
+        .replace("root = \"./data\"", &format!("root = {:?}", root.display().to_string()))
+        .replace("min_free_bytes = 5368709120", "min_free_bytes = 0");
+    Config::from_toml(&text).unwrap()
+}
+
+pub fn clock() -> Arc<dyn Clock> {
+    Arc::new(TokioClock::simulated(T0))
+}
+
+pub fn ctx<'a>(
+    cfg: &'a Config,
+    store: &'a StoreHandle,
+    clock: &Arc<dyn Clock>,
+    sid: &str,
+    stop: Stop,
+) -> RunContext<'a> {
+    RunContext {
+        cfg,
+        store,
+        clock: clock.clone(),
+        session_id: sid.to_owned(),
+        stop,
+    }
+}
+
+pub fn open_store(cfg: &Config, session_id: &str, mode: Mode, clock: &Arc<dyn Clock>) -> StoreHandle {
+    let info = k4na_collector::session_info(cfg, mode, session_id, clock.now(), vec![], Default::default());
+    let (store, _) = Store::open(
+        StoreOptions::from_config(&cfg.storage),
+        Box::new(FsSpaceProbe),
+        info,
+        clock.now(),
+    )
+    .unwrap();
+    StoreHandle::inline(store)
+}
