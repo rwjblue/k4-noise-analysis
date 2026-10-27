@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use k4na_collector::cat::{ControlCat, ReadOnlyCat, RetuneConsent};
+use k4na_collector::cat::{CatQuery, ControlCat, Query, ReadOnlyCat, RetuneConsent};
 use k4na_collector::net::{Connector, TcpConnector};
 use k4na_collector::passive::{CatStateCache, RunSummary, poll_cat_state, run_passive};
 use k4na_collector::runtime::{RunContext, StopHandle, TokioClock, stop_pair};
@@ -94,6 +94,12 @@ enum Cmd {
         /// GET-only preflight and plan preview; sends no setters.
         #[arg(long, conflicts_with = "allow_retune")]
         dry_run: bool,
+    },
+    /// Read every known CAT state value with GET-only queries and print the
+    /// raw responses. Sends no setters.
+    Probe {
+        #[command(flatten)]
+        config: ConfigArgs,
     },
     /// Summarize a data root without the radio (read-only).
     Inspect {
@@ -182,6 +188,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             })
         }
         Cmd::Capture { config, duration } => capture(&config.load()?, duration, json).await,
+        Cmd::Probe { config } => probe(&config.load()?, json).await,
         Cmd::Survey {
             config,
             duration,
@@ -507,6 +514,50 @@ async fn capture(cfg: &Config, duration: Duration, json: bool) -> Result<ExitCod
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// GET-only dump of every known query, raw, for checking CAT formats on a
+/// real radio. Uses the read-only link, which cannot send setters.
+async fn probe(cfg: &Config, json: bool) -> Result<ExitCode> {
+    let (cat_conn, _) = connectors(cfg);
+    let stream = cat_conn
+        .connect()
+        .await
+        .with_context(|| format!("CAT {}", cat_conn.describe()))?;
+    let mut cat = ReadOnlyCat::new(stream, Duration::from_millis(cfg.radio.cat_timeout_ms));
+    let mut values = serde_json::Map::new();
+    // One query at a time so a slow or unanswered command cannot hide others.
+    for q in Query::ALL {
+        let rb = cat
+            .query(&[q])
+            .await
+            .with_context(|| format!("querying {}", q.wire()))?;
+        let v = if q == Query::Revisions {
+            serde_json::json!(rb.revisions)
+        } else {
+            rb.raw(q).map_or(serde_json::Value::Null, |s| serde_json::json!(s))
+        };
+        values.insert(q.prefix().to_owned(), v);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "values": values, "commands_sent": cat.sent() })
+        );
+    } else {
+        println!("probe: GET-only; no setters were sent");
+        for (k, v) in &values {
+            println!(
+                "  {k:<5} {}",
+                if v.is_null() {
+                    "(no answer)".to_owned()
+                } else {
+                    v.to_string()
+                }
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {

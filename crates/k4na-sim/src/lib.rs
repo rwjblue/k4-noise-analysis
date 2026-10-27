@@ -299,6 +299,12 @@ impl SimRadio {
             "#AR" => "#AR0906+081".to_owned(),
             "#AVG" => "#AVG04".to_owned(),
             "#NB" => "#NB0".to_owned(),
+            "#NBL" => "#NBL8".to_owned(),
+            "#PKM" => "#PKM0".to_owned(),
+            "#FPS" => "#FPS15".to_owned(),
+            "NA" => "NA0".to_owned(),
+            "NM" => "NM01760".to_owned(),
+            "OV" => "OV00".to_owned(),
             "PA" => format!("PA{}", m.preamp),
             "RA" => format!("RA{:02}", m.attenuator),
             "GT" => "GT2".to_owned(),
@@ -394,8 +400,10 @@ impl SimRadio {
 fn is_setter(cmd: &str) -> bool {
     let body = cmd.trim_end_matches(';');
     let prefixes = [
-        "#SPN", "#FXT", "#FXA", "#FRZ", "#REF", "#SCL", "#AVG", "#AR", "#NB", "FA", "FB", "BN", "MD", "FT", "DV", "SB",
-        "LK", "RT", "XT", "PA", "RA", "GT", "RG", "NB", "NR", "AR", "AN", "TQ", "OM", "RV", "K4",
+        // Longer prefixes first (`#NBL` before `#NB`).
+        "#NBL", "#PKM", "#FPS", "#SPN", "#FXT", "#FXA", "#FRZ", "#REF", "#SCL", "#AVG", "#AR", "#NB", "FA", "FB", "BN",
+        "MD", "FT", "DV", "SB", "LK", "RT", "XT", "PA", "RA", "GT", "RG", "NB", "NR", "NA", "NM", "OV", "AR", "AN",
+        "TQ", "OM", "RV", "K4",
     ];
     for p in prefixes {
         if let Some(rest) = body.strip_prefix(p) {

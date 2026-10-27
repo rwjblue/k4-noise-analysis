@@ -186,6 +186,31 @@ fn end_to_end_against_tcp_simulator() {
     );
 
     let out = k4na()
+        .args(["--json", "probe", "--config"])
+        .arg(&survey)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let probe: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(probe["values"]["K4"], "0", "{probe}");
+    assert_eq!(probe["values"]["#NBL"], "8", "{probe}");
+    assert!(
+        probe["commands_sent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.as_str().unwrap().len() <= 5),
+        "GET forms only: {probe}"
+    );
+    assert!(
+        radio.setters_received().is_empty(),
+        "probe sent {:?}",
+        radio.setters_received()
+    );
+
+    let out = k4na()
         .args(["--json", "survey", "--allow-retune", "--duration", "12s", "--config"])
         .arg(&survey)
         .assert()

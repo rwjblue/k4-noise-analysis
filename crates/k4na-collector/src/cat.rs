@@ -55,10 +55,16 @@ pub enum Query {
     NoiseReduction,
     RxAntenna,
     TxAntenna,
+    AutoNotch,
+    ManualNotch,
+    PanNoiseBlankerLevel,
+    PeakMode,
+    FramesPerSecond,
+    Overflow,
 }
 
 impl Query {
-    pub const ALL: [Query; 31] = [
+    pub const ALL: [Query; 37] = [
         Query::Identify,
         Query::OptionModules,
         Query::Revisions,
@@ -90,6 +96,12 @@ impl Query {
         Query::NoiseReduction,
         Query::RxAntenna,
         Query::TxAntenna,
+        Query::AutoNotch,
+        Query::ManualNotch,
+        Query::PanNoiseBlankerLevel,
+        Query::PeakMode,
+        Query::FramesPerSecond,
+        Query::Overflow,
     ];
 
     /// State recorded with each visit for comparability segments.
@@ -153,6 +165,12 @@ impl Query {
             Query::NoiseReduction => "NR",
             Query::RxAntenna => "AR",
             Query::TxAntenna => "AN",
+            Query::AutoNotch => "NA",
+            Query::ManualNotch => "NM",
+            Query::PanNoiseBlankerLevel => "#NBL",
+            Query::PeakMode => "#PKM",
+            Query::FramesPerSecond => "#FPS",
+            Query::Overflow => "OV",
         }
     }
 
