@@ -245,7 +245,10 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   the band's own `FA`, `#SPN`, `#FXT` and `AR`, then applies track mode
   and the profile span with `FA`. Before leaving a band, holding between
   cycles or restoring, it puts those settings back (a `state_changed`
-  event), so every band's memory is as the operator left it. A band that
+  event), so every band's memory is as the operator left it. A recalled
+  value the whitelist cannot send (30 m stored `#SPN5000`, below the
+  documented 6000) is left as the survey set it, with a `warning`. A band
+  that
   recalls a fixed pan without `set_pan_track_mode` ends the survey
   (restoring) instead of measuring it.
 - Cadence: a cycle visits every tile once per antenna. `min_cycle_ms` is
@@ -268,7 +271,8 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
 - Any transmit, unreadable TQ, or difference from the baseline is operator
   activity. The survey **stops** with no further setters and leaves the
   radio alone. Resuming means starting a new run (manual resume).
-- Lost CAT means unknown radio state: no retune and no restore.
+- Lost CAT means unknown radio state: no retune and no restore. A setter
+  the whitelist refuses locally (nothing sent) is a conflict.
 - The plan is built from the packet rate observed after a probe tune and
   rebuilt if the rate changes. The pan-center offset from FA is learned
   from headers, with up to `collection.max_tile_corrections` (default 2)
@@ -288,19 +292,27 @@ not stored. Disconnects and stalls become `gap` events with intervals.
 
 ### Observed on a K4D (firmware R39)
 
-Short live runs (5-minute passive capture; two survey passes on 80/40/20
-with RX ANT IN1) observed:
+Live runs on 2026-10-27 (5-minute passive capture; three 80-10 m survey
+passes on RX ANT IN1; two 80-10 m passes on RX ANT IN1, ATU ANT1 and ATU
+ANT2 with `AR` switching; about 500 visits) observed:
 - The LAN stream decoded with no CRC or header errors; pans A, B and Y
   were all sent.
 - `TQ`, `#FRZ`, `RV`, `AR` (`4` for RX ANT IN1) and `AN` were answered.
 - The pan was fixed (`#FXT1`) and its center was not FA (-7.8 kHz);
   survey needed `set_pan_track_mode = true`.
-- `BN` recalled each band's own `#SPN` (80 m 92000, 40 m 22000, 20 m
-  40000) and so the packet rate (192 vs 96 kHz). Re-applying `#SPN40000`
+- `BN` recalled each band's own `#SPN` (80 m 92000, 40 m 22000, 30 m
+  5000, 20 m 40000) and so the packet rate (192 vs 96 kHz). Re-applying `#SPN40000`
   gave 96 kHz on every band; `#REF` and preamp also differ per band and
   are recorded, not changed.
 - `FA` readback matched the 100 Hz-aligned command; headers verified
   coverage of every tile; about 12 frames were discarded per settle.
+- `AR5` and `AR6` (with a KAT4) were accepted and read back as set; `AN`
+  stayed 2 throughout. Every band visited recalled `AR4`, so per-band RX
+  input memory was neither shown nor ruled out.
+- A full 80-10 m pass took 289 s on one antenna and 861 s on three.
+- Median levels differed by antenna by 3-20 native units per band. These
+  are uncalibrated readings that include each input's gain (a LoG has
+  low output), so they do not rank antennas by signal-to-noise.
 
 ### Unverified on hardware
 
@@ -310,11 +322,9 @@ K4. Do not treat them as K4 behavior:
 - The 700 ms settle discards every pre-retune frame (header checks
   passed, but level settling after preamp/`#REF` recall is unmeasured).
 - That `BN` recalls a per-band RX input (the simulator models this).
-- `AR5`-`AR7` without a KAT4: the simulator rejects them, so the survey
-  stops on readback mismatch; the real radio's behavior is undocumented
-  here.
+- `AR5`-`AR7` without a KAT4 (the simulator rejects them).
 - Whether an `AR` change needs more than the 700 ms settle (relay and
-  AGC recovery), and that it never affects the TX path.
+  AGC recovery).
 - The simulator's ANT2 level offset is synthetic and says nothing about
   real antennas.
 Run a live 5-minute passive capture and a short 80/40/20 survey first.

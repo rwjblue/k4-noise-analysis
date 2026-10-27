@@ -11,9 +11,9 @@ conflating an unverified observation with a hardware guarantee.
 | Milestone | Status |
 | --- | --- |
 | 0. Workspace, fixtures, CI | Done |
-| 1. Parser, passive capture | Done offline; live 5-minute capture open; byte-capped diagnostic dump not yet implemented |
+| 1. Parser, passive capture | Done, including a live 5-minute K4D capture; byte-capped diagnostic dump not yet implemented |
 | 2. Storage, aggregation | Done, including accelerated 24 h under the minimum cap (`mise run long-run`) |
-| 3. Survey | Done against the simulator; live 80/40/20 survey and real 24 h dataset open |
+| 3. Survey | Done; live K4D 80-10 m passes on one and three antennas (see collection.md); real 24 h dataset open |
 | 4. Quality | `k4na inspect` health summary done; troubleshooting guide and golden whole-survey replay open |
 | 5. Analysis | Not started (separate PRs) |
 
