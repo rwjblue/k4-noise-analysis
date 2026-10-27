@@ -1,0 +1,25 @@
+#:schema https://mise.jdx.dev/schema/mise.json
+
+# Single source of truth for the toolchain used locally and in CI.
+# Bump deliberately to the newest stable Rust release.
+[tools]
+rust = { version = "1.99.1", components = "clippy,rustfmt", profile = "minimal" }
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "rustfmt check and clippy with warnings denied"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets --locked -- -D warnings",
+]
+
+[tasks.test]
+description = "Run the full offline test suite"
+run = "cargo test --workspace --locked"
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["lint", "test"]

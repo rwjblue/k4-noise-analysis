@@ -1,0 +1,29 @@
+[package]
+name = "k4na-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+humantime = "2.4.0"
+k4na-collector = { version = "0.1.0", path = "../k4na-collector" }
+k4na-core = { version = "0.1.0", path = "../k4na-core" }
+k4na-protocol = { version = "0.1.0", path = "../k4na-protocol" }
+k4na-sim = { version = "0.1.0", path = "../k4na-sim" }
+k4na-store = { version = "0.1.0", path = "../k4na-store" }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"

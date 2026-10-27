@@ -1,0 +1,25 @@
+[package]
+name = "k4na-collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k4na-core = { version = "0.1.0", path = "../k4na-core" }
+k4na-protocol = { version = "0.1.0", path = "../k4na-protocol" }
+k4na-store = { version = "0.1.0", path = "../k4na-store" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+uuid = { version = "1.29.0", features = ["v4", "v7"] }
+
+[dev-dependencies]
+k4na-sim = { path = "../k4na-sim" }
+tempfile = "3.27.0"
