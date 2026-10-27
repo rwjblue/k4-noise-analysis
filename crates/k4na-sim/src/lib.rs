@@ -215,11 +215,9 @@ impl SimRadio {
     pub fn handle_cat(&self, cmd: &str) -> Option<String> {
         let mut g = self.lock();
         g.commands.push(format!("{cmd};"));
-        if FORBIDDEN_PREFIXES
-            .iter()
-            .any(|p| cmd.starts_with(p) && !(cmd == "AR" || cmd == "PA" || cmd == "RA" || cmd == "MD"))
-        {
-            // GET forms of AR/PA/RA/MD are allowed; anything else is forbidden.
+        if FORBIDDEN_PREFIXES.iter().any(|p| cmd.starts_with(p)) && !matches!(cmd, "AR" | "PA" | "RA" | "MD" | "FB") {
+            // Parameterless GET forms of these are allowed; anything else
+            // in a forbidden family is recorded.
             g.forbidden.push(format!("{cmd};"));
             return Some("?;".into());
         }
