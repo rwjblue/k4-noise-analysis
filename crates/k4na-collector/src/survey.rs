@@ -37,7 +37,7 @@ use crate::visit::{RawSampler, VisitBuilder};
 
 /// State fields that must not change except through the collector's own
 /// setters.
-pub const WATCH: [Query; 12] = [
+pub const WATCH: [Query; 13] = [
     Query::VfoA,
     Query::VfoB,
     Query::Band,
@@ -50,6 +50,7 @@ pub const WATCH: [Query; 12] = [
     Query::Xit,
     Query::Span,
     Query::FixedTune,
+    Query::Freeze,
 ];
 
 /// Must be readable and off before and during a survey.
@@ -110,6 +111,10 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
             Some(true) => problems.push(format!("{} is on (survey needs a simple main-RX setup)", q.prefix())),
             None => problems.push(format!("{} is unreadable", q.prefix())),
         }
+    }
+    // #FRZ may be unsupported; refuse only if it is known to be on.
+    if rb.flag(Query::Freeze) == Some(true) {
+        problems.push("the pan display is frozen (#FRZ1), so frames would not be live".to_owned());
     }
     if rb.u64(Query::VfoA).is_none() || rb.u64(Query::Band).is_none() {
         problems.push("original FA/BN are unreadable, so restoration would be impossible".to_owned());

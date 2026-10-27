@@ -155,8 +155,14 @@ impl VisitBuilder {
         let first = acc.first_frame();
         let last = acc.last_frame();
         let stats = acc.finish();
+        // Bin-identical frames are not a live measurement (frozen pan or
+        // stuck stream): stored, but never as complete coverage.
+        let mut status = status;
+        let mut end_reason = end_reason.to_owned();
         if stats.as_ref().is_some_and(|s| s.identical_frames) {
             self.flag("identical_frames_possible_freeze");
+            status = VisitStatus::Aborted;
+            end_reason = format!("identical frames (pan frozen or stream stuck); {end_reason}");
         }
         if stats.as_ref().is_some_and(|s| s.sequence_repeats > 0) {
             self.flag("repeated_sequence_bytes");
@@ -182,7 +188,7 @@ impl VisitBuilder {
             rejected_frames: self.rejected,
             status,
             flags: self.flags,
-            end_reason: end_reason.to_owned(),
+            end_reason,
             radio_state,
             stats,
         })

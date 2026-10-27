@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use k4na_collector::net::{BoxStream, ConnectFuture, Connector};
 use k4na_collector::runtime::{RunContext, Stop, TokioClock};
@@ -10,7 +11,7 @@ use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::time::{Clock, NS_PER_SEC};
 use k4na_sim::{SimRadio, serve_cat, serve_pan};
-use k4na_store::{FsSpaceProbe, Store, StoreOptions};
+use k4na_store::{FsSpaceProbe, SpaceProbe, Store, StoreOptions};
 
 pub const T0: i64 = 1_793_059_200 * NS_PER_SEC; // 2026-10-27T00:00:00Z
 
@@ -74,13 +75,27 @@ pub fn ctx<'a>(
 }
 
 pub fn open_store(cfg: &Config, session_id: &str, mode: Mode, clock: &Arc<dyn Clock>) -> StoreHandle {
+    open_store_with(cfg, session_id, mode, clock, Box::new(FsSpaceProbe))
+}
+
+pub fn open_store_with(
+    cfg: &Config,
+    session_id: &str,
+    mode: Mode,
+    clock: &Arc<dyn Clock>,
+    probe: Box<dyn SpaceProbe>,
+) -> StoreHandle {
     let info = k4na_collector::session_info(cfg, mode, session_id, clock.now(), vec![], Default::default());
-    let (store, _) = Store::open(
-        StoreOptions::from_config(&cfg.storage),
-        Box::new(FsSpaceProbe),
-        info,
-        clock.now(),
-    )
-    .unwrap();
+    let (store, _) = Store::open(StoreOptions::from_config(&cfg.storage), probe, info, clock.now()).unwrap();
     StoreHandle::inline(store)
+}
+
+/// Free space under test control.
+#[derive(Debug, Clone)]
+pub struct FakeDisk(pub Arc<AtomicU64>);
+
+impl SpaceProbe for FakeDisk {
+    fn available_bytes(&self, _: &Path) -> std::io::Result<u64> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
 }

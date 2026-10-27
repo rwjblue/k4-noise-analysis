@@ -143,6 +143,34 @@ async fn disconnects_stalls_and_corruption_become_explicit_gaps() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn frozen_pan_visits_are_never_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir.path().join("data"), "passive");
+    let radio = SimRadio::new(15);
+    radio.update(|m| m.freeze = true);
+    let clock = clock();
+    let sid = "0190aaaa-0000-7000-8000-000000000004";
+    let store = open_store(&cfg, sid, Mode::Passive, &clock);
+    let (_h, stop) = stop_pair();
+    let mut spec = spectrum(&radio, &clock);
+    let summary = run_passive(
+        ctx(&cfg, &store, &clock, sid, stop),
+        &mut spec,
+        None,
+        Duration::from_secs(25),
+    )
+    .await
+    .unwrap();
+    store.close(clock.now(), &summary.end_reason).await.unwrap();
+    let visits = DataSet::open(&cfg.storage.root).unwrap().visits().unwrap();
+    assert!(visits.len() >= 2);
+    for v in &visits {
+        assert_eq!(v.status, "aborted", "{v:?}");
+        assert!(v.flags.contains("identical_frames_possible_freeze"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn operator_retune_splits_passive_visits() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(&dir.path().join("data"), "passive");

@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::time::Clock;
 use k4na_sim::{RadioModel, SimRadio};
+use k4na_store::SpaceProbe;
 use k4na_store::reader::DataSet;
 
 const ALLOWED_SETTERS: [&str; 4] = ["BN", "FA", "#SPN", "#FXT"];
@@ -43,13 +45,25 @@ async fn control(radio: &SimRadio) -> ControlCat {
 
 /// Runs a survey; `script` may inject operator activity or faults.
 async fn survey(radio: SimRadio, secs: u64, script: impl FnOnce(SimRadio) + Send + 'static) -> Run {
+    survey_with(radio, secs, None, script).await
+}
+
+async fn survey_with(
+    radio: SimRadio,
+    secs: u64,
+    probe: Option<Box<dyn SpaceProbe>>,
+    script: impl FnOnce(SimRadio) + Send + 'static,
+) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(&dir.path().join("data"), "survey");
     let clock: Arc<dyn Clock> = clock();
     let mut cat = control(&radio).await;
     let pre = preflight(&mut cat, &cfg).await.unwrap();
     let sid = "0190bbbb-0000-7000-8000-000000000001";
-    let store = open_store(&cfg, sid, Mode::Survey, &clock);
+    let store = match probe {
+        Some(p) => open_store_with(&cfg, sid, Mode::Survey, &clock, p),
+        None => open_store(&cfg, sid, Mode::Survey, &clock),
+    };
     let opts = SpectrumOptions {
         stall_timeout: Duration::from_secs(2),
         reconnect_initial: Duration::from_millis(500),
@@ -270,6 +284,7 @@ async fn preflight_refuses_unsafe_or_unknown_states_without_setters() {
         ("locked", Box::new(|r: &SimRadio| r.update(|m| m.lock = true))),
         ("no TQ", Box::new(|r: &SimRadio| r.faults(|f| f.no_tq = true))),
         ("no RV", Box::new(|r: &SimRadio| r.faults(|f| f.no_revisions = true))),
+        ("frozen pan", Box::new(|r: &SimRadio| r.update(|m| m.freeze = true))),
     ] {
         let radio = SimRadio::new(15);
         setup(&radio);
@@ -278,4 +293,51 @@ async fn preflight_refuses_unsafe_or_unknown_states_without_setters() {
         assert!(err.contains("refused"), "{name}: {err}");
         assert!(radio.setters_received().is_empty(), "{name}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn freezing_the_pan_mid_survey_is_operator_activity() {
+    let radio = SimRadio::new(15);
+    let (mark, script) = after(30, |r| r.update(|m| m.freeze = true));
+    let run = survey(radio, 600, script).await;
+    assert_eq!(run.report.halt, "conflict");
+    assert!(
+        run.report.summary.end_reason.contains("#FRZ"),
+        "{}",
+        run.report.summary.end_reason
+    );
+    assert_eq!(setters_after(&run.radio, &mark), Vec::<String>::new());
+}
+
+#[tokio::test(start_paused = true)]
+async fn mislabeled_pan_headers_never_count_as_coverage() {
+    let radio = SimRadio::new(15);
+    radio.faults(|f| f.wrong_pan = true);
+    radio.update(|m| m.fixed = true);
+    let run = survey(radio, 600, |_| {}).await;
+    assert_eq!(run.report.halt, "no_spectrum", "{:?}", run.report);
+    assert!(run.report.summary.ignored_frames.get("B").copied().unwrap_or(0) > 0);
+    assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
+    assert!(run.radio.model().fixed, "#FXT restored");
+    let insp = DataSet::open(&run.cfg.storage.root).unwrap().inspect().unwrap();
+    assert_eq!(insp.visits_total, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn low_disk_mid_survey_stops_and_restores() {
+    let free = Arc::new(AtomicU64::new(1 << 40));
+    let f2 = free.clone();
+    let radio = SimRadio::new(15);
+    let run = survey_with(radio, 600, Some(Box::new(FakeDisk(free))), move |_| {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Leave less than the configured headroom.
+            f2.store(1 << 20, Ordering::SeqCst);
+        });
+    })
+    .await;
+    assert_eq!(run.report.halt, "storage", "{:?}", run.report);
+    assert!(run.report.summary.end_reason.contains("storage"));
+    assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
+    assert_eq!(run.radio.model().fa, RadioModel::default().fa);
 }
