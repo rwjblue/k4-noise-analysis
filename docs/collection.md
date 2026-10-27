@@ -58,9 +58,10 @@ Preflight:
    bindings are incompatible, or receiver ownership is uncertain. Detect
    concurrent CAT changes; survey is not a cooperative tuner for QK4.
 3. Snapshot all settings the program intends to modify. Prefer changing
-   only the minimal state needed for coverage. Do not modify the TX antenna
-   or RX antenna routing in the first milestone; require the operator to
-   select the correct protected RX input manually.
+   only the minimal state needed for coverage. Never modify the TX antenna
+   (`AN`). The main-RX input (`AR`) is selected only for profile antennas
+   and only with `collection.allow_rx_antenna_switch = true`; otherwise
+   the operator selects the protected RX input manually.
 4. Check free space and estimated upper bound. Require capacity for at
    least one intended retention window under the configured quota.
 5. Print the planned bands/tiles, expected maximum cycle time and disk
@@ -86,15 +87,42 @@ Runtime:
   optional raw samples only. Still record frame losses/gaps and refuse to
   claim complete coverage when writer/decoder cannot keep up.
 
+## Station file and survey profiles
+
+Configuration is split in two:
+
+- The **station file** (`config/example.toml`) describes the radio, the
+  antenna registry, collection safety and storage. It rarely changes.
+- A **survey profile** (`config/surveys/*.toml`) says what to measure and
+  how often: the antennas (ids from the registry), named frequency ranges,
+  `settle_ms`, `dwell_ms`, `min_cycle_ms` and the requested pan span.
+  `collection.survey_profile` names the default, relative to the station
+  file; `--profile PATH` overrides it for one run. The config digest and
+  the stored session config cover both files.
+
+Example profiles: `hf-full` (80-10 m), `hf-cw-us` (US CW/data segments
+only, so each frequency is revisited more often) and `rx-vs-dxc` (40 and
+20 m on two antennas).
+
+Each registry antenna has an `id`, the K4 main-RX `port` it is wired to
+(`rx-ant-in1`, `rx-ant-in2`, `ant1`, `ant2` or `ant3`; `ant2`/`ant3` need a
+KAT4), a description and a `revision`. Bump the revision when the antenna
+or its feed changes so data from before and after is never mixed. Port
+names follow the K4 Programmer's Reference `AR` values (1 = RX ANT IN2,
+2 = RX uses the TX antenna, 4 = RX ANT IN1, 5/6/7 = ATU RX ANT1/2/3).
+Check which jack each antenna is actually wired to; the collector cannot.
+
 ## Band planner
 
-TOML specifies inclusive lower and exclusive upper RF frequency, band
-identifier and optional weight/priority for each interval. Default band
-ranges are 80 (3.5-4.0 MHz), 40 (7.0-7.3), 30 (10.1-10.15),
-20 (14.0-14.35), 17 (18.068-18.168), 15 (21.0-21.45),
-12 (24.89-24.99), 10 (28.0-29.7); these are proposed measurement
-bounds and are not transmit permissions. Any band can be omitted or
-changed. Do not require occupancy of only CW portions.
+A profile range specifies an id, inclusive lower and exclusive upper RF
+frequency and optional weight. A range can be a whole band or part of one
+(for example `40m-cw`, 7.000-7.125 MHz); its id is stored as each visit's
+`band_id`. The `hf-full` ranges are 80 (3.5-4.0 MHz), 40 (7.0-7.3),
+30 (10.1-10.15), 20 (14.0-14.35), 17 (18.068-18.168), 15 (21.0-21.45),
+12 (24.89-24.99), 10 (28.0-29.7); these are measurement bounds and are
+not transmit permissions. Any range can be omitted or changed. Range ids
+must be unique, and ranges may not overlap and must lie within
+100 kHz-54 MHz.
 
 Planner must discover/validate usable *observed* spectrum width, not
 assume the display span: usable = sample_rate_hz * usable_fraction, default
@@ -104,7 +132,7 @@ centers/modes; reject unsupported or unreachable tiles and record them.
 On change of observed rate, rebuild the remaining plan and log why.
 Each accepted visit records its requested and actual interval.
 
-Start with sample survey settings of 3 seconds dwell plus 700 ms for
+Start with sample survey settings of 5 seconds dwell plus 700 ms for
 tuning/settling. Actual acceptance begins only after a verified fresh PAN
 frame following the CAT retune. The values are tunable, not hardware claims.
 Use band-fair round-robin scheduling so the long 10m interval does not
@@ -160,6 +188,7 @@ k4na estimate --config config.toml --duration 24h
 k4na capture --config config.toml --duration 5m
 k4na survey --config config.toml --duration 24h --dry-run
 k4na survey --config config.toml --duration 24h --allow-retune
+k4na survey --config config.toml --profile surveys/rx-vs-dxc.toml --duration 24h --allow-retune
 k4na inspect --data ./data
 k4na replay --input fixture.bin
 ~~~
@@ -185,17 +214,44 @@ Passive (`capture`):
   loss, host clock jump or stop closes the visit early as `partial`.
   Band attribution comes only from the observed center; passive capture
   never claims band coverage.
+- Passive capture needs exactly one profile antenna (the one the operator
+  says is connected). Each window is attributed by the main-RX `AR`/`AN`
+  readback at window end: the declared antenna, or another registry
+  antenna whose port matches (flag `antenna_from_readback`). Without
+  readback, or for the sub receiver, the window keeps the declared antenna
+  with no observed port and flag `antenna_unverified`. A window whose port
+  changed between start and end is `aborted` with
+  `antenna_changed_during_window`, because the polled readback cannot say
+  when the switch happened.
 
 Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
-- Setters are limited to `BN`, `FA` (rounded to 100 Hz), `#SPN` and
-  `#FXT`. Mode, antennas, gain and display reference are never set.
+- Setters are limited to `BN`, `FA` (rounded to 100 Hz), `#SPN`,
+  `#FXT` and, only with `collection.allow_rx_antenna_switch = true`, `AR`
+  for a main-RX port in the registry (`AR1`, `AR4`-`AR7`). The TX antenna
+  (`AN`), mode, gain and display reference are never set.
+- Antennas: before measuring a tile, the main-RX input read back after
+  `BN`/`FA` must resolve to the profile antenna's port. Otherwise the
+  survey selects it with `AR` (when allowed, then verified by readback; a
+  mismatch stops the survey), or skips the tile with an
+  `antenna_mismatch` event (when not allowed). A band can recall its own
+  RX input, so the check runs after every band change. Before leaving a
+  band or holding between cycles, the survey puts back the input that band
+  had. With several antennas, each band's tiles are visited on the first
+  antenna, then all on the next, so comparisons are minutes apart and
+  `AR` changes at most once per antenna per band. Profiles with more than
+  one antenna require the switching opt-in.
+- Cadence: a cycle visits every tile once per antenna. `min_cycle_ms` is
+  the target start-to-start period. A faster cycle holds the last tile
+  without retuning (still polling the interlock; frames are not stored);
+  a slower one starts the next cycle immediately. Each cycle's actual
+  duration is a `cycle_complete` event and appears in the report.
 - Preflight (GET-only) refuses unless `TQ` reads 0; `LK`, `FT`, `DV`,
   `SB`, `RT`, `XT` read 0; `#FRZ` is not 1; FA/BN are readable; the pan
   is not fixed (`#FXT1`) unless `collection.set_pan_track_mode = true`
   lets the survey switch it to track; and, when
   `require_firmware_readback`, `RV` answered.
 - Before each change the interlock (TQ plus FA, FB, BN, MD, FT, DV, SB,
-  LK, RT, XT, #SPN, #FXT, #FRZ) must equal the baseline. After setters,
+  LK, RT, XT, AR, AN, #SPN, #FXT, #FRZ) must equal the baseline. After setters,
   the full state is read back. The setters must be confirmed, nothing they
   should not affect may move, and the readback becomes the new baseline.
   It is polled every `collection.cat_poll_ms` (default 500 ms) during a
@@ -211,7 +267,8 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   coverage still misses its target becomes a `coverage_unverified` event,
   not a visit. Settle frames are discarded and counted.
 - Clean ends (duration, signal, storage suspension, no usable spectrum)
-  restore the original BN/FA/#SPN/#FXT only if the radio still matches the
+  restore the original BN/FA/#SPN/#FXT, then the original `AR` if the
+  band recalled another input, only if the radio still matches the
   collector's last state. A mode change from band-stack recall is
   reported, not corrected. Nothing is restored on a later restart.
 
@@ -232,6 +289,15 @@ before unattended use. Do not treat them as K4 behavior:
   is supported by the R39 fixtures).
 - `TQ`, `#FRZ` and `RV` are answered on the operator's firmware.
 - The 700 ms settle discards every pre-retune frame.
+- `AR` and `AN` readback formats on the operator's firmware, and that
+  `BN` recalls a per-band RX input (the simulator models this).
+- `AR5`-`AR7` without a KAT4: the simulator rejects them, so the survey
+  stops on readback mismatch; the real radio's behavior is undocumented
+  here.
+- Whether an `AR` change needs more than the 700 ms settle (relay and
+  AGC recovery), and that it never affects the TX path.
+- The simulator's ANT2 level offset is synthetic and says nothing about
+  real antennas.
 Run a live 5-minute passive capture and a short 80/40/20 survey first.
 
 ## Quality gates for a believable baseline

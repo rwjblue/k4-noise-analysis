@@ -50,24 +50,26 @@ fn walkdir(p: &Path) -> Vec<String> {
 }
 
 fn tight_config(root: &Path) -> Config {
-    let text = include_str!("../../../config/example.toml")
-        .replace("root = \"./data\"", &format!("root = {:?}", root.display().to_string()))
-        .replace("min_free_bytes = 5368709120", "min_free_bytes = 0")
+    // Back-to-back cycles (no cadence idle) are the worst case for disk.
+    let text = station(root, "survey")
         .replace("max_total_bytes = 4294967296", "max_total_bytes = 67108864")
         .replace("raw_retention_hours = 48", "raw_retention_hours = 3")
         .replace("summary_retention_days = 30", "summary_retention_days = 1")
         .replace("protected_summary_hours = 24", "protected_summary_hours = 1")
         .replace("shard_duration_minutes = 60", "shard_duration_minutes = 15");
-    let cfg = Config::from_toml(&text).unwrap();
+    let profile = HF_FULL
+        .replace("min_cycle_ms = 300000", "min_cycle_ms = 0")
+        .replace("dwell_ms = 5000", "dwell_ms = 3000");
+    let cfg = Config::from_parts(&text, Some(&profile)).unwrap();
     // The same admission check the CLI runs before opening the store.
     let opts = StoreOptions::from_config(&cfg.storage);
-    let c = &cfg.collection;
+    let p = cfg.profile.as_ref().unwrap();
     let est = estimate(
         &opts,
         1,
-        c.settle_ms + c.dwell_ms + 250,
-        c.dwell_ms,
-        c.raw_sample_interval_ms,
+        p.settle_ms + p.dwell_ms + 250,
+        p.dwell_ms,
+        cfg.collection.raw_sample_interval_ms,
     );
     admission(&opts, &est, 0, 1 << 40).unwrap();
     cfg

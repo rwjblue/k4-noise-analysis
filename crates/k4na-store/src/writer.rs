@@ -433,7 +433,7 @@ impl Store {
                     segment_id,
                     session.session_id,
                     visit.pan.as_str(),
-                    session.antenna_id,
+                    visit.antenna.id,
                     key,
                     serde_json::to_string(&visit.radio_state)?,
                     visit.started.utc_ns
@@ -763,9 +763,8 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
 fn insert_session(conn: &Connection, s: &SessionInfo) -> Result<(), StoreError> {
     conn.execute(
         "INSERT OR IGNORE INTO sessions (session_id, mode, started_utc_ns, program_version, decoder_version, mapping_version,
-            config_digest, config_toml, antenna_id, antenna_revision, antenna_description, antenna_notes, receiver,
-            firmware_json, snapshot_json, units, calibration)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            config_digest, config_toml, profile_id, antennas_json, receiver, firmware_json, snapshot_json, units, calibration)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             s.session_id,
             s.mode.as_str(),
@@ -775,10 +774,8 @@ fn insert_session(conn: &Connection, s: &SessionInfo) -> Result<(), StoreError> 
             s.mapping_version,
             s.config_digest,
             s.config_toml,
-            s.antenna_id,
-            s.antenna_revision,
-            s.antenna_description,
-            s.antenna_notes,
+            s.profile_id,
+            serde_json::to_string(&s.antennas)?,
             s.receiver,
             serde_json::to_string(&s.firmware)?,
             serde_json::to_string(&s.snapshot)?,
@@ -800,9 +797,10 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
             requested_vfo_hz, requested_span_hz, center_hz, sample_rate_hz, bin_count, usable_fraction, full_low_hz, full_high_hz,
             actual_low_hz, actual_high_hz, started_utc_ns, started_mono_ns, first_utc_ns, first_mono_ns, last_utc_ns, last_mono_ns,
             ended_utc_ns, ended_mono_ns, settle_ms, settle_discarded, accepted_frames, rejected_frames, status, flags, end_reason,
-            noise_field_min, noise_field_median, noise_field_max, sequence_repeats, radio_state_json)
+            noise_field_min, noise_field_median, noise_field_max, sequence_repeats, antenna_id, antenna_revision, antenna_port,
+            antenna_observed_port, radio_state_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
         params![
             v.visit_id,
             v.session_id,
@@ -842,6 +840,10 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
             s.map(|s| s.noise_field_median),
             s.map(|s| s.noise_field_max),
             s.map(|s| s.sequence_repeats),
+            v.antenna.id,
+            v.antenna.revision,
+            v.antenna.port.as_str(),
+            v.antenna.observed_port.map(|p| p.as_str()),
             serde_json::to_string(&v.radio_state)?
         ],
     )?;

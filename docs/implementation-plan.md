@@ -88,6 +88,12 @@ the data root are removed.
   explicit stop/pause conditions. Streaming summaries per visit.
 - Cover 80/40/30/20/17/15/12/10m example configuration, including
   the upper 10m band if requested.
+- Survey profiles separate from the station file: named ranges (whole
+  bands or segments), `min_cycle_ms` cadence and antenna choice.
+  Implemented; real-radio cadence and `AR` behavior still unverified.
+- Antenna registry with per-visit antenna id/revision/observed port;
+  opt-in, readback-verified main-RX `AR` selection for multi-antenna
+  profiles, per-band input put back. Implemented in the simulator only.
 
 Acceptance: mock K4 exercises cross-band BN/FA, split/diversity conflict,
 human retune, TX activity, frozen PAN, rate change, wrong header, disconnect,

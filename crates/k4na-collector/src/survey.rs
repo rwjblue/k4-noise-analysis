@@ -3,8 +3,14 @@
 //!
 //! Safety contract (docs/collection.md):
 //! * Requires a [`ControlCat`](crate::cat::ControlCat), which only exists
-//!   with both config and CLI consent. Only `BN`, `FA`, `#SPN` and `#FXT`
-//!   can be sent.
+//!   with both config and CLI consent. Only `BN`, `FA`, `#SPN`, `#FXT` and
+//!   (with `collection.allow_rx_antenna_switch`) `AR` can be sent. The TX
+//!   antenna is never changed.
+//! * Every visit is attributed to a profile antenna whose port matches the
+//!   `AR`/`AN` readback. The input is re-read after every band change
+//!   (the K4 may recall a per-band antenna); a band on the wrong input is
+//!   selected with `AR` if allowed, else skipped. The input found on a
+//!   band is put back before leaving it.
 //! * Preflight refuses to start unless transmit state is readable and off,
 //!   lock/split/sub/diversity/RIT/XIT are readable and off, and the original
 //!   FA/BN are known (so restoration is possible).
@@ -15,6 +21,8 @@
 //! * Lost CAT is treated as unknown radio state: no retune, no restore.
 //! * On a clean end the original state is restored only if the radio still
 //!   matches what the collector last set.
+//! * Cycles start at most every `min_cycle_ms`; between cycles the survey
+//!   holds the last tile without retuning and keeps polling the interlock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,13 +30,14 @@ use std::time::Duration;
 use k4na_core::Config;
 use k4na_core::aggregate::PushOutcome;
 use k4na_core::band::k4_band_number;
-use k4na_core::model::{Event, EventKind, RadioState, TileRef, VisitStatus};
+use k4na_core::config::{AntennaConfig, K4Port, SurveyProfile};
+use k4na_core::model::{Event, EventKind, RadioState, TileRef, VisitAntenna, VisitStatus};
 use k4na_core::plan::{SurveyPlan, Tile};
 use k4na_core::time::{Clock, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::{BIN_COUNT, DecoderDiagnostics, PanId};
 
-use crate::cat::{CatControl, CatError, CatQuery, Query, Readback, Setter};
+use crate::cat::{CatControl, CatError, CatQuery, Query, Readback, RxInput, Setter};
 use crate::passive::{RunError, RunSummary};
 use crate::runtime::{RunContext, Stop};
 use crate::spectrum::{ReceivedFrame, SpectrumEvent, SpectrumSource};
@@ -37,7 +46,7 @@ use crate::visit::{RawSampler, VisitBuilder};
 
 /// State fields that must not change except through the collector's own
 /// setters.
-pub const WATCH: [Query; 13] = [
+pub const WATCH: [Query; 15] = [
     Query::VfoA,
     Query::VfoB,
     Query::Band,
@@ -51,6 +60,8 @@ pub const WATCH: [Query; 13] = [
     Query::Span,
     Query::FixedTune,
     Query::Freeze,
+    Query::RxAntenna,
+    Query::TxAntenna,
 ];
 
 /// Must be readable and off before and during a survey.
@@ -125,6 +136,9 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
     if rb.flag(Query::Freeze) == Some(true) {
         problems.push("the pan display is frozen (#FRZ1), so frames would not be live".to_owned());
     }
+    if rb.u64(Query::RxAntenna).is_none() {
+        problems.push("the main RX input (AR) is unreadable, so the antenna cannot be verified".to_owned());
+    }
     if rb.u64(Query::VfoA).is_none() || rb.u64(Query::Band).is_none() {
         problems.push("original FA/BN are unreadable, so restoration would be impossible".to_owned());
     }
@@ -196,10 +210,24 @@ pub struct SurveyReport {
     pub cycles: u64,
     pub tiles_planned: usize,
     pub coverage_unverified: u64,
+    /// Duration of the last complete cycle (start to end, before idling).
+    pub last_cycle_s: Option<f64>,
+    /// Total time spent idling between cycles to honor `min_cycle_ms`.
+    pub idle_s: f64,
+    /// Tiles skipped because the RX input was not the wanted antenna.
+    pub antenna_skips: u64,
 }
 
 struct Survey<'a, S, C> {
     cfg: &'a Config,
+    profile: &'a SurveyProfile,
+    /// Profile antennas in survey order.
+    antennas: Vec<AntennaConfig>,
+    /// `AR` found on the current band before the survey changed it.
+    band_input_found: Option<String>,
+    /// (antenna index, tile index) in visiting order.
+    schedule: Vec<(usize, usize)>,
+    cycle_started: tokio::time::Instant,
     store: &'a StoreHandle,
     clock: Arc<dyn Clock>,
     session_id: String,
@@ -295,8 +323,19 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         for s in setters {
             let ok = match *s {
                 Setter::Band(n) => {
-                    may_change.extend([Query::Band, Query::Mode, Query::VfoB]);
+                    // A band change may recall that band's mode and antennas.
+                    may_change.extend([
+                        Query::Band,
+                        Query::Mode,
+                        Query::VfoB,
+                        Query::RxAntenna,
+                        Query::TxAntenna,
+                    ]);
                     rb.u64(Query::Band) == Some(u64::from(n))
+                }
+                Setter::RxInput(i) => {
+                    may_change.push(Query::RxAntenna);
+                    rb.u64(Query::RxAntenna) == Some(u64::from(i.value()))
                 }
                 Setter::VfoA(hz) => rb.u64(Query::VfoA) == Some(hz),
                 Setter::Span(hz) => {
@@ -330,6 +369,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         if let Some(n) = k4_band_number(fa)
             && self.baseline.u64(Query::Band) != Some(u64::from(n))
         {
+            self.leave_band().await?;
             setters.push(Setter::Band(n));
         }
         setters.push(Setter::VfoA(fa));
@@ -425,7 +465,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// Discards frames until `settle_ms` after the confirmed retune, and
     /// returns the last observed pan geometry.
     async fn settle(&mut self) -> Step<Settled> {
-        let settle_end = tokio::time::Instant::now() + Duration::from_millis(self.cfg.collection.settle_ms);
+        let settle_end = tokio::time::Instant::now() + Duration::from_millis(self.profile.settle_ms);
         let wait_end = settle_end + FRAME_WAIT;
         let mut s = Settled {
             geometry: None,
@@ -471,7 +511,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// Accepts frames for `dwell_ms`, polling the interlock. Returns the
     /// visit and the halt that ended it early, if any.
     async fn dwell(&mut self, mut v: VisitBuilder) -> (VisitBuilder, Option<Halt>) {
-        let dwell_end = tokio::time::Instant::now() + Duration::from_millis(self.cfg.collection.dwell_ms);
+        let dwell_end = tokio::time::Instant::now() + Duration::from_millis(self.profile.dwell_ms);
         let poll = poll_interval(self.cfg);
         let mut next_poll = tokio::time::Instant::now() + poll;
         loop {
@@ -537,7 +577,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             return Ok(false);
         }
         let plan = SurveyPlan::build(
-            &self.cfg.bands,
+            self.cfg.ranges(),
             sample_rate_hz,
             BIN_COUNT as u32,
             self.cfg.collection.usable_fraction,
@@ -545,20 +585,31 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         .map_err(|e| Halt::NoSpectrum(format!("cannot plan with observed sample rate: {e}")))?;
         let rebuilt = self.plan.is_some();
         self.report.tiles_planned = plan.tiles.len();
+        self.schedule = schedule(&plan, self.antennas.len());
         self.plan = Some(plan);
         Ok(rebuilt)
     }
 
     async fn plan_event(&self, rebuilt: bool) -> Step<()> {
         let Some(p) = &self.plan else { return Ok(()) };
-        let c = &self.cfg.collection;
+        let s = self.profile;
+        let busy = p.cycle_duration(s.settle_ms, s.dwell_ms, 250) * self.antennas.len() as u32;
+        let target = Duration::from_millis(s.min_cycle_ms);
         let msg = format!(
-            "{} tiles, {} visits/cycle, observed packet rate {} Hz, usable {} Hz, cycle <= {} s",
+            "{} tiles x {} antenna(s) = {} visits/cycle, observed packet rate {} Hz, usable {} Hz; \
+             cycle needs about {} s, target start-to-start {} s{}",
             p.tiles.len(),
-            p.cycle.len(),
+            self.antennas.len(),
+            self.schedule.len(),
             p.sample_rate_hz,
             p.usable_width_hz,
-            p.cycle_duration(c.settle_ms, c.dwell_ms, 250).as_secs()
+            busy.as_secs(),
+            target.as_secs(),
+            if busy > target {
+                " (cycles will run longer than the target)"
+            } else {
+                ""
+            }
         );
         let kind = if rebuilt {
             EventKind::PlanRebuilt
@@ -568,16 +619,95 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         self.record(self.event(kind, msg).count(p.tiles.len() as u64)).await
     }
 
-    /// Tunes for a center and settles; one learned-offset correction if the
-    /// observed usable span misses `target`.
+    /// The main-RX input resolved from the current baseline readback.
+    fn observed_port(&self) -> Option<K4Port> {
+        K4Port::from_readback(self.baseline.raw(Query::RxAntenna), self.baseline.raw(Query::TxAntenna))
+    }
+
+    /// Ensures the main-RX input is `a`. Returns `false`, having changed
+    /// nothing, when it is not and switching is not allowed.
+    async fn select_antenna(&mut self, a: &AntennaConfig, band: Option<&str>, tile: Option<&str>) -> Step<bool> {
+        if self.observed_port() == Some(a.port) {
+            return Ok(true);
+        }
+        let found = format!(
+            "AR{} AN{}",
+            self.baseline.raw(Query::RxAntenna).unwrap_or("?"),
+            self.baseline.raw(Query::TxAntenna).unwrap_or("?")
+        );
+        if !self.cfg.collection.allow_rx_antenna_switch {
+            let msg = format!(
+                "main RX input is {} ({found}), not antenna {} on {}; tile skipped \
+                 (select it on this band, or set collection.allow_rx_antenna_switch)",
+                self.observed_port().map_or("unknown", K4Port::as_str),
+                a.id,
+                a.port
+            );
+            self.report.antenna_skips += 1;
+            self.record(self.event(EventKind::AntennaMismatch, msg).band(band, tile))
+                .await?;
+            return Ok(false);
+        }
+        if self.band_input_found.is_none() {
+            self.band_input_found = self.baseline.raw(Query::RxAntenna).map(str::to_owned);
+        }
+        let setter = Setter::RxInput(RxInput::for_port(a.port));
+        self.apply(&[setter]).await?;
+        if self.observed_port() != Some(a.port) {
+            let msg = format!("{} did not select port {}", setter.wire(), a.port);
+            self.record(self.event(EventKind::ReadbackMismatch, &msg)).await?;
+            return Err(Halt::Conflict(msg));
+        }
+        let msg = format!(
+            "selected antenna {} ({}) with {} (was {found})",
+            a.id,
+            a.port,
+            setter.wire()
+        );
+        self.record(self.event(EventKind::AntennaSelected, msg).band(band, tile))
+            .await?;
+        Ok(true)
+    }
+
+    /// Puts back the main-RX input found on the current band, if the survey
+    /// changed it. Called before leaving a band and before idling.
+    async fn leave_band(&mut self) -> Step<()> {
+        let Some(found) = self.band_input_found.take() else {
+            return Ok(());
+        };
+        if self.baseline.raw(Query::RxAntenna) == Some(found.as_str()) {
+            return Ok(());
+        }
+        match RxInput::from_readback(&found) {
+            Some(i) => {
+                self.apply(&[Setter::RxInput(i)]).await?;
+                let msg = format!("put back this band's RX input with {}", Setter::RxInput(i).wire());
+                self.record(self.event(EventKind::AntennaSelected, msg)).await
+            }
+            None => {
+                let msg = format!("this band's original RX input AR{found} cannot be selected by the collector");
+                self.record(self.event(EventKind::Warning, msg)).await
+            }
+        }
+    }
+
+    /// Tunes for a center, selects the antenna and settles; up to
+    /// `max_tile_corrections` learned-offset retunes if the observed usable
+    /// span misses `target`. `None` if the antenna could not be selected.
     async fn tune_and_settle(
         &mut self,
         center_hz: u64,
         target: Option<&HzRange>,
+        antenna: Option<&AntennaConfig>,
         band: Option<&str>,
         tile: Option<&str>,
-    ) -> Step<(u64, Settled)> {
+    ) -> Step<Option<(u64, Settled)>> {
         let mut fa = self.tune(center_hz).await?;
+        if let Some(a) = antenna
+            && !self.select_antenna(a, band, tile).await?
+        {
+            return Ok(None);
+        }
         let mut settled = self.settle().await?;
         let mut corrections = 0;
         while let Some(g) = settled.geometry {
@@ -596,13 +726,79 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             self.record(self.event(EventKind::RetuneCorrection, msg).band(band, tile))
                 .await?;
             fa = self.tune(center_hz).await?;
+            if let Some(a) = antenna
+                && !self.select_antenna(a, band, tile).await?
+            {
+                return Ok(None);
+            }
             let again = self.settle().await?;
             settled = Settled {
                 geometry: again.geometry,
                 discarded: settled.discarded + again.discarded,
             };
         }
-        Ok((fa, settled))
+        Ok(Some((fa, settled)))
+    }
+
+    /// Holds the current tile without retuning until `until`, still
+    /// polling the interlock and flushing storage. Frames are not stored.
+    async fn idle(&mut self, until: tokio::time::Instant) -> Step<()> {
+        let poll = poll_interval(self.cfg).max(Duration::from_secs(2));
+        let mut next_check = tokio::time::Instant::now() + poll;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                return Ok(());
+            }
+            if now >= next_check {
+                next_check = now + poll;
+                self.check().await?;
+                self.maybe_tick().await?;
+            }
+            match self.next_event(until.min(next_check)).await? {
+                None => {}
+                Some(SpectrumEvent::Frame(rf)) => {
+                    if !self.note_ignored(&rf) {
+                        self.on_reconnect(rf.at).await?;
+                    }
+                }
+                Some(SpectrumEvent::Connected) => {
+                    self.record(self.event(EventKind::SpectrumConnected, "spectrum stream connected"))
+                        .await?;
+                }
+                Some(SpectrumEvent::Disconnected { reason, stalled }) => self.on_disconnect(reason, stalled).await?,
+            }
+        }
+    }
+
+    /// Records a finished cycle and waits out the rest of `min_cycle_ms`.
+    async fn end_cycle(&mut self) -> Step<()> {
+        let elapsed = self.cycle_started.elapsed();
+        let target = Duration::from_millis(self.profile.min_cycle_ms);
+        self.report.cycles += 1;
+        self.report.last_cycle_s = Some(elapsed.as_secs_f64());
+        let wait = target.saturating_sub(elapsed);
+        let msg = format!(
+            "cycle {} took {:.1} s (target {} s); {}",
+            self.report.cycles,
+            elapsed.as_secs_f64(),
+            target.as_secs(),
+            if wait.is_zero() {
+                "next cycle starts now".to_owned()
+            } else {
+                format!("holding {:.1} s before the next", wait.as_secs_f64())
+            }
+        );
+        self.record(self.event(EventKind::CycleComplete, msg).count(self.report.cycles))
+            .await?;
+        if !wait.is_zero() {
+            self.leave_band().await?;
+            let start = tokio::time::Instant::now();
+            self.idle(start + wait).await?;
+            self.report.idle_s += start.elapsed().as_secs_f64();
+        }
+        self.cycle_started = tokio::time::Instant::now();
+        Ok(())
     }
 
     async fn maybe_tick(&mut self) -> Step<()> {
@@ -616,7 +812,13 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         Ok(())
     }
 
-    async fn finish_visit(&mut self, mut v: VisitBuilder, tile: &Tile, halt: Option<&Halt>) -> Step<()> {
+    async fn finish_visit(
+        &mut self,
+        mut v: VisitBuilder,
+        tile: &Tile,
+        antenna: VisitAntenna,
+        halt: Option<&Halt>,
+    ) -> Step<()> {
         let end = v.last_frame().unwrap_or_else(|| self.now());
         let frames = v.frames();
         let covered = v
@@ -661,7 +863,13 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             );
         }
         let state = self.baseline.to_state(&interlock_queries());
-        if let Some(record) = v.finish(end, status, &reason, state) {
+        if !antenna.verified() {
+            // The interlock watches AR/AN, so this means the dwell's state
+            // was inconsistent; never attribute it as verified.
+            v.flag("antenna_unverified");
+            status = VisitStatus::Aborted;
+        }
+        if let Some(record) = v.finish(end, status, &reason, antenna, state) {
             self.report.summary.visits += 1;
             self.report.summary.accepted_frames += frames as u64;
             self.store.write_visit(record, events).await?;
@@ -676,12 +884,22 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         Ok(())
     }
 
-    async fn visit_tile(&mut self, tile: &Tile) -> Step<()> {
+    async fn visit_tile(&mut self, tile: &Tile, antenna: &AntennaConfig) -> Step<()> {
         let tile_id = tile.id();
         let started = self.now();
-        let (fa, settled) = self
-            .tune_and_settle(tile.center_hz, Some(&tile.target), Some(&tile.band_id), Some(&tile_id))
-            .await?;
+        let Some((fa, settled)) = self
+            .tune_and_settle(
+                tile.center_hz,
+                Some(&tile.target),
+                Some(antenna),
+                Some(&tile.band_id),
+                Some(&tile_id),
+            )
+            .await?
+        else {
+            self.report.coverage_unverified += 1;
+            return Ok(());
+        };
         let Some(g) = settled.geometry else {
             self.report.coverage_unverified += 1;
             let e = self
@@ -722,15 +940,16 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         });
         v.requested_vfo_hz = Some(fa);
         v.requested_span_hz = self.baseline.u64(Query::Span).and_then(|s| u32::try_from(s).ok());
-        v.settle_ms = c.settle_ms;
+        v.settle_ms = self.profile.settle_ms;
         v.settle_discarded = settled.discarded;
+        let visit_antenna = VisitAntenna::configured(antenna, self.observed_port());
         let (v, halt) = self.dwell(v).await;
         // Confirm state at the end of the dwell before calling it complete.
         let halt = match halt {
             Some(h) => Some(h),
             None => self.check().await.err(),
         };
-        self.finish_visit(v, tile, halt.as_ref()).await?;
+        self.finish_visit(v, tile, visit_antenna, halt.as_ref()).await?;
         match halt {
             Some(h) => Err(h),
             None => Ok(()),
@@ -745,10 +964,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         if self.original.flag(Query::FixedTune) == Some(true) && self.cfg.collection.set_pan_track_mode {
             setup.push(Setter::FixedTune(false));
         }
-        if let (Some(span), Some(_)) = (
-            self.cfg.collection.requested_pan_span_hz,
-            self.original.u64(Query::Span),
-        ) && self.original.u64(Query::Span) != Some(u64::from(span))
+        if let (Some(span), Some(_)) = (self.profile.requested_pan_span_hz, self.original.u64(Query::Span))
+            && self.original.u64(Query::Span) != Some(u64::from(span))
         {
             setup.push(Setter::Span(span));
         }
@@ -758,13 +975,17 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         // Probe the observed packet geometry at the first band's center.
         let first = self
             .cfg
-            .bands
+            .ranges()
             .iter()
             .min_by_key(|b| b.low_hz)
-            .ok_or_else(|| Halt::NoSpectrum("no bands".into()))?;
+            .ok_or_else(|| Halt::NoSpectrum("no ranges".into()))?;
         let center = first.range().midpoint();
-        let (_, settled) = self.tune_and_settle(center, None, Some(&first.id), None).await?;
-        let Some(g) = settled.geometry else {
+        // The geometry probe is not stored, so any antenna will do.
+        let settled = self
+            .tune_and_settle(center, None, None, Some(&first.id), None)
+            .await?
+            .map(|(_, s)| s);
+        let Some(g) = settled.and_then(|s| s.geometry) else {
             return Err(Halt::NoSpectrum(
                 "no spectrum frames after tuning; coverage cannot be verified".into(),
             ));
@@ -773,25 +994,28 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         self.plan_event(false).await?;
 
         let mut pos = 0usize;
+        self.cycle_started = tokio::time::Instant::now();
         loop {
             self.time_left()?;
             if self.spectrum_down_since.is_some() {
                 self.wait_for_spectrum().await?;
             }
-            let plan = self.plan.as_ref().ok_or_else(|| Halt::NoSpectrum("no plan".into()))?;
-            if pos >= plan.cycle.len() {
+            if pos >= self.schedule.len() {
                 pos = 0;
-                self.report.cycles += 1;
+                self.end_cycle().await?;
             }
-            let tile = plan.tiles[plan.cycle[pos]].clone();
+            let plan = self.plan.as_ref().ok_or_else(|| Halt::NoSpectrum("no plan".into()))?;
+            let (ant, tile_idx) = self.schedule[pos];
+            let tile = plan.tiles[tile_idx].clone();
             let rate = plan.sample_rate_hz;
-            self.visit_tile(&tile).await?;
+            let antenna = self.antennas[ant].clone();
+            self.visit_tile(&tile, &antenna).await?;
             self.maybe_tick().await?;
             let plan = self.plan.as_ref().ok_or_else(|| Halt::NoSpectrum("no plan".into()))?;
             if plan.sample_rate_hz != rate {
-                // Resume on the nearest tile of the same band in the new plan.
+                // Resume on the nearest tile of the same band and antenna.
                 let idx = plan.tile_matching(&tile.band_id, tile.center_hz).map_or(0, |t| t.index);
-                pos = plan.cycle.iter().position(|i| *i == idx).unwrap_or(0);
+                pos = self.schedule.iter().position(|e| *e == (ant, idx)).unwrap_or(0);
             } else {
                 pos += 1;
             }
@@ -806,6 +1030,33 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
             return msg;
         }
+        if let Err(h) = self.leave_band().await {
+            let msg = format!("not restoring: {}", h.reason());
+            let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
+            return msg;
+        }
+        let mut msg = self.restore_tuning().await;
+        if msg.starts_with("not restoring") {
+            return msg;
+        }
+        // The original band may recall another input; put the original back.
+        if let Some(orig) = self.original.raw(Query::RxAntenna).map(str::to_owned)
+            && self.baseline.raw(Query::RxAntenna) != Some(orig.as_str())
+        {
+            let note = match RxInput::from_readback(&orig) {
+                Some(i) => match self.apply(&[Setter::RxInput(i)]).await {
+                    Ok(()) => format!("; restored {}", Setter::RxInput(i).wire()),
+                    Err(h) => format!("; RX input not restored: {}", h.reason()),
+                },
+                None => format!("; original RX input AR{orig} cannot be selected by the collector"),
+            };
+            msg.push_str(&note);
+            let _ = self.record(self.event(EventKind::RestoreDone, &msg)).await;
+        }
+        msg
+    }
+
+    async fn restore_tuning(&mut self) -> String {
         let mut setters = Vec::new();
         let orig_band = self.original.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
         if let Some(b) = orig_band
@@ -855,6 +1106,27 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     }
 }
 
+/// Visiting order: each band's run of tiles once per antenna (all tiles on
+/// the first antenna, then all on the next), so antennas are compared
+/// minutes apart and the RX input changes at most once per antenna per
+/// band.
+fn schedule(plan: &SurveyPlan, antennas: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < plan.cycle.len() {
+        let band = &plan.tiles[plan.cycle[i]].band_id;
+        let mut j = i;
+        while j < plan.cycle.len() && &plan.tiles[plan.cycle[j]].band_id == band {
+            j += 1;
+        }
+        for a in 0..antennas {
+            out.extend(plan.cycle[i..j].iter().map(|t| (a, *t)));
+        }
+        i = j;
+    }
+    out
+}
+
 fn diff(before: &Readback, after: &Readback, fields: &[Query]) -> Vec<String> {
     fields
         .iter()
@@ -886,8 +1158,23 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
     } = ctx;
     let sampler = RawSampler::new(cfg.collection.raw_sample_interval_ms);
     let policy = sampler.policy();
+    let profile = cfg
+        .profile
+        .as_ref()
+        .ok_or_else(|| RunError::Config("a survey needs a survey profile".into()))?;
+    let antennas: Vec<AntennaConfig> = cfg.survey_antennas().into_iter().cloned().collect();
+    if antennas.is_empty() {
+        return Err(RunError::Config(
+            "the survey profile lists no registered antenna".into(),
+        ));
+    }
     let mut s = Survey {
         cfg,
+        profile,
+        antennas,
+        band_input_found: None,
+        schedule: Vec::new(),
+        cycle_started: tokio::time::Instant::now(),
         store,
         clock: clock.clone(),
         session_id,
@@ -912,14 +1199,24 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
             cycles: 0,
             tiles_planned: 0,
             coverage_unverified: 0,
+            last_cycle_s: None,
+            idle_s: 0.0,
+            antenna_skips: 0,
         },
     };
     store
         .event(s.event(
             EventKind::SessionStart,
             format!(
-                "authorized survey for {} s; setters limited to BN/FA/#SPN/#FXT",
-                duration.as_secs()
+                "authorized survey for {} s with profile {:?} on antenna(s) {}; setters limited to BN/FA/#SPN/#FXT{}",
+                duration.as_secs(),
+                profile.id,
+                profile.antennas.join(", "),
+                if cfg.collection.allow_rx_antenna_switch {
+                    "/AR"
+                } else {
+                    ""
+                }
             ),
         ))
         .await?;

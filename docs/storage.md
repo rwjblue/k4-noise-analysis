@@ -1,7 +1,9 @@
 # On-disk format and bounded retention
 
-Status: implemented (schema version 1) in crates/k4na-store; no migrations
-yet. Readers reject unsupported schema versions.
+Status: implemented (schema version 2) in crates/k4na-store; no migrations
+yet. Readers reject unsupported schema versions. Version 2 moved antenna
+identity from the session to each visit, because one survey session can
+measure several antennas. Version 1 was pre-release and is not read.
 
 ## Why storage must be designed before continuous capture
 
@@ -49,8 +51,10 @@ Meta: format/schema version, creation/finalization time, shard type,
 host-clock metadata, collection software/protocol version and provenance.
 
 Session: session UUID; mode (passive/survey); started/ended UTC; source
-host fingerprint (optional); declared antenna mapping; equipment firmware;
-config hash; start/end reasons. A session can cross shard boundaries.
+host fingerprint (optional); survey profile id; the antennas the session
+could attribute visits to (`antennas_json`: id, port, revision,
+description); equipment firmware; config hash (station plus profile);
+start/end reasons. A session can cross shard boundaries.
 
 State segment: UUID; receiver/pan, physical antenna ID and revision;
 CAT preamp/attenuation, AGC and noise reduction, RF gain when readable;
@@ -64,6 +68,16 @@ interval, requested CAT frequency/span, first/last sample UTC and monotonic
 elapsed, observed center/sample rate/bin count, accepted and rejected
 counts, settle period, actual frequency coverage, completeness flags
 and abort/gap reason. Actual bands are half-open [low_hz, high_hz).
+The `band_id` is the survey profile's range id (for example `40m` or
+`40m-cw`).
+
+Each visit also records its antenna: `antenna_id`, `antenna_revision`,
+`antenna_port` (the registry port) and `antenna_observed_port` (the port
+the `AR`/`AN` readback resolved to, or NULL when no readback was
+available). A NULL observed port carries the `antenna_unverified` flag;
+passive visits attributed from readback to a non-declared antenna carry
+`antenna_from_readback`. A segment never mixes antennas, and inspection
+reports coverage per (band, antenna).
 
 Summary: one row per valid visit and pan, carrying zstd-compressed typed
 arrays of native signed tenths-of-dB per bin: min, p10, p50, p90 and max;
@@ -87,7 +101,8 @@ backpressure, disk ceiling, clock jump, shutdown, etc.), observed
 counts/duration and a redacted message. Never convert unavailable
 time/frequency coverage into low-noise samples.
 
-Suggested indexes: session+time, band+time, antenna+pan+time,
+Implemented indexes include antenna+band+time. Suggested indexes:
+session+time, band+time, antenna+pan+time,
 actual_low/actual_high frequency window and tile ID.
 
 Schema revisions require an explicit migration/export path. Version the

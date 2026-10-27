@@ -46,12 +46,24 @@ impl Connector for SimConnector {
     }
 }
 
-pub fn config(root: &Path, mode: &str) -> Config {
-    let text = include_str!("../../../../config/example.toml")
+pub const STATION: &str = include_str!("../../../../config/example.toml");
+pub const HF_FULL: &str = include_str!("../../../../config/surveys/hf-full.toml");
+pub const RX_VS_DXC: &str = include_str!("../../../../config/surveys/rx-vs-dxc.toml");
+
+pub fn station(root: &Path, mode: &str) -> String {
+    STATION
         .replace("mode = \"survey\"", &format!("mode = \"{mode}\""))
         .replace("root = \"./data\"", &format!("root = {:?}", root.display().to_string()))
-        .replace("min_free_bytes = 5368709120", "min_free_bytes = 0");
-    Config::from_toml(&text).unwrap()
+        .replace("min_free_bytes = 5368709120", "min_free_bytes = 0")
+}
+
+/// The example station with the `hf-full` profile, back-to-back cycles and
+/// a 3 s dwell (cadence has its own tests).
+pub fn config(root: &Path, mode: &str) -> Config {
+    let profile = HF_FULL
+        .replace("min_cycle_ms = 300000", "min_cycle_ms = 0")
+        .replace("dwell_ms = 5000", "dwell_ms = 3000");
+    Config::from_parts(&station(root, mode), Some(&profile)).unwrap()
 }
 
 pub fn clock() -> Arc<dyn Clock> {

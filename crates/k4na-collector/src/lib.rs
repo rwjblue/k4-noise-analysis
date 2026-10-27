@@ -16,8 +16,8 @@ use k4na_core::model::{RadioState, SessionInfo};
 use k4na_core::time::Timestamp;
 
 /// Builds the session record stored in every shard. The stored config is
-/// redacted (no radio host); only the user-chosen antenna label and notes
-/// describe the setup.
+/// redacted (no radio host); only the user-chosen antenna labels and notes
+/// describe the setup. Each visit records its own antenna.
 pub fn session_info(
     cfg: &Config,
     mode: Mode,
@@ -35,10 +35,8 @@ pub fn session_info(
         mapping_version: k4na_core::units::MAPPING_VERSION.to_owned(),
         config_digest: cfg.digest(),
         config_toml: toml::to_string(&cfg.redacted()).unwrap_or_default(),
-        antenna_id: cfg.antenna.id.clone(),
-        antenna_revision: cfg.antenna.revision.clone(),
-        antenna_description: cfg.antenna.description.clone(),
-        antenna_notes: cfg.antenna.notes.clone(),
+        profile_id: cfg.profile.as_ref().map(|p| p.id.clone()),
+        antennas: cfg.antennas.clone(),
         receiver: cfg.radio.receiver.as_str().to_owned(),
         firmware,
         snapshot,

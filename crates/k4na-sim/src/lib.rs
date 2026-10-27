@@ -42,6 +42,36 @@ pub struct RadioModel {
     pub attenuator: u8,
     /// Last FA per band, recalled by `BN` (band stack).
     pub band_stack: BTreeMap<u8, u64>,
+    /// Main-RX input (`AR`): 1 RX ANT IN2, 2 TX antenna, 4 RX ANT IN1,
+    /// 5..=7 ATU ANT1-3.
+    pub rx_input: u8,
+    /// TX antenna (`AN`) 1..=3.
+    pub tx_antenna: u8,
+    /// Last `AR` per band, recalled by `BN` (a stand-in for per-band
+    /// antenna memory; real K4 behavior is unverified).
+    pub band_rx_input: BTreeMap<u8, u8>,
+    /// KAT4 installed: without it `AR5..7` are refused.
+    pub atu: bool,
+}
+
+impl RadioModel {
+    /// The port actually feeding the main receiver, in station-config
+    /// terms.
+    pub fn rx_port(&self) -> Option<&'static str> {
+        let ant = |n: u8| match n {
+            1 => Some("ant1"),
+            2 => Some("ant2"),
+            3 => Some("ant3"),
+            _ => None,
+        };
+        match self.rx_input {
+            1 => Some("rx-ant-in2"),
+            2 => ant(self.tx_antenna),
+            4 => Some("rx-ant-in1"),
+            5..=7 => ant(self.rx_input - 4),
+            _ => None,
+        }
+    }
 }
 
 impl Default for RadioModel {
@@ -80,6 +110,10 @@ impl Default for RadioModel {
             preamp: 1,
             attenuator: 0,
             band_stack,
+            rx_input: 4,
+            tx_antenna: 1,
+            band_rx_input: BTreeMap::new(),
+            atu: true,
         }
     }
 }
@@ -215,7 +249,13 @@ impl SimRadio {
     pub fn handle_cat(&self, cmd: &str) -> Option<String> {
         let mut g = self.lock();
         g.commands.push(format!("{cmd};"));
-        if FORBIDDEN_PREFIXES.iter().any(|p| cmd.starts_with(p)) && !matches!(cmd, "AR" | "PA" | "RA" | "MD" | "FB") {
+        let rx_input_setter = cmd
+            .strip_prefix("AR")
+            .is_some_and(|v| matches!(v, "1" | "2" | "4" | "5" | "6" | "7"));
+        if FORBIDDEN_PREFIXES.iter().any(|p| cmd.starts_with(p))
+            && !matches!(cmd, "AR" | "AN" | "PA" | "RA" | "MD" | "FB")
+            && !rx_input_setter
+        {
             // Parameterless GET forms of these are allowed; anything else
             // in a forbidden family is recorded.
             g.forbidden.push(format!("{cmd};"));
@@ -259,7 +299,8 @@ impl SimRadio {
             "RG" => "RG-00".to_owned(),
             "NB" => "NB0".to_owned(),
             "NR" => "NR0".to_owned(),
-            "AR" => "AR2".to_owned(),
+            "AR" => format!("AR{}", m.rx_input),
+            "AN" => format!("AN{}", m.tx_antenna),
             "RV" => {
                 if faults.no_revisions {
                     return None;
@@ -280,8 +321,18 @@ impl SimRadio {
                         let cur = m.bn;
                         let fa = m.fa;
                         m.band_stack.insert(cur, fa);
+                        let input = m.rx_input;
+                        m.band_rx_input.insert(cur, input);
                         m.bn = v;
                         m.fa = m.band_stack.get(&v).copied().unwrap_or(m.fa);
+                        m.rx_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
+                    }
+                    return None;
+                }
+                if rx_input_setter {
+                    let v: u8 = cmd[2..].parse().unwrap_or(0);
+                    if !m.transmitting && (m.atu || !(5..=7).contains(&v)) {
+                        m.rx_input = v;
                     }
                     return None;
                 }
@@ -310,7 +361,12 @@ impl SimRadio {
         };
         let center = if pan == PanId::A { center } else { 7_074_000 };
         let seed_index = if freeze { 0 } else { frame_index };
-        let bins = synth_bins(center, rate, seed_index);
+        let port = self.lock().model.rx_port();
+        let mut bins = synth_bins(center, rate, seed_index);
+        let offset = port_floor_offset(port);
+        for b in &mut bins {
+            *b = b.saturating_add(offset);
+        }
         let header_pan = if wrong_pan && pan == PanId::A { PanId::B } else { pan };
         let frame = SyntheticFrame {
             sequence,
@@ -328,7 +384,7 @@ fn is_setter(cmd: &str) -> bool {
     let body = cmd.trim_end_matches(';');
     let prefixes = [
         "#SPN", "#FXT", "#FXA", "#FRZ", "#REF", "#SCL", "#AVG", "#AR", "#NB", "FA", "FB", "BN", "MD", "FT", "DV", "SB",
-        "LK", "RT", "XT", "PA", "RA", "GT", "RG", "NB", "NR", "AR", "TQ", "OM", "RV", "K4",
+        "LK", "RT", "XT", "PA", "RA", "GT", "RG", "NB", "NR", "AR", "AN", "TQ", "OM", "RV", "K4",
     ];
     for p in prefixes {
         if let Some(rest) = body.strip_prefix(p) {
@@ -336,6 +392,16 @@ fn is_setter(cmd: &str) -> bool {
         }
     }
     !body.is_empty()
+}
+
+/// Synthetic level offset per RX input, so tests can tell antennas apart:
+/// ANT2 reads 6 dB higher, a disconnected input 40 dB lower.
+pub fn port_floor_offset(port: Option<&str>) -> i16 {
+    match port {
+        Some("ant2") => 60,
+        Some(_) => 0,
+        None => -400,
+    }
 }
 
 /// Deterministic synthetic spectrum: floor near -130 dB (native tenths)

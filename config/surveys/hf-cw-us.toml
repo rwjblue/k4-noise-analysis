@@ -1,0 +1,51 @@
+# Survey profile: only the US (FCC Part 97) CW/data segments of 80-10 m.
+# Segment edges differ by country and license class; check your own band
+# plan. Fewer tiles means each frequency is revisited more often.
+id = "hf-cw-us"
+description = "80-10 m US CW/data segments, receive antenna"
+antennas = ["log-near-house"]
+
+settle_ms = 700
+dwell_ms = 5000
+min_cycle_ms = 300000
+requested_pan_span_hz = 40000
+
+[[ranges]]
+id = "80m-cw"
+low_hz = 3500000
+high_hz = 3600000
+
+[[ranges]]
+id = "40m-cw"
+low_hz = 7000000
+high_hz = 7125000
+
+[[ranges]]
+id = "30m-cw"
+low_hz = 10100000
+high_hz = 10150000
+
+[[ranges]]
+id = "20m-cw"
+low_hz = 14000000
+high_hz = 14150000
+
+[[ranges]]
+id = "17m-cw"
+low_hz = 18068000
+high_hz = 18110000
+
+[[ranges]]
+id = "15m-cw"
+low_hz = 21000000
+high_hz = 21200000
+
+[[ranges]]
+id = "12m-cw"
+low_hz = 24890000
+high_hz = 24930000
+
+[[ranges]]
+id = "10m-cw"
+low_hz = 28000000
+high_hz = 28300000

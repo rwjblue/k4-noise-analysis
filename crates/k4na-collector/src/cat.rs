@@ -2,7 +2,9 @@
 //!
 //! Safety layers:
 //! 1. Callers can only express commands through [`Query`] (GET forms) and
-//!    [`Setter`] (`BN`, `FA`, `#SPN`, `#FXT`). There is no string API.
+//!    [`Setter`] (`BN`, `FA`, `#SPN`, `#FXT`, `AR`). There is no string API.
+//!    `AR` only routes an input to the main receiver; the TX antenna (`AN`)
+//!    can be read but never set.
 //! 2. Every byte sequence is re-validated by [`check_wire`] immediately
 //!    before it reaches the socket. Setters are refused on a read-only link.
 //! 3. A [`ControlCat`] link can only be created with a [`RetuneConsent`],
@@ -52,10 +54,11 @@ pub enum Query {
     NoiseBlanker,
     NoiseReduction,
     RxAntenna,
+    TxAntenna,
 }
 
 impl Query {
-    pub const ALL: [Query; 30] = [
+    pub const ALL: [Query; 31] = [
         Query::Identify,
         Query::OptionModules,
         Query::Revisions,
@@ -86,10 +89,11 @@ impl Query {
         Query::NoiseBlanker,
         Query::NoiseReduction,
         Query::RxAntenna,
+        Query::TxAntenna,
     ];
 
     /// State recorded with each visit for comparability segments.
-    pub const STATE: [Query; 22] = [
+    pub const STATE: [Query; 23] = [
         Query::VfoA,
         Query::Band,
         Query::Mode,
@@ -112,6 +116,7 @@ impl Query {
         Query::Agc,
         Query::RfGain,
         Query::RxAntenna,
+        Query::TxAntenna,
     ];
 
     /// Response prefix, which is also the GET command text.
@@ -147,6 +152,7 @@ impl Query {
             Query::NoiseBlanker => "NB",
             Query::NoiseReduction => "NR",
             Query::RxAntenna => "AR",
+            Query::TxAntenna => "AN",
         }
     }
 
@@ -159,8 +165,35 @@ impl Query {
     }
 }
 
+/// A main-RX input for `AR`. Only 1 (RX ANT IN2), 2 (RX uses the TX
+/// antenna), 4 (RX ANT IN1) and 5..=7 (ATU ANT1-3) can be constructed; never
+/// 0 (disconnect every RX input) or 3 (internal transverter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxInput(u8);
+
+impl RxInput {
+    pub fn for_port(port: k4na_core::config::K4Port) -> Self {
+        Self(port.ar_value())
+    }
+
+    /// A previously read `AR` value, for restoring it.
+    pub fn from_readback(raw: &str) -> Option<Self> {
+        let n: u8 = raw.trim().parse().ok()?;
+        rx_input_ok(n).then_some(Self(n))
+    }
+
+    pub fn value(self) -> u8 {
+        self.0
+    }
+}
+
+fn rx_input_ok(n: u8) -> bool {
+    matches!(n, 1 | 2 | 4..=7)
+}
+
 /// The only radio-state changes the collector can make. Each is reviewed:
-/// band select, VFO A frequency, pan span and pan track/fixed mode.
+/// band select, VFO A frequency, pan span, pan track/fixed mode and the
+/// main-RX input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setter {
     /// `BNnn;` K4 band number 0..=10 (HF/6 m only; no transverter bands).
@@ -171,6 +204,8 @@ pub enum Setter {
     Span(u32),
     /// `#FXT0;` track or `#FXT1;` fixed.
     FixedTune(bool),
+    /// `ARn;` main-RX input (receive routing only).
+    RxInput(RxInput),
 }
 
 impl Setter {
@@ -180,11 +215,12 @@ impl Setter {
             Setter::VfoA(hz) => format!("FA{hz:011};"),
             Setter::Span(hz) => format!("#SPN{hz};"),
             Setter::FixedTune(fixed) => format!("#FXT{};", u8::from(fixed)),
+            Setter::RxInput(i) => format!("AR{};", i.0),
         }
     }
 }
 
-const SETTER_PREFIXES: [&str; 4] = ["BN", "FA", "#SPN", "#FXT"];
+const SETTER_PREFIXES: [&str; 5] = ["BN", "FA", "#SPN", "#FXT", "AR"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatError {
@@ -242,6 +278,7 @@ pub fn check_wire(wire: &str, allow_setters: bool) -> Result<(), CatError> {
             "FA" => params.len() == 11 && (100_000..=54_000_000).contains(&n),
             "#SPN" => (6_000..=368_000).contains(&n),
             "#FXT" => params.len() == 1 && n <= 1,
+            "AR" => params.len() == 1 && rx_input_ok(n as u8),
             _ => false,
         };
         if !ok {
@@ -508,12 +545,24 @@ mod tests {
             Setter::VfoA(14_045_000),
             Setter::Span(40_000),
             Setter::FixedTune(false),
+            Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::RxAntIn1)),
+            Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)),
+            Setter::RxInput(RxInput::from_readback("2").unwrap()),
         ];
         for s in ok {
             check_wire(&s.wire(), true).unwrap();
             assert!(check_wire(&s.wire(), false).is_err(), "{s:?} allowed on read-only link");
         }
         assert_eq!(Setter::VfoA(7_000_000).wire(), "FA00007000000;");
+        assert_eq!(
+            Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)).wire(),
+            "AR6;"
+        );
+        // Disconnect-all and the internal transverter input are not inputs
+        // the collector can select or restore.
+        assert_eq!(RxInput::from_readback("0"), None);
+        assert_eq!(RxInput::from_readback("3"), None);
+        assert_eq!(RxInput::from_readback("8"), None);
         for bad in [
             Setter::Band(11),
             Setter::VfoA(99_999),
@@ -552,8 +601,15 @@ mod tests {
             "MD3;",
             "PA1;",
             "RA1;",
-            "AR1;",
+            "AR0;",
+            "AR3;",
+            "AR8;",
+            "AR12;",
+            "AR/;",
+            "AR$4;",
             "AN1;",
+            "AN2;",
+            "AN/;",
             "#SPN$40000;",
             "#FXA1;",
             "#REF-110;",

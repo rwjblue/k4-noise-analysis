@@ -1,0 +1,25 @@
+# Survey profile: compare the receive antenna with the DXC.
+#
+# Each band is surveyed on every listed antenna in turn (all tiles on the
+# first antenna, then all tiles on the next) so the comparison is minutes
+# apart rather than a whole cycle. Selecting an antenna sends only AR
+# (main RX input); the TX antenna (AN) is never changed. Requires
+# collection.allow_rx_antenna_switch = true in the station file.
+id = "rx-vs-dxc"
+description = "40 and 20 m, receive antenna vs DXC"
+antennas = ["log-near-house", "dxc"]
+
+settle_ms = 700
+dwell_ms = 5000
+min_cycle_ms = 300000
+requested_pan_span_hz = 40000
+
+[[ranges]]
+id = "40m"
+low_hz = 7000000
+high_hz = 7300000
+
+[[ranges]]
+id = "20m"
+low_hz = 14000000
+high_hz = 14350000

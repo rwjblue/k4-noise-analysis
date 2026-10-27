@@ -53,6 +53,10 @@ pub struct VisitRow {
     pub status: String,
     pub flags: String,
     pub end_reason: String,
+    pub antenna_id: String,
+    pub antenna_port: String,
+    /// `None` when the attribution was not verified by readback.
+    pub antenna_observed_port: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,7 +66,9 @@ pub struct SessionRow {
     pub started_utc_ns: i64,
     pub ended_utc_ns: Option<i64>,
     pub end_reason: Option<String>,
-    pub antenna_id: String,
+    pub profile_id: Option<String>,
+    /// Antenna ids the session could attribute visits to.
+    pub antennas: Vec<String>,
     pub receiver: String,
     pub firmware: String,
     pub config_digest: String,
@@ -98,6 +104,7 @@ pub struct RawRow {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BandCoverage {
     pub band_id: String,
+    pub antenna_id: String,
     pub complete_visits: u64,
     pub other_visits: u64,
     pub tiles: u64,
@@ -187,18 +194,20 @@ impl DataSet {
         let mut by_id: BTreeMap<String, SessionRow> = BTreeMap::new();
         for rows in self.each_conn(ShardKind::Summary, |c| {
             let mut st = c.prepare(
-                "SELECT session_id, mode, started_utc_ns, ended_utc_ns, end_reason, antenna_id, receiver, firmware_json,
-                        config_digest, snapshot_json, units, calibration FROM sessions",
+                "SELECT session_id, mode, started_utc_ns, ended_utc_ns, end_reason, antennas_json, receiver, firmware_json,
+                        config_digest, snapshot_json, units, calibration, profile_id FROM sessions",
             )?;
             let rows = st
                 .query_map([], |r| {
+                    let antennas: String = r.get(5)?;
                     Ok(SessionRow {
                         session_id: r.get(0)?,
                         mode: r.get(1)?,
                         started_utc_ns: r.get(2)?,
                         ended_utc_ns: r.get(3)?,
                         end_reason: r.get(4)?,
-                        antenna_id: r.get(5)?,
+                        profile_id: r.get(12)?,
+                        antennas: antenna_ids(&antennas),
                         receiver: r.get(6)?,
                         firmware: r.get(7)?,
                         config_digest: r.get(8)?,
@@ -229,7 +238,8 @@ impl DataSet {
                 let mut st = c.prepare(
                     "SELECT visit_id, session_id, segment_id, pan, band_id, tile_id, target_low_hz, target_high_hz, requested_vfo_hz,
                         center_hz, sample_rate_hz, bin_count, actual_low_hz, actual_high_hz, started_utc_ns, ended_utc_ns,
-                        accepted_frames, rejected_frames, settle_discarded, status, flags, end_reason
+                        accepted_frames, rejected_frames, settle_discarded, status, flags, end_reason, antenna_id, antenna_port,
+                        antenna_observed_port
                      FROM visits ORDER BY started_utc_ns",
                 )?;
                 let rows = st
@@ -257,6 +267,9 @@ impl DataSet {
                             status: r.get(19)?,
                             flags: r.get(20)?,
                             end_reason: r.get(21)?,
+                            antenna_id: r.get(22)?,
+                            antenna_port: r.get(23)?,
+                            antenna_observed_port: r.get(24)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -468,18 +481,34 @@ pub fn union_len(mut ranges: Vec<(i64, i64)>) -> u64 {
     total as u64
 }
 
+fn antenna_ids(json: &str) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Id {
+        id: String,
+    }
+    serde_json::from_str::<Vec<Id>>(json)
+        .map(|v| v.into_iter().map(|a| a.id).collect())
+        .unwrap_or_default()
+}
+
+/// Coverage per (band, antenna): data from different antennas is never
+/// merged.
 fn band_coverage(visits: &[VisitRow]) -> Vec<BandCoverage> {
-    let mut by_band: BTreeMap<String, Vec<&VisitRow>> = BTreeMap::new();
+    let mut by_band: BTreeMap<(String, String), Vec<&VisitRow>> = BTreeMap::new();
     for v in visits {
         by_band
-            .entry(v.band_id.clone().unwrap_or_else(|| "(no band)".into()))
+            .entry((
+                v.band_id.clone().unwrap_or_else(|| "(no band)".into()),
+                v.antenna_id.clone(),
+            ))
             .or_default()
             .push(v);
     }
     let mut out = Vec::new();
-    for (band_id, vs) in by_band {
+    for ((band_id, antenna_id), vs) in by_band {
         let mut c = BandCoverage {
             band_id,
+            antenna_id,
             ..Default::default()
         };
         let mut targets = Vec::new();

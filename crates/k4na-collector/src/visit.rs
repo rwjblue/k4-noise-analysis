@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use k4na_core::aggregate::{PushOutcome, VisitAccumulator};
-use k4na_core::model::{RadioState, RawFrameRecord, TileRef, VisitRecord, VisitStatus};
+use k4na_core::model::{RadioState, RawFrameRecord, TileRef, VisitAntenna, VisitRecord, VisitStatus};
 use k4na_core::time::Timestamp;
 use k4na_core::units::BinGeometry;
 use k4na_protocol::PanId;
@@ -148,6 +148,7 @@ impl VisitBuilder {
         ended: Timestamp,
         status: VisitStatus,
         end_reason: &str,
+        antenna: VisitAntenna,
         radio_state: RadioState,
     ) -> Option<VisitRecord> {
         let acc = self.acc.take()?;
@@ -189,6 +190,7 @@ impl VisitBuilder {
             status,
             flags: self.flags,
             end_reason,
+            antenna,
             radio_state,
             stats,
         })

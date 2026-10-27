@@ -1,6 +1,13 @@
 //! Strict TOML configuration. Unknown keys are errors, and safety-relevant
 //! values that this release does not implement are rejected rather than
 //! silently ignored.
+//!
+//! Two files make up a configuration:
+//! * the **station** file: radio, antenna registry, collection safety and
+//!   storage. It changes rarely.
+//! * a **survey profile**: which antennas and frequency ranges to survey
+//!   and how often. Keep several (whole bands, CW segments only, ...) and
+//!   pick one with `collection.survey_profile` or `--profile`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -14,11 +21,82 @@ use crate::units::HzRange;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub radio: RadioConfig,
-    pub antenna: AntennaConfig,
+    /// Every antenna that can be connected, with the K4 port that proves it
+    /// is selected.
+    pub antennas: Vec<AntennaConfig>,
     pub collection: CollectionConfig,
     pub storage: StorageConfig,
-    #[serde(default)]
-    pub bands: Vec<BandConfig>,
+    /// The loaded survey profile. Never read from the station file; it is
+    /// serialized so the digest and stored session config cover it.
+    #[serde(default, skip_deserializing)]
+    pub profile: Option<SurveyProfile>,
+}
+
+/// A main-receiver RF input on the K4 (HF-6 m).
+///
+/// The K4 Programmer's Reference (checked against the public rev. C15 and
+/// D5 PDFs from ftp.elecraft.com) defines `AR` (main RX antenna)
+/// as 1 = RX ANT IN2, 2 = RX uses the TX antenna, 4 = RX ANT IN1,
+/// 5/6/7 = ATU (KAT4) ANT1/2/3, and `AN` as the TX antenna 1..=3 (also the
+/// RX input when `AR2`). ANT2/ANT3 exist only with a KAT4.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum K4Port {
+    RxAntIn1,
+    RxAntIn2,
+    Ant1,
+    Ant2,
+    Ant3,
+}
+
+impl K4Port {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RxAntIn1 => "rx-ant-in1",
+            Self::RxAntIn2 => "rx-ant-in2",
+            Self::Ant1 => "ant1",
+            Self::Ant2 => "ant2",
+            Self::Ant3 => "ant3",
+        }
+    }
+
+    /// The `AR` value that routes this port to the main receiver without
+    /// touching the TX antenna (`AN` is never set).
+    pub fn ar_value(self) -> u8 {
+        match self {
+            Self::RxAntIn1 => 4,
+            Self::RxAntIn2 => 1,
+            Self::Ant1 => 5,
+            Self::Ant2 => 6,
+            Self::Ant3 => 7,
+        }
+    }
+
+    /// Resolves the main-RX input from raw `AR` and `AN` readbacks. `None`
+    /// for disconnected/transverter inputs or unreadable values.
+    pub fn from_readback(ar: Option<&str>, an: Option<&str>) -> Option<Self> {
+        let tx = || match an?.trim().parse::<u8>().ok()? {
+            1 => Some(Self::Ant1),
+            2 => Some(Self::Ant2),
+            3 => Some(Self::Ant3),
+            _ => None,
+        };
+        match ar?.trim().parse::<u8>().ok()? {
+            1 => Some(Self::RxAntIn2),
+            2 => tx(),
+            4 => Some(Self::RxAntIn1),
+            5 => Some(Self::Ant1),
+            6 => Some(Self::Ant2),
+            7 => Some(Self::Ant3),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for K4Port {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -80,6 +158,9 @@ pub struct RadioConfig {
 #[serde(deny_unknown_fields)]
 pub struct AntennaConfig {
     pub id: String,
+    /// Where it is connected; visits are only attributed to this antenna
+    /// when `AR`/`AN` readback resolves to this port.
+    pub port: K4Port,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -111,19 +192,20 @@ pub struct CollectionConfig {
     /// TOML half of the two-part retune consent (CLI `--allow-retune` is the other).
     #[serde(default)]
     pub allow_retune: bool,
-    /// `#SPN` request; it is NOT the sampled packet width.
+    /// Survey profile file, relative to this station file.
     #[serde(default)]
-    pub requested_pan_span_hz: Option<u32>,
+    pub survey_profile: Option<PathBuf>,
+    /// Permit the survey to select the profile's antennas with `AR` (main
+    /// RX input only; the TX antenna is never changed). Off by default: a
+    /// band whose RX input is not the wanted antenna is then skipped.
+    #[serde(default)]
+    pub allow_rx_antenna_switch: bool,
     /// Permit the survey to set `#FXT0` (track) if the pan is fixed. Off by
     /// default: a fixed pan makes the survey refuse to start instead.
     #[serde(default)]
     pub set_pan_track_mode: bool,
     #[serde(default = "default_usable_fraction")]
     pub usable_fraction: f64,
-    #[serde(default = "default_settle_ms")]
-    pub settle_ms: u64,
-    #[serde(default = "default_dwell_ms")]
-    pub dwell_ms: u64,
     #[serde(default = "yes")]
     pub pause_on_transmit: bool,
     #[serde(default = "yes")]
@@ -186,9 +268,37 @@ pub struct StorageConfig {
     pub raw_resume_fraction: f64,
 }
 
+/// What to survey and how often. Lives in its own file so alternative
+/// surveys can be kept side by side.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct BandConfig {
+pub struct SurveyProfile {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    /// Antenna ids from the station registry. With more than one, each band
+    /// is surveyed on every antenna in turn (needs
+    /// `collection.allow_rx_antenna_switch`).
+    pub antennas: Vec<String>,
+    #[serde(default = "default_settle_ms")]
+    pub settle_ms: u64,
+    #[serde(default = "default_dwell_ms")]
+    pub dwell_ms: u64,
+    /// Target start-to-start period of a full cycle. A faster cycle waits;
+    /// a slower one starts the next immediately. 0 = back-to-back.
+    #[serde(default = "default_min_cycle_ms")]
+    pub min_cycle_ms: u64,
+    /// `#SPN` request; it is NOT the sampled packet width.
+    #[serde(default)]
+    pub requested_pan_span_hz: Option<u32>,
+    pub ranges: Vec<RangeConfig>,
+}
+
+/// A named frequency range to survey: a whole band or part of one. The id
+/// is stored with each visit as its `band_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RangeConfig {
     pub id: String,
     pub low_hz: u64,
     pub high_hz: u64,
@@ -196,7 +306,7 @@ pub struct BandConfig {
     pub weight: u32,
 }
 
-impl BandConfig {
+impl RangeConfig {
     pub fn range(&self) -> HzRange {
         HzRange::new(self.low_hz, self.high_hz)
     }
@@ -236,7 +346,10 @@ fn default_settle_ms() -> u64 {
     700
 }
 fn default_dwell_ms() -> u64 {
-    3000
+    5000
+}
+fn default_min_cycle_ms() -> u64 {
+    300_000
 }
 fn default_raw_interval_ms() -> u64 {
     1000
@@ -301,22 +414,62 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-impl Config {
+fn read(path: &Path) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|e| ConfigError {
+        problems: vec![format!("cannot read {}: {e}", path.display())],
+    })
+}
+
+impl SurveyProfile {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text).map_err(|e| ConfigError {
+        toml::from_str(text).map_err(|e| ConfigError {
+            problems: vec![format!("survey profile: {e}")],
+        })
+    }
+}
+
+impl Config {
+    /// Parses a station file only; `collection.survey_profile` is NOT loaded
+    /// (use [`Config::load`] or [`Config::from_parts`]).
+    pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        Self::from_parts(text, None)
+    }
+
+    /// Parses a station file and an optional survey profile, then validates
+    /// them together.
+    pub fn from_parts(station: &str, profile: Option<&str>) -> Result<Self, ConfigError> {
+        let mut config: Config = toml::from_str(station).map_err(|e| ConfigError {
             problems: vec![e.to_string()],
         })?;
+        config.profile = profile.map(SurveyProfile::from_toml).transpose()?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Loads, parses and validates a config file. Relative storage roots are
-    /// resolved against the current directory, not the config file.
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ConfigError {
-            problems: vec![format!("cannot read {}: {e}", path.display())],
+    /// Loads a station file and its survey profile: `profile` if given
+    /// (relative to the current directory), else `collection.survey_profile`
+    /// (relative to the station file). Relative storage roots are resolved
+    /// against the current directory.
+    pub fn load(path: &Path, profile: Option<&Path>) -> Result<Self, ConfigError> {
+        let station = read(path)?;
+        let parsed: Config = toml::from_str(&station).map_err(|e| ConfigError {
+            problems: vec![e.to_string()],
         })?;
-        Self::from_toml(&text)
+        let profile_path = match profile {
+            Some(p) => Some(p.to_path_buf()),
+            None => parsed
+                .collection
+                .survey_profile
+                .as_ref()
+                .map(|p| path.parent().unwrap_or(Path::new(".")).join(p)),
+        };
+        let profile_text = profile_path.as_deref().map(read).transpose()?;
+        Self::from_parts(&station, profile_text.as_deref()).map_err(|mut e| {
+            if let Some(p) = &profile_path {
+                e.problems.push(format!("(survey profile: {})", p.display()));
+            }
+            e
+        })
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -337,26 +490,22 @@ impl Config {
         if r.cat_timeout_ms < 100 {
             p.push("radio.cat_timeout_ms must be >= 100".into());
         }
-        if self.antenna.id.trim().is_empty() {
-            p.push("antenna.id must not be empty".into());
+        if self.antennas.is_empty() {
+            p.push("at least one [[antennas]] entry is required".into());
+        }
+        let mut antenna_ids = std::collections::BTreeSet::new();
+        for a in &self.antennas {
+            if a.id.trim().is_empty() || a.id.len() > 32 {
+                p.push("antenna ids must be 1..=32 characters".into());
+            }
+            if !antenna_ids.insert(a.id.as_str()) {
+                p.push(format!("duplicate antenna id {:?}", a.id));
+            }
         }
 
         let c = &self.collection;
         if !(0.1..=1.0).contains(&c.usable_fraction) {
             p.push("collection.usable_fraction must be within 0.1..=1.0".into());
-        }
-        if let Some(span) = c.requested_pan_span_hz
-            && !K4_SPAN_RANGE.contains(&span)
-        {
-            p.push(format!(
-                "collection.requested_pan_span_hz {span} outside K4 #SPN range 6000..=368000"
-            ));
-        }
-        if c.dwell_ms < 200 {
-            p.push("collection.dwell_ms must be >= 200".into());
-        }
-        if c.settle_ms < 100 {
-            p.push("collection.settle_ms must be >= 100".into());
         }
         if c.passive_visit_ms < 500 {
             p.push("collection.passive_visit_ms must be >= 500".into());
@@ -399,9 +548,12 @@ impl Config {
             if self.radio.receiver != Receiver::Main {
                 p.push("survey mode supports only radio.receiver = \"main\" in this release".into());
             }
-            if self.bands.is_empty() {
-                p.push("survey mode requires at least one [[bands]] entry".into());
+            if self.profile.is_none() {
+                p.push("survey mode needs a survey profile (collection.survey_profile or --profile)".into());
             }
+        }
+        if let Some(profile) = &self.profile {
+            self.validate_profile(profile, &mut p);
         }
 
         let s = &self.storage;
@@ -433,36 +585,89 @@ impl Config {
             p.push("storage.raw_resume_fraction must be within 0.1..soft_limit_fraction".into());
         }
 
-        let mut ids = std::collections::BTreeSet::new();
-        for b in &self.bands {
-            if !ids.insert(b.id.as_str()) {
-                p.push(format!("duplicate band id {:?}", b.id));
-            }
-            if b.id.trim().is_empty() || b.id.len() > 32 {
-                p.push("band ids must be 1..=32 characters".into());
-            }
-            if b.low_hz >= b.high_hz {
-                p.push(format!("band {}: low_hz must be < high_hz", b.id));
-            }
-            if b.low_hz < K4_MIN_HZ || b.high_hz > K4_MAX_HZ {
-                p.push(format!("band {}: interval must lie within 100 kHz..54 MHz", b.id));
-            }
-            if b.weight == 0 || b.weight > 10 {
-                p.push(format!("band {}: weight must be within 1..=10", b.id));
-            }
-        }
-        let mut sorted: Vec<_> = self.bands.iter().collect();
-        sorted.sort_by_key(|b| b.low_hz);
-        for w in sorted.windows(2) {
-            if w[0].high_hz > w[1].low_hz {
-                p.push(format!("bands {} and {} overlap", w[0].id, w[1].id));
-            }
-        }
-
         if p.is_empty() {
             Ok(())
         } else {
             Err(ConfigError { problems: p })
+        }
+    }
+
+    fn validate_profile(&self, s: &SurveyProfile, p: &mut Vec<String>) {
+        if s.id.trim().is_empty() || s.id.len() > 64 {
+            p.push("profile id must be 1..=64 characters".into());
+        }
+        if s.antennas.is_empty() {
+            p.push("profile antennas must list at least one antenna id".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ports = std::collections::BTreeMap::new();
+        for id in &s.antennas {
+            if !seen.insert(id.as_str()) {
+                p.push(format!("profile lists antenna {id:?} twice"));
+            }
+            match self.antenna(id) {
+                None => p.push(format!(
+                    "profile antenna {id:?} is not in the station [[antennas]] registry"
+                )),
+                Some(a) => {
+                    if let Some(other) = ports.insert(a.port, id.as_str()) {
+                        p.push(format!(
+                            "profile antennas {other:?} and {id:?} share port {} and cannot be told apart",
+                            a.port
+                        ));
+                    }
+                }
+            }
+        }
+        if s.antennas.len() > 1 && !self.collection.allow_rx_antenna_switch {
+            p.push(format!(
+                "profile surveys {} antennas, which needs collection.allow_rx_antenna_switch = true",
+                s.antennas.len()
+            ));
+        }
+        if let Some(span) = s.requested_pan_span_hz
+            && !K4_SPAN_RANGE.contains(&span)
+        {
+            p.push(format!(
+                "profile requested_pan_span_hz {span} outside K4 #SPN range 6000..=368000"
+            ));
+        }
+        if s.dwell_ms < 200 {
+            p.push("profile dwell_ms must be >= 200".into());
+        }
+        if s.settle_ms < 100 {
+            p.push("profile settle_ms must be >= 100".into());
+        }
+        if s.min_cycle_ms > 86_400_000 {
+            p.push("profile min_cycle_ms must be <= 86400000 (one day)".into());
+        }
+        if s.ranges.is_empty() {
+            p.push("profile needs at least one [[ranges]] entry".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for b in &s.ranges {
+            if !ids.insert(b.id.as_str()) {
+                p.push(format!("duplicate range id {:?}", b.id));
+            }
+            if b.id.trim().is_empty() || b.id.len() > 32 {
+                p.push("range ids must be 1..=32 characters".into());
+            }
+            if b.low_hz >= b.high_hz {
+                p.push(format!("range {}: low_hz must be < high_hz", b.id));
+            }
+            if b.low_hz < K4_MIN_HZ || b.high_hz > K4_MAX_HZ {
+                p.push(format!("range {}: interval must lie within 100 kHz..54 MHz", b.id));
+            }
+            if b.weight == 0 || b.weight > 10 {
+                p.push(format!("range {}: weight must be within 1..=10", b.id));
+            }
+        }
+        let mut sorted: Vec<_> = s.ranges.iter().collect();
+        sorted.sort_by_key(|b| b.low_hz);
+        for w in sorted.windows(2) {
+            if w[0].high_hz > w[1].low_hz {
+                p.push(format!("ranges {} and {} overlap", w[0].id, w[1].id));
+            }
         }
     }
 
@@ -482,13 +687,43 @@ impl Config {
         c
     }
 
-    pub fn band(&self, id: &str) -> Option<&BandConfig> {
-        self.bands.iter().find(|b| b.id == id)
+    /// Survey ranges from the loaded profile (empty without one).
+    pub fn ranges(&self) -> &[RangeConfig] {
+        self.profile.as_ref().map_or(&[], |p| p.ranges.as_slice())
     }
 
-    /// The configured band containing `hz`, if any.
-    pub fn band_containing(&self, hz: u64) -> Option<&BandConfig> {
-        self.bands.iter().find(|b| b.range().contains(hz))
+    /// The profile range containing `hz`, if any.
+    pub fn range_containing(&self, hz: u64) -> Option<&RangeConfig> {
+        self.ranges().iter().find(|b| b.range().contains(hz))
+    }
+
+    pub fn antenna(&self, id: &str) -> Option<&AntennaConfig> {
+        self.antennas.iter().find(|a| a.id == id)
+    }
+
+    /// The profile's antennas in survey order.
+    pub fn survey_antennas(&self) -> Vec<&AntennaConfig> {
+        self.profile
+            .iter()
+            .flat_map(|p| p.antennas.iter())
+            .filter_map(|id| self.antenna(id))
+            .collect()
+    }
+
+    /// The antenna passive capture attributes data to: the profile's only
+    /// antenna, or the registry's only antenna without a profile.
+    pub fn passive_antenna(&self) -> Result<&AntennaConfig, String> {
+        let candidates = match &self.profile {
+            Some(_) => self.survey_antennas(),
+            None => self.antennas.iter().collect(),
+        };
+        match candidates.as_slice() {
+            [one] => Ok(one),
+            _ => Err(format!(
+                "passive capture needs exactly one antenna, found {}: use a profile listing one antenna",
+                candidates.len()
+            )),
+        }
     }
 }
 
@@ -497,42 +732,116 @@ mod tests {
     use super::*;
 
     pub(crate) const EXAMPLE: &str = include_str!("../../../config/example.toml");
+    pub(crate) const HF_FULL: &str = include_str!("../../../config/surveys/hf-full.toml");
+    const HF_CW: &str = include_str!("../../../config/surveys/hf-cw-us.toml");
+    const RX_VS_DXC: &str = include_str!("../../../config/surveys/rx-vs-dxc.toml");
+
+    fn example() -> Config {
+        Config::from_parts(EXAMPLE, Some(HF_FULL)).expect("example config")
+    }
 
     #[test]
     fn example_config_is_valid() {
-        let c = Config::from_toml(EXAMPLE).expect("example config");
-        assert_eq!(c.bands.len(), 8);
+        let c = example();
+        assert_eq!(c.ranges().len(), 8);
         assert_eq!(c.collection.mode, Mode::Survey);
         assert_eq!(c.storage.max_total_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(c.radio.receiver, Receiver::Main);
+        let p = c.profile.as_ref().unwrap();
+        assert_eq!((p.dwell_ms, p.min_cycle_ms), (5000, 300_000));
+        assert_eq!(c.passive_antenna().unwrap().port, K4Port::RxAntIn1);
+    }
+
+    #[test]
+    fn example_profiles_are_valid() {
+        let cw = Config::from_parts(EXAMPLE, Some(HF_CW)).expect("cw profile");
+        assert_eq!(cw.range_containing(7_050_000).map(|r| r.id.as_str()), Some("40m-cw"));
+        assert!(cw.range_containing(7_200_000).is_none());
+        // Two antennas need the switching opt-in.
+        let err = Config::from_parts(EXAMPLE, Some(RX_VS_DXC)).unwrap_err();
+        assert!(err.to_string().contains("allow_rx_antenna_switch"), "{err}");
+        let station = EXAMPLE.replace("allow_rx_antenna_switch = false", "allow_rx_antenna_switch = true");
+        let both = Config::from_parts(&station, Some(RX_VS_DXC)).expect("two antennas");
+        let ports: Vec<_> = both.survey_antennas().iter().map(|a| a.port).collect();
+        assert_eq!(ports, [K4Port::RxAntIn1, K4Port::Ant2]);
+        assert!(both.passive_antenna().is_err());
+    }
+
+    #[test]
+    fn survey_mode_needs_a_profile() {
+        let err = Config::from_toml(EXAMPLE).unwrap_err();
+        assert!(err.to_string().contains("survey profile"), "{err}");
+        let passive = EXAMPLE.replace("mode = \"survey\"", "mode = \"passive\"");
+        assert!(Config::from_toml(&passive).is_ok());
+    }
+
+    #[test]
+    fn profile_antennas_must_be_registered() {
+        let bad = HF_FULL.replace("antennas = [\"log-near-house\"]", "antennas = [\"nope\"]");
+        let err = Config::from_parts(EXAMPLE, Some(&bad)).unwrap_err();
+        assert!(err.to_string().contains("registry"), "{err}");
+    }
+
+    #[test]
+    fn load_resolves_the_profile_relative_to_the_station_file() {
+        let dir = std::env::temp_dir().join(format!("k4na-config-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("surveys")).unwrap();
+        std::fs::write(dir.join("station.toml"), EXAMPLE).unwrap();
+        std::fs::write(dir.join("surveys/hf-full.toml"), HF_FULL).unwrap();
+        std::fs::write(dir.join("cw.toml"), HF_CW).unwrap();
+        let c = Config::load(&dir.join("station.toml"), None).unwrap();
+        assert_eq!(c.profile.as_ref().unwrap().id, "hf-full");
+        let c = Config::load(&dir.join("station.toml"), Some(&dir.join("cw.toml"))).unwrap();
+        assert_eq!(c.profile.as_ref().unwrap().id, "hf-cw-us");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ports_resolve_from_ar_and_an() {
+        use K4Port::*;
+        assert_eq!(K4Port::from_readback(Some("4"), Some("1")), Some(RxAntIn1));
+        assert_eq!(K4Port::from_readback(Some("1"), None), Some(RxAntIn2));
+        assert_eq!(K4Port::from_readback(Some("6"), Some("1")), Some(Ant2));
+        assert_eq!(K4Port::from_readback(Some("2"), Some("2")), Some(Ant2));
+        assert_eq!(K4Port::from_readback(Some("2"), None), None);
+        assert_eq!(K4Port::from_readback(Some("0"), Some("1")), None);
+        assert_eq!(K4Port::from_readback(Some("3"), Some("1")), None);
+        for port in [RxAntIn1, RxAntIn2, Ant1, Ant2, Ant3] {
+            let ar = port.ar_value().to_string();
+            assert_eq!(K4Port::from_readback(Some(&ar), Some("1")), Some(port));
+        }
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
         let text = EXAMPLE.replace("[radio]", "[radio]\ncat_script = \"TX;\"");
-        let err = Config::from_toml(&text).unwrap_err();
+        let err = Config::from_parts(&text, Some(HF_FULL)).unwrap_err();
+        assert!(err.to_string().contains("cat_script"), "{err}");
+        let err = Config::from_parts(EXAMPLE, Some(&format!("cat_script = 1\n{HF_FULL}"))).unwrap_err();
         assert!(err.to_string().contains("cat_script"), "{err}");
     }
 
     #[test]
     fn disabling_interlocks_is_rejected() {
         let text = EXAMPLE.replace("pause_on_transmit = true", "pause_on_transmit = false");
-        let err = Config::from_toml(&text).unwrap_err();
+        let err = Config::from_parts(&text, Some(HF_FULL)).unwrap_err();
         assert!(err.to_string().contains("pause_on_transmit"));
     }
 
     #[test]
-    fn overlapping_bands_are_rejected() {
-        let text = EXAMPLE.replace("high_hz = 7300000", "high_hz = 10120000");
-        let err = Config::from_toml(&text).unwrap_err();
+    fn overlapping_ranges_are_rejected() {
+        let text = HF_FULL.replace("high_hz = 7300000", "high_hz = 10120000");
+        let err = Config::from_parts(EXAMPLE, Some(&text)).unwrap_err();
         assert!(err.to_string().contains("overlap"), "{err}");
     }
 
     #[test]
-    fn digest_ignores_host() {
-        let a = Config::from_toml(EXAMPLE).expect("a");
-        let b = Config::from_toml(&EXAMPLE.replace("k4.local", "192.0.2.10")).expect("b");
+    fn digest_ignores_host_and_covers_the_profile() {
+        let a = example();
+        let b = Config::from_parts(&EXAMPLE.replace("k4.local", "192.0.2.10"), Some(HF_FULL)).expect("b");
         assert_eq!(a.digest(), b.digest());
         assert_eq!(b.redacted().radio.host, "<redacted>");
+        let c = Config::from_parts(EXAMPLE, Some(&HF_FULL.replace("dwell_ms = 5000", "dwell_ms = 4000"))).unwrap();
+        assert_ne!(a.digest(), c.digest());
     }
 }

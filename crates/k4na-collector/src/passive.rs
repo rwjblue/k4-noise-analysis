@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use k4na_core::Config;
 use k4na_core::aggregate::PushOutcome;
-use k4na_core::model::{Event, EventKind, RadioState, VisitStatus};
+use k4na_core::config::{AntennaConfig, K4Port};
+use k4na_core::model::{Event, EventKind, RadioState, VisitAntenna, VisitStatus};
 use k4na_core::time::{Clock, NS_PER_SEC, Timestamp};
 use k4na_protocol::{DecoderDiagnostics, PanId};
 use k4na_store::StoreError;
@@ -94,6 +95,8 @@ pub struct RunSummary {
 pub enum RunError {
     #[error("storage: {0}")]
     Store(#[from] StoreError),
+    #[error("configuration: {0}")]
+    Config(String),
 }
 
 struct Passive<'a> {
@@ -102,6 +105,10 @@ struct Passive<'a> {
     clock: Arc<dyn Clock>,
     session_id: String,
     pan: PanId,
+    /// The antenna the operator says is connected.
+    declared: AntennaConfig,
+    /// Main-RX port read when the current window opened.
+    window_start_port: Option<K4Port>,
     window: Duration,
     cat: Option<SharedCatState>,
     sampler: RawSampler,
@@ -132,6 +139,46 @@ impl Passive<'_> {
         s
     }
 
+    /// Main-RX port from the latest readback; never for the sub receiver.
+    fn port(&self, state: &RadioState) -> Option<K4Port> {
+        if self.pan != PanId::A {
+            return None;
+        }
+        K4Port::from_readback(state.get("AR").map(String::as_str), state.get("AN").map(String::as_str))
+    }
+
+    fn open_window(&mut self) {
+        let state = self.state();
+        self.window_start_port = self.port(&state);
+    }
+
+    /// Attributes a window to an antenna: the declared one unless the
+    /// main-RX `AR`/`AN` readback shows another port. Never verified for
+    /// the sub receiver or without readback.
+    fn antenna(&self, state: &RadioState, v: &mut VisitBuilder) -> VisitAntenna {
+        let observed = self.port(state);
+        match observed {
+            None => {
+                v.flag("antenna_unverified");
+                VisitAntenna::configured(&self.declared, None)
+            }
+            Some(p) if p == self.declared.port => VisitAntenna::configured(&self.declared, Some(p)),
+            Some(p) => {
+                v.flag("antenna_from_readback");
+                let mut matching = self.cfg.antennas.iter().filter(|a| a.port == p);
+                match (matching.next(), matching.next()) {
+                    (Some(a), None) => VisitAntenna::configured(a, Some(p)),
+                    _ => VisitAntenna {
+                        id: "unregistered".into(),
+                        revision: String::new(),
+                        port: p,
+                        observed_port: Some(p),
+                    },
+                }
+            }
+        }
+    }
+
     async fn finish_visit(
         &mut self,
         end: Timestamp,
@@ -146,7 +193,7 @@ impl Passive<'_> {
             v.flag("too_few_frames");
         }
         if let Some(g) = v.geometry() {
-            v.band_id = self.cfg.band_containing(g.center_hz).map(|b| b.id.clone());
+            v.band_id = self.cfg.range_containing(g.center_hz).map(|b| b.id.clone());
         }
         let mut events = Vec::new();
         let delta = diag.since(&self.diag_at_last_visit);
@@ -180,8 +227,16 @@ impl Passive<'_> {
             }
         }
         let state = self.state();
+        let antenna = self.antenna(&state, &mut v);
+        let start_port = self.window_start_port.take();
+        if start_port.is_some() && antenna.observed_port.is_some() && start_port != antenna.observed_port {
+            // Readback is polled, so the change time is unknown: the window
+            // mixes two inputs and is never attributed as one antenna.
+            v.flag("antenna_changed_during_window");
+            status = VisitStatus::Aborted;
+        }
         let frames = v.frames() as u64;
-        if let Some(record) = v.finish(end, status, reason, state) {
+        if let Some(record) = v.finish(end, status, reason, antenna, state) {
             self.summary.visits += 1;
             self.summary.accepted_frames += frames;
             self.store.write_visit(record, events).await?;
@@ -250,6 +305,9 @@ impl Passive<'_> {
             self.finish_visit(end, VisitStatus::Complete, "window complete", diag)
                 .await?;
         }
+        if self.visit.is_none() {
+            self.open_window();
+        }
         let visit = self.visit.get_or_insert_with(|| {
             VisitBuilder::new(
                 &self.session_id,
@@ -274,6 +332,7 @@ impl Passive<'_> {
                 visit.flag(flag);
                 let end = visit.last_frame().unwrap_or(rf.at);
                 self.finish_visit(end, status, reason, diag).await?;
+                self.open_window();
                 let mut v = self.new_visit(rf.at);
                 v.accept(&rf);
                 self.visit = Some(v);
@@ -313,6 +372,8 @@ pub async fn run_passive<S: SpectrumSource>(
         clock: clock.clone(),
         session_id: session_id.to_owned(),
         pan: cfg.radio.receiver.pan(),
+        declared: cfg.passive_antenna().map_err(RunError::Config)?.clone(),
+        window_start_port: None,
         window: Duration::from_millis(cfg.collection.passive_visit_ms),
         cat,
         sampler,

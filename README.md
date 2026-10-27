@@ -19,11 +19,17 @@ k4na estimate --config my.toml --duration 24h
 k4na capture  --config my.toml --duration 5m        # passive, no setters
 k4na survey   --config my.toml --duration 1m --dry-run
 k4na survey   --config my.toml --duration 24h --allow-retune
+k4na survey   --config my.toml --profile config/surveys/hf-cw-us.toml --duration 24h --allow-retune
 k4na inspect  --data ./data
 k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
 ~~~
 
 `mise run long-run` runs the accelerated 24-hour simulated survey.
+
+The station file (`config/example.toml`) holds the radio, antenna
+registry, safety and storage settings. Survey profiles under
+`config/surveys/` choose antennas, frequency ranges and cadence; see
+[docs/collection.md](docs/collection.md#station-file-and-survey-profiles).
 
 ## Motivation
 

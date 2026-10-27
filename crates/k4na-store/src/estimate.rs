@@ -93,7 +93,11 @@ mod tests {
     use k4na_core::Config;
 
     fn opts() -> StoreOptions {
-        let c = Config::from_toml(include_str!("../../../config/example.toml")).unwrap();
+        let c = Config::from_parts(
+            include_str!("../../../config/example.toml"),
+            Some(include_str!("../../../config/surveys/hf-full.toml")),
+        )
+        .unwrap();
         StoreOptions::from_config(&c.storage)
     }
 

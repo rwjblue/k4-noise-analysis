@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -20,6 +21,18 @@ use k4na_store::SpaceProbe;
 use k4na_store::reader::DataSet;
 
 const ALLOWED_SETTERS: [&str; 4] = ["BN", "FA", "#SPN", "#FXT"];
+
+/// The example station and `profile` (with test cadence edits applied).
+fn config_with(root: &Path, station_edit: &str, profile: &str) -> Config {
+    let station = station(root, "survey").replace("allow_rx_antenna_switch = false", station_edit);
+    Config::from_parts(&station, Some(profile)).unwrap()
+}
+
+fn fast(profile: &str) -> String {
+    profile
+        .replace("min_cycle_ms = 300000", "min_cycle_ms = 0")
+        .replace("dwell_ms = 5000", "dwell_ms = 3000")
+}
 
 struct Run {
     cfg: Config,
@@ -45,17 +58,18 @@ async fn control(radio: &SimRadio) -> ControlCat {
 
 /// Runs a survey; `script` may inject operator activity or faults.
 async fn survey(radio: SimRadio, secs: u64, script: impl FnOnce(SimRadio) + Send + 'static) -> Run {
-    survey_with(radio, secs, None, script).await
+    survey_with(radio, secs, None, |root| config(root, "survey"), script).await
 }
 
 async fn survey_with(
     radio: SimRadio,
     secs: u64,
     probe: Option<Box<dyn SpaceProbe>>,
+    make_config: impl FnOnce(&Path) -> Config,
     script: impl FnOnce(SimRadio) + Send + 'static,
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = config(&dir.path().join("data"), "survey");
+    let mut cfg = make_config(&dir.path().join("data"));
     // Some scenarios start from a fixed pan; opt in to switching it.
     cfg.collection.set_pan_track_mode = true;
     let clock: Arc<dyn Clock> = clock();
@@ -97,10 +111,12 @@ async fn survey_with(
         radio.forbidden_commands()
     );
     for s in radio.setters_received() {
+        let rx_input = s.starts_with("AR") && cfg.collection.allow_rx_antenna_switch;
         assert!(
-            ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
+            rx_input || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
             "unexpected setter {s}"
         );
+        assert!(!s.starts_with("AN"), "the TX antenna must never be set: {s}");
     }
     Run {
         cfg,
@@ -155,13 +171,19 @@ async fn survey_covers_every_band_and_restores_the_radio() {
 
     let ds = DataSet::open(&run.cfg.storage.root).unwrap();
     let visits = ds.visits().unwrap();
-    for band in &run.cfg.bands {
+    for band in run.cfg.ranges() {
         let complete: Vec<_> = visits
             .iter()
             .filter(|v| v.band_id.as_deref() == Some(&band.id) && v.status == "complete")
             .collect();
         assert!(!complete.is_empty(), "no complete visits for {}", band.id);
     }
+    for v in &visits {
+        assert_eq!(v.antenna_id, "log-near-house");
+        assert_eq!(v.antenna_port, "rx-ant-in1");
+        assert_eq!(v.antenna_observed_port.as_deref(), Some("rx-ant-in1"));
+    }
+    assert!(!run.radio.setters_received().iter().any(|s| s.starts_with("AR")));
     for v in visits.iter().filter(|v| v.status == "complete") {
         assert_eq!(v.sample_rate_hz, 96_000, "#SPN40000 maps to 96 kHz in the simulator");
         assert!(
@@ -334,16 +356,275 @@ async fn low_disk_mid_survey_stops_and_restores() {
     let free = Arc::new(AtomicU64::new(1 << 40));
     let f2 = free.clone();
     let radio = SimRadio::new(15);
-    let run = survey_with(radio, 600, Some(Box::new(FakeDisk(free))), move |_| {
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            // Leave less than the configured headroom.
-            f2.store(1 << 20, Ordering::SeqCst);
-        });
-    })
+    let run = survey_with(
+        radio,
+        600,
+        Some(Box::new(FakeDisk(free))),
+        |root| config(root, "survey"),
+        move |_| {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Leave less than the configured headroom.
+                f2.store(1 << 20, Ordering::SeqCst);
+            });
+        },
+    )
     .await;
     assert_eq!(run.report.halt, "storage", "{:?}", run.report);
     assert!(run.report.summary.end_reason.contains("storage"));
     assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
     assert_eq!(run.radio.model().fa, RadioModel::default().fa);
+}
+
+fn mean(v: &[i16]) -> f64 {
+    v.iter().map(|x| f64::from(*x)).sum::<f64>() / v.len() as f64
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_antennas_are_surveyed_band_by_band_and_inputs_put_back() {
+    let radio = SimRadio::new(15);
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = true", &fast(RX_VS_DXC)),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.cycles >= 2, "{r:?}");
+    assert_eq!(r.antenna_skips, 0);
+    // Only the reviewed RX inputs were selected: ANT2 via the ATU (AR6)
+    // and back to RX ANT IN1 (AR4). AN is never sent (checked above).
+    let ar: std::collections::BTreeSet<_> = run
+        .radio
+        .setters_received()
+        .into_iter()
+        .filter(|s| s.starts_with("AR"))
+        .collect();
+    assert_eq!(ar, ["AR4;".to_owned(), "AR6;".to_owned()].into());
+    // Every band's input, and the current one, are as found.
+    let m = run.radio.model();
+    assert_eq!((m.rx_input, m.tx_antenna, m.fa, m.bn), (4, 1, 14_074_000, 5));
+    assert!(m.band_rx_input.values().all(|v| *v == 4), "{:?}", m.band_rx_input);
+
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let visits = ds.visits().unwrap();
+    let insp = ds.inspect().unwrap();
+    for band in ["40m", "20m"] {
+        for (antenna, port) in [("log-near-house", "rx-ant-in1"), ("dxc", "ant2")] {
+            let cov = insp
+                .bands
+                .iter()
+                .find(|b| b.band_id == band && b.antenna_id == antenna)
+                .unwrap_or_else(|| panic!("no coverage row for {band} on {antenna}"));
+            assert!(cov.complete_visits > 0, "{cov:?}");
+            assert_eq!(cov.covered_hz, cov.target_hz, "{cov:?}");
+            assert!(
+                visits
+                    .iter()
+                    .filter(|v| v.antenna_id == antenna)
+                    .all(|v| v.antenna_observed_port.as_deref() == Some(port)),
+                "{antenna}"
+            );
+        }
+    }
+    // Within a band, all tiles on one antenna come before the next.
+    let order: Vec<(String, String)> = visits
+        .iter()
+        .map(|v| (v.band_id.clone().unwrap(), v.antenna_id.clone()))
+        .collect();
+    let mut runs = order.clone();
+    runs.dedup();
+    assert!(runs.len() <= 4 * (r.cycles as usize + 1), "{runs:?}");
+    // Different antennas are different segments and different data: the
+    // simulator's ANT2 floor is 6 dB (60 native tenths) higher.
+    let level = |antenna: &str| {
+        let v = visits
+            .iter()
+            .find(|v| v.antenna_id == antenna && v.status == "complete" && v.band_id.as_deref() == Some("40m"))
+            .unwrap();
+        mean(&ds.summary(&v.visit_id).unwrap().unwrap()[0])
+    };
+    let delta = level("dxc") - level("log-near-house");
+    assert!((delta - 60.0).abs() < 15.0, "delta {delta}");
+    let segments: std::collections::BTreeSet<_> = visits.iter().map(|v| (&v.segment_id, &v.antenna_id)).collect();
+    let seg_ids: std::collections::BTreeSet<_> = segments.iter().map(|(s, _)| *s).collect();
+    assert_eq!(seg_ids.len(), segments.len(), "a segment never mixes antennas");
+    assert!(insp.events_by_kind.get("antenna_selected").copied().unwrap_or(0) >= 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_band_recalling_another_input_is_skipped_without_switch_consent() {
+    let radio = SimRadio::new(15);
+    // 40 m (K4 band 3) recalls ANT2 when selected.
+    radio.update(|m| {
+        m.band_rx_input.insert(3, 6);
+    });
+    let run = survey(radio, 600, |_| {}).await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.antenna_skips > 0, "{r:?}");
+    assert!(!run.radio.setters_received().iter().any(|s| s.starts_with("AR")));
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let visits = ds.visits().unwrap();
+    assert!(
+        !visits.iter().any(|v| v.band_id.as_deref() == Some("40m")),
+        "nothing is attributed on the wrong input"
+    );
+    assert!(
+        visits
+            .iter()
+            .any(|v| v.band_id.as_deref() == Some("20m") && v.status == "complete")
+    );
+    let insp = ds.inspect().unwrap();
+    assert!(insp.events_by_kind.get("antenna_mismatch").copied().unwrap_or(0) > 0);
+    // The radio's own per-band memory was not touched.
+    assert_eq!(run.radio.model().band_rx_input.get(&3), Some(&6));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_band_recalling_another_input_is_selected_and_put_back_with_consent() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.band_rx_input.insert(3, 6);
+    });
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = true", &fast(HF_FULL)),
+        |_| {},
+    )
+    .await;
+    assert_eq!(run.report.halt, "stop", "{:?}", run.report);
+    assert_eq!(run.report.antenna_skips, 0);
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let forty: Vec<_> = ds
+        .visits()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.band_id.as_deref() == Some("40m"))
+        .collect();
+    assert!(forty.iter().any(|v| v.status == "complete"));
+    assert!(
+        forty
+            .iter()
+            .all(|v| v.antenna_observed_port.as_deref() == Some("rx-ant-in1"))
+    );
+    let m = run.radio.model();
+    assert_eq!(m.band_rx_input.get(&3), Some(&6), "40 m keeps the operator's ANT2");
+    assert_eq!(m.rx_input, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn changing_the_antenna_mid_survey_is_operator_activity() {
+    let radio = SimRadio::new(15);
+    let (mark, script) = after(30, |r| r.update(|m| m.rx_input = 6));
+    let run = survey(radio, 600, script).await;
+    assert_eq!(run.report.halt, "conflict", "{:?}", run.report);
+    assert!(
+        run.report.summary.end_reason.contains("AR"),
+        "{}",
+        run.report.summary.end_reason
+    );
+    assert_eq!(setters_after(&run.radio, &mark), Vec::<String>::new());
+    assert_eq!(run.radio.model().rx_input, 6, "left as the operator set it");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_atu_input_stops_on_readback_mismatch() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| m.atu = false);
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = true", &fast(RX_VS_DXC)),
+        |_| {},
+    )
+    .await;
+    assert_eq!(run.report.halt, "conflict", "{:?}", run.report);
+    assert!(
+        run.report.summary.end_reason.contains("AR6"),
+        "{}",
+        run.report.summary.end_reason
+    );
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    assert!(!ds.visits().unwrap().iter().any(|v| v.antenna_id == "dxc"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cycles_start_at_most_every_min_cycle_ms() {
+    let radio = SimRadio::new(15);
+    // One 30 m tile (~4 s of work) per cycle, cycles every 60 s.
+    let profile = r#"
+id = "cadence"
+antennas = ["log-near-house"]
+dwell_ms = 3000
+min_cycle_ms = 60000
+[[ranges]]
+id = "30m"
+low_hz = 10100000
+high_hz = 10150000
+"#;
+    let run = survey_with(
+        radio,
+        250,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = false", profile),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    // Cycles start at ~0, 60, 120, 180 and 240 s; each finishes ~4 s later.
+    assert!((4..=5).contains(&r.cycles), "{r:?}");
+    assert!(r.idle_s > 150.0, "{r:?}");
+    assert!(r.last_cycle_s.unwrap() < 10.0, "{r:?}");
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let starts: Vec<i64> = ds.visits().unwrap().iter().map(|v| v.started_utc_ns).collect();
+    assert!((4..=5).contains(&starts.len()), "{starts:?}");
+    for w in starts.windows(2) {
+        let gap = (w[1] - w[0]) as f64 / 1e9;
+        assert!((59.0..62.0).contains(&gap), "visits {gap} s apart");
+    }
+    let insp = ds.inspect().unwrap();
+    assert_eq!(insp.events_by_kind.get("cycle_complete").copied(), Some(r.cycles));
+    // Holding between cycles sends no setters.
+    let fa = run
+        .radio
+        .setters_received()
+        .iter()
+        .filter(|s| s.starts_with("FA"))
+        .count();
+    assert!(fa <= starts.len() + 3, "{fa} FA setters");
+}
+
+#[tokio::test(start_paused = true)]
+async fn operator_activity_while_holding_between_cycles_stops_the_survey() {
+    let radio = SimRadio::new(15);
+    let profile = r#"
+id = "cadence"
+antennas = ["log-near-house"]
+dwell_ms = 3000
+min_cycle_ms = 120000
+[[ranges]]
+id = "30m"
+low_hz = 10100000
+high_hz = 10150000
+"#;
+    let (mark, script) = after(40, |r| r.external_retune(10_120_000));
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = false", profile),
+        script,
+    )
+    .await;
+    assert_eq!(run.report.halt, "conflict", "{:?}", run.report);
+    assert_eq!(setters_after(&run.radio, &mark), Vec::<String>::new());
+    assert_eq!(run.radio.model().fa, 10_120_000);
 }

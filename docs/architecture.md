@@ -92,6 +92,12 @@ used for QSOs, split, diversity, or a separate remote session. Survey is
 fail-closed on loss of transmit/operator interlock, unexpected VFO changes,
 or unverified frequency coverage. See collection.md.
 
+Survey mode can also compare antennas sequentially: a profile lists
+several registry antennas, and with an explicit station opt-in the
+survey selects each main-RX input with `AR` (verified by readback) and
+measures each band on each antenna in turn. The TX antenna is never set.
+Every visit records its antenna id, revision and observed port.
+
 A later **paired** mode records simultaneously observed A/B sweeps from
 separately configured antennas, keyed by exact frequency coverage and
 timestamps, without assuming their nominal scales are calibrated or

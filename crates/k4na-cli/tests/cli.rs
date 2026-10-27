@@ -6,6 +6,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 const EXAMPLE: &str = include_str!("../../../config/example.toml");
+const PROFILES: [(&str, &str); 3] = [
+    ("hf-full.toml", include_str!("../../../config/surveys/hf-full.toml")),
+    ("hf-cw-us.toml", include_str!("../../../config/surveys/hf-cw-us.toml")),
+    ("rx-vs-dxc.toml", include_str!("../../../config/surveys/rx-vs-dxc.toml")),
+];
 
 fn k4na() -> Command {
     Command::cargo_bin("k4na").unwrap()
@@ -24,7 +29,62 @@ fn write_config(dir: &Path, mode: &str, cat: u16, pan: u16) -> PathBuf {
         .replace("min_free_bytes = 5368709120", "min_free_bytes = 0");
     let path = dir.join(format!("{mode}.toml"));
     std::fs::write(&path, text).unwrap();
+    // Profiles resolve relative to the station file, as in config/.
+    std::fs::create_dir_all(dir.join("surveys")).unwrap();
+    for (name, body) in PROFILES {
+        let body = body.replace("min_cycle_ms = 300000", "min_cycle_ms = 0");
+        std::fs::write(dir.join("surveys").join(name), body).unwrap();
+    }
     path
+}
+
+#[test]
+fn check_shows_the_profile_and_profile_overrides_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let station = write_config(dir.path(), "survey", 9200, 9201);
+    k4na()
+        .args(["check", "--config"])
+        .arg(&station)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("profile  hf-full"))
+        .stdout(predicate::str::contains("antenna  dxc on ant2"));
+    k4na()
+        .args(["check", "--config"])
+        .arg(&station)
+        .arg("--profile")
+        .arg(dir.path().join("surveys/hf-cw-us.toml"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("40m-cw 7.000-7.125 MHz"));
+    // Two antennas need the station's switching opt-in.
+    k4na()
+        .args(["check", "--config"])
+        .arg(&station)
+        .arg("--profile")
+        .arg(dir.path().join("surveys/rx-vs-dxc.toml"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("allow_rx_antenna_switch"));
+}
+
+#[test]
+fn passive_capture_refuses_an_ambiguous_antenna() {
+    let dir = tempfile::tempdir().unwrap();
+    let station = write_config(dir.path(), "passive", 9, 9);
+    let text = std::fs::read_to_string(&station)
+        .unwrap()
+        .replace("allow_rx_antenna_switch = false", "allow_rx_antenna_switch = true");
+    std::fs::write(&station, text).unwrap();
+    k4na()
+        .args(["capture", "--duration", "3s", "--config"])
+        .arg(&station)
+        .arg("--profile")
+        .arg(dir.path().join("surveys/rx-vs-dxc.toml"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("exactly one antenna"));
+    assert!(!dir.path().join("data").exists());
 }
 
 #[test]

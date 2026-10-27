@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::band::k4_band_number;
-use crate::config::BandConfig;
+use crate::config::RangeConfig;
 use crate::units::{BinGeometry, HzRange};
 
 /// One frequency tile: a target interval that a single pan visit must
@@ -55,7 +55,7 @@ impl SurveyPlan {
     /// target pieces whose width fits the usable interior with a margin of
     /// four bins on each side, so both band ends are covered.
     pub fn build(
-        bands: &[BandConfig],
+        bands: &[RangeConfig],
         sample_rate_hz: u32,
         bin_count: u32,
         usable_fraction: f64,
@@ -72,7 +72,7 @@ impl SurveyPlan {
         if max_tile_width_hz < 1000 {
             return Err(PlanError::TooNarrow(sample_rate_hz));
         }
-        let mut ordered: Vec<&BandConfig> = bands.iter().collect();
+        let mut ordered: Vec<&RangeConfig> = bands.iter().collect();
         ordered.sort_by_key(|b| b.low_hz);
 
         let mut tiles = Vec::new();
@@ -146,10 +146,14 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn bands() -> Vec<BandConfig> {
-        Config::from_toml(include_str!("../../../config/example.toml"))
-            .expect("config")
-            .bands
+    fn bands() -> Vec<RangeConfig> {
+        Config::from_parts(
+            include_str!("../../../config/example.toml"),
+            Some(include_str!("../../../config/surveys/hf-full.toml")),
+        )
+        .expect("config")
+        .ranges()
+        .to_vec()
     }
 
     #[test]

@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use k4na_core::aggregate::VisitStats;
-use k4na_core::config::Mode;
-use k4na_core::model::{Event, EventKind, RawFrameRecord, SessionInfo, TileRef, VisitRecord, VisitStatus};
+use k4na_core::config::{AntennaConfig, K4Port, Mode};
+use k4na_core::model::{
+    Event, EventKind, RawFrameRecord, SessionInfo, TileRef, VisitAntenna, VisitRecord, VisitStatus,
+};
 use k4na_core::time::{NS_PER_HOUR, NS_PER_SEC, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::PanId;
@@ -41,6 +43,16 @@ fn opts(root: &Path) -> StoreOptions {
     }
 }
 
+fn log_antenna() -> AntennaConfig {
+    AntennaConfig {
+        id: "log".into(),
+        port: K4Port::RxAntIn1,
+        description: String::new(),
+        revision: "r1".into(),
+        notes: String::new(),
+    }
+}
+
 fn session(id: &str) -> SessionInfo {
     SessionInfo {
         session_id: id.into(),
@@ -51,10 +63,8 @@ fn session(id: &str) -> SessionInfo {
         mapping_version: k4na_core::units::MAPPING_VERSION.into(),
         config_digest: "digest".into(),
         config_toml: "".into(),
-        antenna_id: "log".into(),
-        antenna_revision: "r1".into(),
-        antenna_description: "".into(),
-        antenna_notes: "".into(),
+        profile_id: Some("test".into()),
+        antennas: vec![log_antenna()],
         receiver: "main".into(),
         firmware: vec!["FP-1".into()],
         snapshot: Default::default(),
@@ -117,6 +127,7 @@ fn visit(session_id: &str, n: u64, at: i64) -> VisitRecord {
         status: VisitStatus::Complete,
         flags: vec![],
         end_reason: "dwell complete".into(),
+        antenna: VisitAntenna::configured(&log_antenna(), Some(K4Port::RxAntIn1)),
         radio_state: [("PA".to_string(), "PA1".to_string())].into(),
         stats: Some(stats(n)),
     }
@@ -184,6 +195,8 @@ fn rotates_hourly_and_round_trips_summaries() {
     assert_eq!(r.sessions[0].end_reason.as_deref(), Some("duration reached"));
     assert_eq!(r.segments, 1);
     assert_eq!(r.bands[0].band_id, "20m");
+    assert_eq!(r.bands[0].antenna_id, "log");
+    assert_eq!(r.sessions[0].antennas, ["log"]);
     assert_eq!(r.bands[0].covered_hz, 70_000);
     assert_eq!(r.bands[0].max_revisit_s, Some(600.0));
 

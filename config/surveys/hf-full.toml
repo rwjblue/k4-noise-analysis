@@ -1,0 +1,56 @@
+# Survey profile: whole 80-10 m bands on the receive antenna.
+#
+# A profile says what to survey and how often. Ranges are receive-only
+# measurement intervals, NOT transmit rights. Lower bound inclusive;
+# upper bound exclusive. A range id is stored with each visit (band_id).
+id = "hf-full"
+description = "80-10 m whole bands, receive antenna, ~5 minute cycles"
+antennas = ["log-near-house"]   # ids from the station [[antennas]] registry
+
+settle_ms = 700         # frames discarded after each confirmed retune
+dwell_ms = 5000         # measured time per tile
+# Target start-to-start period of one full cycle. A faster cycle waits
+# (holding the last tile, without retuning); a slower one starts the next
+# cycle immediately and records the actual duration. 0 = back-to-back.
+min_cycle_ms = 300000
+requested_pan_span_hz = 40000 # #SPN request; not the sampled packet width
+
+[[ranges]]
+id = "80m"
+low_hz = 3500000
+high_hz = 4000000
+
+[[ranges]]
+id = "40m"
+low_hz = 7000000
+high_hz = 7300000
+
+[[ranges]]
+id = "30m"
+low_hz = 10100000
+high_hz = 10150000
+
+[[ranges]]
+id = "20m"
+low_hz = 14000000
+high_hz = 14350000
+
+[[ranges]]
+id = "17m"
+low_hz = 18068000
+high_hz = 18168000
+
+[[ranges]]
+id = "15m"
+low_hz = 21000000
+high_hz = 21450000
+
+[[ranges]]
+id = "12m"
+low_hz = 24890000
+high_hz = 24990000
+
+[[ranges]]
+id = "10m"
+low_hz = 28000000
+high_hz = 29700000

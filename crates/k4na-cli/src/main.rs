@@ -39,35 +39,56 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Debug, clap::Args)]
+struct ConfigArgs {
+    /// Station config file.
+    #[arg(long)]
+    config: PathBuf,
+    /// Survey profile; overrides `collection.survey_profile`.
+    #[arg(long)]
+    profile: Option<PathBuf>,
+}
+
+impl ConfigArgs {
+    fn load(&self) -> Result<Config> {
+        Config::load(&self.config, self.profile.as_deref())
+            .map_err(|e| refuse(format!("{}: {e}", self.config.display())))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Validate a config file and print its digest.
+    /// Validate a station config and survey profile and print the digest.
     Check {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
     },
     /// Estimate storage for a run and check admission against the data root.
     Estimate {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
         #[arg(long, value_parser = humantime::parse_duration, default_value = "24h")]
         duration: Duration,
+        /// Estimate passive capture instead of the configured mode.
+        #[arg(long)]
+        passive: bool,
     },
     /// Passive capture: spectrum stream only; optional GET-only CAT readback.
     Capture {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
         #[arg(long, value_parser = humantime::parse_duration)]
         duration: Duration,
     },
     /// Authorized band survey (retunes VFO A). Requires --allow-retune AND
     /// `collection.allow_retune = true`; use --dry-run first.
     Survey {
-        #[arg(long)]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
         #[arg(long, value_parser = humantime::parse_duration)]
         duration: Duration,
-        /// Consent to retune the radio (BN/FA/#SPN/#FXT only).
+        /// Consent to retune the radio (BN/FA/#SPN/#FXT, and AR when
+        /// `collection.allow_rx_antenna_switch` is set).
         #[arg(long)]
         allow_retune: bool,
         /// GET-only preflight and plan preview; sends no setters.
@@ -145,24 +166,29 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let json = cli.json;
     match cli.cmd {
         Cmd::Check { config } => check(&config, json),
-        Cmd::Estimate { config, duration } => {
-            let cfg = load(&config)?;
-            let (est, admit) = estimate_for(&cfg, duration)?;
-            print_estimate(&cfg, &est, admit.as_ref().err(), json);
+        Cmd::Estimate {
+            config,
+            duration,
+            passive,
+        } => {
+            let cfg = config.load()?;
+            let mode = if passive { Mode::Passive } else { cfg.collection.mode };
+            let (est, admit) = estimate_for(&cfg, mode, duration)?;
+            print_estimate(&cfg, mode, &est, admit.as_ref().err(), json);
             Ok(if admit.is_ok() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
             })
         }
-        Cmd::Capture { config, duration } => capture(&load(&config)?, duration, json).await,
+        Cmd::Capture { config, duration } => capture(&config.load()?, duration, json).await,
         Cmd::Survey {
             config,
             duration,
             allow_retune,
             dry_run,
         } => {
-            let cfg = load(&config)?;
+            let cfg = config.load()?;
             if dry_run {
                 survey_dry_run(&cfg, json).await
             } else {
@@ -191,32 +217,76 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn load(path: &Path) -> Result<Config> {
-    Config::load(path).map_err(|e| refuse(format!("{}: {e}", path.display())))
-}
-
-fn check(path: &Path, json: bool) -> Result<ExitCode> {
-    let cfg = load(path)?;
+fn check(args: &ConfigArgs, json: bool) -> Result<ExitCode> {
+    let cfg = args.load()?;
+    let profile = cfg.profile.as_ref();
     if json {
         println!(
             "{}",
-            serde_json::json!({"ok": true, "digest": cfg.digest(), "mode": cfg.collection.mode, "bands": cfg.bands.len()})
+            serde_json::json!({
+                "ok": true,
+                "digest": cfg.digest(),
+                "mode": cfg.collection.mode,
+                "profile": profile.map(|p| &p.id),
+                "antennas": profile.map(|p| &p.antennas),
+                "ranges": cfg.ranges().len(),
+            })
         );
-    } else {
-        println!("config OK: {}", path.display());
-        println!("  digest   {}", cfg.digest());
-        println!(
-            "  mode     {:?} (allow_retune = {})",
-            cfg.collection.mode, cfg.collection.allow_retune
-        );
-        println!("  antenna  {} rev {}", cfg.antenna.id, cfg.antenna.revision);
-        println!(
-            "  bands    {}",
-            cfg.bands.iter().map(|b| b.id.as_str()).collect::<Vec<_>>().join(" ")
-        );
-        println!("  data     {}", cfg.storage.root.display());
+        return Ok(ExitCode::SUCCESS);
     }
+    println!("config OK: {}", args.config.display());
+    println!("  digest   {}", cfg.digest());
+    println!(
+        "  mode     {:?} (allow_retune = {}, allow_rx_antenna_switch = {})",
+        cfg.collection.mode, cfg.collection.allow_retune, cfg.collection.allow_rx_antenna_switch
+    );
+    for a in &cfg.antennas {
+        println!("  antenna  {} on {} rev {:?}", a.id, a.port, a.revision);
+    }
+    match profile {
+        Some(p) => {
+            println!("  profile  {} ({})", p.id, p.description);
+            println!("  surveys  {}", p.antennas.join(", "));
+            println!(
+                "  cadence  settle {} ms, dwell {} ms, cycle start-to-start >= {} s",
+                p.settle_ms,
+                p.dwell_ms,
+                p.min_cycle_ms / 1000
+            );
+            println!(
+                "  ranges   {}",
+                p.ranges
+                    .iter()
+                    .map(|b| format!(
+                        "{} {:.3}-{:.3} MHz",
+                        b.id,
+                        b.low_hz as f64 / 1e6,
+                        b.high_hz as f64 / 1e6
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        None => println!("  profile  none"),
+    }
+    println!("  data     {}", cfg.storage.root.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// Expected cycle shape at the planning sample rate: (visits per cycle,
+/// busy time, start-to-start period).
+fn cycle_shape(cfg: &Config) -> Option<(usize, Duration, Duration)> {
+    let p = cfg.profile.as_ref()?;
+    let plan = SurveyPlan::build(
+        cfg.ranges(),
+        cfg.collection.planning_sample_rate_hz,
+        k4na_protocol::BIN_COUNT as u32,
+        cfg.collection.usable_fraction,
+    )
+    .ok()?;
+    let visits = plan.cycle.len() * p.antennas.len();
+    let busy = Duration::from_millis(visits as u64 * (p.settle_ms + p.dwell_ms + VISIT_OVERHEAD_MS));
+    Some((visits, busy, busy.max(Duration::from_millis(p.min_cycle_ms))))
 }
 
 fn existing_ancestor(path: &Path) -> PathBuf {
@@ -229,12 +299,16 @@ fn existing_ancestor(path: &Path) -> PathBuf {
     p
 }
 
-fn estimate_for(cfg: &Config, _duration: Duration) -> Result<(Estimate, Result<(), String>)> {
+fn estimate_for(cfg: &Config, mode: Mode, _duration: Duration) -> Result<(Estimate, Result<(), String>)> {
     let opts = StoreOptions::from_config(&cfg.storage);
     let c = &cfg.collection;
-    let (visit_ms, accepting_ms) = match c.mode {
-        Mode::Survey => (c.settle_ms + c.dwell_ms + VISIT_OVERHEAD_MS, c.dwell_ms),
-        Mode::Passive => (c.passive_visit_ms, c.passive_visit_ms),
+    let (visit_ms, accepting_ms) = match (mode, cfg.profile.as_ref(), cycle_shape(cfg)) {
+        // Idle time between cycles stretches the average visit period.
+        (Mode::Survey, Some(p), Some((visits, _, period))) => {
+            ((period.as_millis() as u64 / visits.max(1) as u64).max(1), p.dwell_ms)
+        }
+        (Mode::Survey, _, _) => bail!(refuse("a survey estimate needs a valid survey profile")),
+        (Mode::Passive, _, _) => (c.passive_visit_ms, c.passive_visit_ms),
     };
     let est = estimate(&opts, 1, visit_ms, accepting_ms, c.raw_sample_interval_ms);
     let usage = if cfg.storage.root.is_dir() {
@@ -256,15 +330,33 @@ fn mib(b: u64) -> String {
     format!("{:.1} MiB", b as f64 / 1_048_576.0)
 }
 
-fn print_estimate(cfg: &Config, est: &Estimate, refused: Option<&String>, json: bool) {
+fn print_estimate(cfg: &Config, mode: Mode, est: &Estimate, refused: Option<&String>, json: bool) {
+    let shape = (mode == Mode::Survey).then(|| cycle_shape(cfg)).flatten();
     if json {
         println!(
             "{}",
-            serde_json::json!({"estimate": est, "admitted": refused.is_none(), "reason": refused})
+            serde_json::json!({
+                "estimate": est,
+                "admitted": refused.is_none(),
+                "reason": refused,
+                "cycle": shape.map(|(visits, busy, period)| serde_json::json!({
+                    "visits": visits,
+                    "busy_s": busy.as_secs_f64(),
+                    "period_s": period.as_secs_f64(),
+                })),
+            })
         );
         return;
     }
-    println!("storage estimate ({:?} mode, upper bounds):", cfg.collection.mode);
+    println!("storage estimate ({mode:?} mode, upper bounds):");
+    if let Some((visits, busy, period)) = shape {
+        println!(
+            "  cycle                {visits} visits, ~{} s busy, one every {} s (at {} Hz packets)",
+            busy.as_secs(),
+            period.as_secs(),
+            cfg.collection.planning_sample_rate_hz
+        );
+    }
     println!("  visits/hour          {:.0}", est.visits_per_hour);
     println!("  raw frames/hour      {:.0}", est.raw_frames_per_hour);
     println!("  summaries/day        {}", mib(est.summary_bytes_per_day));
@@ -329,7 +421,7 @@ fn open_store(
     snapshot: k4na_core::model::RadioState,
     duration: Duration,
 ) -> Result<(StoreHandle, std::thread::JoinHandle<()>)> {
-    let (_, admit) = estimate_for(cfg, duration)?;
+    let (_, admit) = estimate_for(cfg, mode, duration)?;
     admit.map_err(|r| refuse(format!("storage admission: {r}")))?;
     let info = k4na_collector::session_info(cfg, mode, session_id, clock.now(), firmware, snapshot);
     let (store, recovery) = Store::open(
@@ -349,6 +441,11 @@ fn open_store(
 }
 
 async fn capture(cfg: &Config, duration: Duration, json: bool) -> Result<ExitCode> {
+    let antenna = cfg.passive_antenna().map_err(refuse)?;
+    eprintln!(
+        "attributing data to antenna {} on {} (verified per window from AR/AN readback when available)",
+        antenna.id, antenna.port
+    );
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::real());
     let session_id = k4na_collector::visit::new_id();
     let (cat_conn, pan_conn) = connectors(cfg);
@@ -436,7 +533,7 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
     .ok();
     let plan = observed.as_ref().map(|h| {
         SurveyPlan::build(
-            &cfg.bands,
+            cfg.ranges(),
             h.sample_rate_hz,
             k4na_protocol::BIN_COUNT as u32,
             cfg.collection.usable_fraction,
@@ -466,17 +563,38 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
             ),
             None => println!("no spectrum frame on pan {pan} within 10 s"),
         }
-        if let Some(Ok(p)) = &plan {
-            let c = &cfg.collection;
+        if let (Some(Ok(p)), Some(s)) = (&plan, cfg.profile.as_ref()) {
+            let antennas = s.antennas.len();
             println!(
-                "plan at the CURRENT packet rate: {} tiles, {} visits/cycle, cycle <= {} s",
+                "plan at the CURRENT packet rate: {} tiles x {antennas} antenna(s), cycle needs ~{} s, \
+                 starts at most every {} s",
                 p.tiles.len(),
-                p.cycle.len(),
-                p.cycle_duration(c.settle_ms, c.dwell_ms, VISIT_OVERHEAD_MS).as_secs()
+                (p.cycle_duration(s.settle_ms, s.dwell_ms, VISIT_OVERHEAD_MS) * antennas as u32).as_secs(),
+                s.min_cycle_ms / 1000
             );
             println!("  (the survey re-plans from the rate observed after applying #SPN)");
-            for b in &cfg.bands {
-                println!("  {:>5}: {} tile(s)", b.id, p.tiles_for_band(&b.id).count());
+            for b in cfg.ranges() {
+                println!("  {:>8}: {} tile(s)", b.id, p.tiles_for_band(&b.id).count());
+            }
+            if let Ok(pre) = &pre {
+                let port = k4na_core::config::K4Port::from_readback(
+                    pre.readback.raw(k4na_collector::cat::Query::RxAntenna),
+                    pre.readback.raw(k4na_collector::cat::Query::TxAntenna),
+                );
+                println!(
+                    "main RX input now: {} (this band only; other bands may recall another)",
+                    port.map_or("unknown", |p| p.as_str())
+                );
+                for a in cfg.survey_antennas() {
+                    let note = if Some(a.port) == port {
+                        "selected"
+                    } else if cfg.collection.allow_rx_antenna_switch {
+                        "will be selected with AR"
+                    } else {
+                        "NOT selected: tiles will be skipped unless chosen on the radio"
+                    };
+                    println!("  antenna {} on {}: {note}", a.id, a.port);
+                }
             }
         }
     }
@@ -559,9 +677,12 @@ fn print_summary(s: &RunSummary, survey: Option<&SurveyReport>, json: bool) {
     );
     if let Some(r) = survey {
         println!(
-            "survey: {} cycles over {} tiles, {} tile visits without verified coverage",
-            r.cycles, r.tiles_planned, r.coverage_unverified
+            "survey: {} cycles over {} tiles, {} tile visits without verified coverage, {} skipped for antenna",
+            r.cycles, r.tiles_planned, r.coverage_unverified, r.antenna_skips
         );
+        if let Some(s) = r.last_cycle_s {
+            println!("cadence: last cycle {s:.0} s; {:.0} s idle between cycles", r.idle_s);
+        }
         println!("radio: {}", r.restore);
     }
 }
@@ -588,8 +709,12 @@ fn inspect(data: &Path, json: bool) -> Result<ExitCode> {
     println!("sessions: {}", r.sessions.len());
     for s in &r.sessions {
         println!(
-            "  {} {} antenna {} ended {:?}",
-            s.session_id, s.mode, s.antenna_id, s.end_reason
+            "  {} {} profile {} antennas {} ended {:?}",
+            s.session_id,
+            s.mode,
+            s.profile_id.as_deref().unwrap_or("-"),
+            s.antennas.join(","),
+            s.end_reason
         );
     }
     println!("visits: {} {:?}", r.visits_total, r.visits_by_status);
@@ -608,8 +733,8 @@ fn inspect(data: &Path, json: bool) -> Result<ExitCode> {
             0.0
         };
         println!(
-            "  {:>5}: {} complete / {} other visits, {} tiles, {:.0}% of planned targets covered",
-            b.band_id, b.complete_visits, b.other_visits, b.tiles, pct
+            "  {:>8} on {}: {} complete / {} other visits, {} tiles, {:.0}% of planned targets covered",
+            b.band_id, b.antenna_id, b.complete_visits, b.other_visits, b.tiles, pct
         );
     }
     println!("events: {:?}", r.events_by_kind);

@@ -7,7 +7,7 @@ use k4na_protocol::PanId;
 use serde::{Deserialize, Serialize};
 
 use crate::aggregate::VisitStats;
-use crate::config::Mode;
+use crate::config::{AntennaConfig, K4Port, Mode};
 use crate::time::Timestamp;
 use crate::units::{BinGeometry, HzRange};
 
@@ -57,10 +57,11 @@ pub struct SessionInfo {
     pub config_digest: String,
     /// Redacted configuration TOML (no host).
     pub config_toml: String,
-    pub antenna_id: String,
-    pub antenna_revision: String,
-    pub antenna_description: String,
-    pub antenna_notes: String,
+    /// Survey profile id, if one was loaded.
+    pub profile_id: Option<String>,
+    /// Registry entries this session may attribute visits to. Each visit
+    /// records its own antenna.
+    pub antennas: Vec<AntennaConfig>,
     pub receiver: String,
     /// Firmware revisions from `RV`, if read.
     pub firmware: Vec<String>,
@@ -101,8 +102,38 @@ pub struct VisitRecord {
     pub status: VisitStatus,
     pub flags: Vec<String>,
     pub end_reason: String,
+    pub antenna: VisitAntenna,
     pub radio_state: RadioState,
     pub stats: Option<VisitStats>,
+}
+
+/// The antenna a visit measured and how that was established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisitAntenna {
+    /// Registry id, or `unregistered` when readback showed a port no
+    /// registry entry claims.
+    pub id: String,
+    pub revision: String,
+    /// The port the registry places this antenna on.
+    pub port: K4Port,
+    /// The main-RX input resolved from this visit's `AR`/`AN` readback;
+    /// `None` when it was not read (the attribution is then unverified).
+    pub observed_port: Option<K4Port>,
+}
+
+impl VisitAntenna {
+    pub fn configured(a: &AntennaConfig, observed_port: Option<K4Port>) -> Self {
+        Self {
+            id: a.id.clone(),
+            revision: a.revision.clone(),
+            port: a.port,
+            observed_port,
+        }
+    }
+
+    pub fn verified(&self) -> bool {
+        self.observed_port == Some(self.port)
+    }
 }
 
 impl VisitRecord {
@@ -114,8 +145,12 @@ impl VisitRecord {
     /// subset that affects spectra. Equal keys may be compared directly.
     pub fn segment_key(&self, session: &SessionInfo) -> String {
         let mut parts = vec![
-            format!("antenna={}", session.antenna_id),
-            format!("antenna_revision={}", session.antenna_revision),
+            format!("antenna={}", self.antenna.id),
+            format!("antenna_revision={}", self.antenna.revision),
+            format!(
+                "antenna_port={}",
+                self.antenna.observed_port.map_or("unverified", K4Port::as_str)
+            ),
             format!("pan={}", self.pan),
             format!("mapping={}", session.mapping_version),
             format!("decoder={}", session.decoder_version),
@@ -161,11 +196,20 @@ pub enum EventKind {
     RestoreSkipped,
     ShardRecovered,
     Warning,
+    /// The survey selected (or put back) a main-RX input with `AR`.
+    AntennaSelected,
+    /// The main-RX input is not the wanted antenna and was not changed.
+    AntennaMismatch,
+    /// A full survey cycle finished; `count` is the cycle number.
+    CycleComplete,
 }
 
 impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AntennaSelected => "antenna_selected",
+            Self::AntennaMismatch => "antenna_mismatch",
+            Self::CycleComplete => "cycle_complete",
             Self::SessionStart => "session_start",
             Self::SessionEnd => "session_end",
             Self::SpectrumConnected => "spectrum_connected",

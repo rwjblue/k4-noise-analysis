@@ -1,7 +1,11 @@
-//! SQLite schema version 1. See docs/storage.md for semantics.
+//! SQLite schema version 2. See docs/storage.md for semantics.
+//!
+//! Version 2 moved antenna identity from the session to each visit (a
+//! session may survey several antennas). Version 1 was pre-release and
+//! only ever produced by tests and the simulator; it is not readable.
 
 pub const FORMAT: &str = "k4na-shard";
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Tables common to both shard kinds.
 const COMMON: &str = r#"
@@ -21,10 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     mapping_version  TEXT NOT NULL,
     config_digest    TEXT NOT NULL,
     config_toml      TEXT NOT NULL,
-    antenna_id       TEXT NOT NULL,
-    antenna_revision TEXT NOT NULL,
-    antenna_description TEXT NOT NULL,
-    antenna_notes    TEXT NOT NULL,
+    profile_id       TEXT,
+    antennas_json    TEXT NOT NULL,
     receiver         TEXT NOT NULL,
     firmware_json    TEXT NOT NULL,
     snapshot_json    TEXT NOT NULL,
@@ -83,8 +85,13 @@ CREATE TABLE IF NOT EXISTS visits (
     noise_field_median  INTEGER,
     noise_field_max     INTEGER,
     sequence_repeats    INTEGER,
+    antenna_id          TEXT NOT NULL,
+    antenna_revision    TEXT NOT NULL,
+    antenna_port        TEXT NOT NULL,
+    antenna_observed_port TEXT,
     radio_state_json    TEXT NOT NULL
 ) STRICT;
+CREATE INDEX IF NOT EXISTS visits_antenna_band_time ON visits (antenna_id, band_id, started_utc_ns);
 CREATE INDEX IF NOT EXISTS visits_session_time ON visits (session_id, started_utc_ns);
 CREATE INDEX IF NOT EXISTS visits_band_time ON visits (band_id, started_utc_ns);
 CREATE INDEX IF NOT EXISTS visits_freq ON visits (actual_low_hz, actual_high_hz);
