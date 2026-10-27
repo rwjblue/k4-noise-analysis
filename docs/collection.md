@@ -234,15 +234,24 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   survey selects it with `AR` (when allowed, then verified by readback; a
   mismatch stops the survey), or skips the tile with an
   `antenna_mismatch` event (when not allowed). A band can recall its own
-  RX input, so the check runs after every band change. Before leaving a
-  band or holding between cycles, the survey puts back the input that band
-  had. With several antennas, each band's tiles are visited on the first
+  RX input, so the check runs after every band change. With several
+  antennas, each band's tiles are visited on the first
   antenna, then all on the next, so comparisons are minutes apart and
   `AR` changes at most once per antenna per band. Profiles with more than
   one antenna require the switching opt-in.
+- Band memory: the K4 recalls per-band settings on `BN` (a K4D on R39
+  recalled each band's `#SPN`, and so its packet rate, along with the
+  band-stack `FA`). The survey selects a new band with `BN` alone, records
+  the band's own `FA`, `#SPN`, `#FXT` and `AR`, then applies track mode
+  and the profile span with `FA`. Before leaving a band, holding between
+  cycles or restoring, it puts those settings back (a `state_changed`
+  event), so every band's memory is as the operator left it. A band that
+  recalls a fixed pan without `set_pan_track_mode` ends the survey
+  (restoring) instead of measuring it.
 - Cadence: a cycle visits every tile once per antenna. `min_cycle_ms` is
-  the target start-to-start period. A faster cycle holds the last tile
-  without retuning (still polling the interlock; frames are not stored);
+  the target start-to-start period. A faster cycle puts back the band's
+  settings and holds there (still polling the interlock; frames are not
+  stored);
   a slower one starts the next cycle immediately. Each cycle's actual
   duration is a `cycle_complete` event and appears in the report.
 - Preflight (GET-only) refuses unless `TQ` reads 0; `LK`, `FT`, `DV`,
@@ -267,30 +276,40 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   coverage still misses its target becomes a `coverage_unverified` event,
   not a visit. Settle frames are discarded and counted.
 - Clean ends (duration, signal, storage suspension, no usable spectrum)
-  restore the original BN/FA/#SPN/#FXT, then the original `AR` if the
-  band recalled another input, only if the radio still matches the
-  collector's last state. A mode change from band-stack recall is
+  put back the current band's settings, select the original band with
+  `BN` alone, then send only the original FA/#SPN/#FXT and `AR` that its
+  recalled memory did not already restore, only if the radio still
+  matches the collector's last state. A mode change from band-stack recall is
   reported, not corrected. Nothing is restored on a later restart.
 
 Both modes: bin-identical frames across a visit (frozen pan, stuck
 stream) produce an `aborted` visit. Frames from other pans are counted,
 not stored. Disconnects and stalls become `gap` events with intervals.
 
+### Observed on a K4D (firmware R39)
+
+Short live runs (5-minute passive capture; two survey passes on 80/40/20
+with RX ANT IN1) observed:
+- The LAN stream decoded with no CRC or header errors; pans A, B and Y
+  were all sent.
+- `TQ`, `#FRZ`, `RV`, `AR` (`4` for RX ANT IN1) and `AN` were answered.
+- The pan was fixed (`#FXT1`) and its center was not FA (-7.8 kHz);
+  survey needed `set_pan_track_mode = true`.
+- `BN` recalled each band's own `#SPN` (80 m 92000, 40 m 22000, 20 m
+  40000) and so the packet rate (192 vs 96 kHz). Re-applying `#SPN40000`
+  gave 96 kHz on every band; `#REF` and preamp also differ per band and
+  are recorded, not changed.
+- `FA` readback matched the 100 Hz-aligned command; headers verified
+  coverage of every tile; about 12 frames were discarded per settle.
+
 ### Unverified on hardware
 
-The simulator encodes assumptions that must be checked on a physical K4
-before unattended use. Do not treat them as K4 behavior:
-- `FA` readback equals the commanded 100 Hz-aligned value exactly.
-- `BN` recalls the band stack, and `FB`/`MD` changes after `BN` are the
-  only side effects.
-- `#FXT0` makes the pan follow FA with a stable center offset.
-- The `#SPN` to packet-rate mapping (simulator stand-in: smallest of
-  24/48/96/192/384 kHz at least twice the span; only `#SPN40000` to 96 kHz
-  is supported by the R39 fixtures).
-- `TQ`, `#FRZ` and `RV` are answered on the operator's firmware.
-- The 700 ms settle discards every pre-retune frame.
-- `AR` and `AN` readback formats on the operator's firmware, and that
-  `BN` recalls a per-band RX input (the simulator models this).
+The simulator encodes assumptions that are still unchecked on a physical
+K4. Do not treat them as K4 behavior:
+- `#FXT` being per band (the survey treats it as possibly per band).
+- The 700 ms settle discards every pre-retune frame (header checks
+  passed, but level settling after preamp/`#REF` recall is unmeasured).
+- That `BN` recalls a per-band RX input (the simulator models this).
 - `AR5`-`AR7` without a KAT4: the simulator rejects them, so the survey
   stops on readback mismatch; the real radio's behavior is undocumented
   here.

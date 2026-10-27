@@ -35,6 +35,10 @@ survey_profile = "surveys/hf-full.toml" # relative to this file; --profile overr
 # TX antenna is never changed). Required for profiles with 2+ antennas.
 # When false, a band whose RX input is not the wanted antenna is skipped.
 allow_rx_antenna_switch = false
+# A fixed pan (#FXT1) does not follow FA. When true the survey switches
+# each band it visits to track mode and puts that band's #FXT back when
+# leaving; when false a fixed pan refuses the survey.
+set_pan_track_mode = false
 usable_fraction = 0.80       # leave 10% packet edges on both sides
 pause_on_transmit = true
 pause_on_external_change = true

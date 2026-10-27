@@ -52,6 +52,10 @@ pub struct RadioModel {
     pub band_rx_input: BTreeMap<u8, u8>,
     /// KAT4 installed: without it `AR5..7` are refused.
     pub atu: bool,
+    /// Last `#SPN` and `#FXT` per band, recalled by `BN`. A K4D (R39) was
+    /// observed recalling a band's span (and so its packet rate) on `BN`.
+    pub band_span: BTreeMap<u8, u32>,
+    pub band_fixed: BTreeMap<u8, bool>,
 }
 
 impl RadioModel {
@@ -113,6 +117,8 @@ impl Default for RadioModel {
             rx_input: 4,
             tx_antenna: 1,
             band_rx_input: BTreeMap::new(),
+            band_span: BTreeMap::new(),
+            band_fixed: BTreeMap::new(),
             atu: true,
         }
     }
@@ -321,11 +327,16 @@ impl SimRadio {
                         let cur = m.bn;
                         let fa = m.fa;
                         m.band_stack.insert(cur, fa);
-                        let input = m.rx_input;
+                        let (input, span, fixed) = (m.rx_input, m.span, m.fixed);
                         m.band_rx_input.insert(cur, input);
+                        m.band_span.insert(cur, span);
+                        m.band_fixed.insert(cur, fixed);
                         m.bn = v;
                         m.fa = m.band_stack.get(&v).copied().unwrap_or(m.fa);
                         m.rx_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
+                        m.span = m.band_span.get(&v).copied().unwrap_or(m.span);
+                        m.fixed = m.band_fixed.get(&v).copied().unwrap_or(m.fixed);
+                        m.fixed_center = m.fa;
                     }
                     return None;
                 }

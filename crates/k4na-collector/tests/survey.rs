@@ -58,7 +58,15 @@ async fn control(radio: &SimRadio) -> ControlCat {
 
 /// Runs a survey; `script` may inject operator activity or faults.
 async fn survey(radio: SimRadio, secs: u64, script: impl FnOnce(SimRadio) + Send + 'static) -> Run {
-    survey_with(radio, secs, None, |root| config(root, "survey"), script).await
+    survey_with(radio, secs, None, tracking_config, script).await
+}
+
+/// The default survey config, opted in to switching a fixed pan to track
+/// (some scenarios start from a fixed pan).
+fn tracking_config(root: &Path) -> Config {
+    let mut cfg = config(root, "survey");
+    cfg.collection.set_pan_track_mode = true;
+    cfg
 }
 
 async fn survey_with(
@@ -69,9 +77,7 @@ async fn survey_with(
     script: impl FnOnce(SimRadio) + Send + 'static,
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = make_config(&dir.path().join("data"));
-    // Some scenarios start from a fixed pan; opt in to switching it.
-    cfg.collection.set_pan_track_mode = true;
+    let cfg = make_config(&dir.path().join("data"));
     let clock: Arc<dyn Clock> = clock();
     let mut cat = control(&radio).await;
     let pre = preflight(&mut cat, &cfg).await.unwrap();
@@ -356,24 +362,82 @@ async fn low_disk_mid_survey_stops_and_restores() {
     let free = Arc::new(AtomicU64::new(1 << 40));
     let f2 = free.clone();
     let radio = SimRadio::new(15);
-    let run = survey_with(
-        radio,
-        600,
-        Some(Box::new(FakeDisk(free))),
-        |root| config(root, "survey"),
-        move |_| {
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                // Leave less than the configured headroom.
-                f2.store(1 << 20, Ordering::SeqCst);
-            });
-        },
-    )
+    let run = survey_with(radio, 600, Some(Box::new(FakeDisk(free))), tracking_config, move |_| {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Leave less than the configured headroom.
+            f2.store(1 << 20, Ordering::SeqCst);
+        });
+    })
     .await;
     assert_eq!(run.report.halt, "storage", "{:?}", run.report);
     assert!(run.report.summary.end_reason.contains("storage"));
     assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
     assert_eq!(run.radio.model().fa, RadioModel::default().fa);
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_band_span_track_and_vfo_memories_are_put_back() {
+    // As observed on a K4D: BN recalls the band's own span (and so packet
+    // rate) and pan mode, alongside the band-stack VFO.
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.fixed = true;
+        m.band_span.insert(3, 92_000);
+        m.band_fixed.insert(3, true);
+        m.band_stack.insert(3, 7_030_000);
+    });
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| {
+            let station = station(root, "survey").replace("set_pan_track_mode = false", "set_pan_track_mode = true");
+            Config::from_parts(&station, Some(&fast(HF_FULL))).unwrap()
+        },
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.cycles >= 1, "{r:?}");
+    assert!(r.restore.starts_with("restored"), "{}", r.restore);
+    let m = run.radio.model();
+    assert_eq!((m.bn, m.fa, m.span, m.fixed), (5, 14_074_000, 40_000, true));
+    assert_eq!(m.band_span.get(&3), Some(&92_000), "40 m keeps its span");
+    assert_eq!(m.band_fixed.get(&3), Some(&true), "40 m keeps its fixed pan");
+    assert_eq!(m.band_stack.get(&3), Some(&7_030_000), "40 m keeps its VFO");
+    assert!(m.band_span.values().all(|s| *s == 40_000 || *s == 92_000));
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let insp = ds.inspect().unwrap();
+    assert_eq!(
+        insp.events_by_kind.get("plan_rebuilt"),
+        None,
+        "span re-applied per band"
+    );
+    let rates: std::collections::BTreeSet<i64> = ds.visits().unwrap().iter().map(|v| v.sample_rate_hz).collect();
+    assert_eq!(rates, [96_000].into());
+    assert!(insp.events_by_kind.get("state_changed").copied().unwrap_or(0) >= 8);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_band_recalling_a_fixed_pan_without_opt_in_ends_and_restores() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.band_fixed.insert(3, true);
+    });
+    // Not opted in to switching a fixed pan.
+    let run = survey_with(radio, 600, None, |root| config(root, "survey"), |_| {}).await;
+    assert_eq!(run.report.halt, "no_spectrum", "{:?}", run.report);
+    assert!(
+        run.report.summary.end_reason.contains("#FXT1"),
+        "{}",
+        run.report.summary.end_reason
+    );
+    assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
+    let m = run.radio.model();
+    assert_eq!((m.bn, m.fa, m.fixed), (5, 14_074_000, false));
+    assert!(!run.radio.setters_received().iter().any(|s| s.starts_with("#FXT0")));
 }
 
 fn mean(v: &[i16]) -> f64 {
@@ -592,14 +656,14 @@ high_hz = 10150000
     }
     let insp = ds.inspect().unwrap();
     assert_eq!(insp.events_by_kind.get("cycle_complete").copied(), Some(r.cycles));
-    // Holding between cycles sends no setters.
+    // Holding puts the band's own FA back once, then retunes nothing.
     let fa = run
         .radio
         .setters_received()
         .iter()
         .filter(|s| s.starts_with("FA"))
         .count();
-    assert!(fa <= starts.len() + 3, "{fa} FA setters");
+    assert!(fa <= 2 * starts.len() + 3, "{fa} FA setters");
 }
 
 #[tokio::test(start_paused = true)]
