@@ -135,6 +135,12 @@ visits, gaps, and age of oldest/newest data.
    report why. Never fill the host disk hoping compression succeeds.
 5. WAL/journal/temp files count toward budgets. Reserve enough headroom
    for the largest pending SQLite transaction and rotation/checkpoint.
+   The soft and raw-resume thresholds are fractions of the budget *minus*
+   headroom, so pressure pruning always starts before the hard ceiling
+   (usage + headroom > budget) can suspend collection.
+   Admission likewise counts one unprunable shard duration of summary
+   and raw bytes on top of the protected window, because pruning is per
+   shard and open shards are never deleted.
    Pre-allocate/validate at least a shard's expected headroom before a
    long run; re-check frequently, not just at startup.
 

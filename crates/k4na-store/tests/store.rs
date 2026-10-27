@@ -372,6 +372,42 @@ fn disk_cap_is_never_exceeded_and_foreign_files_survive_pruning() {
     assert!(recent >= 179, "protected window kept {recent} visits");
 }
 
+/// Production headroom (16 MiB) is 25% of the minimum 64 MiB cap. The soft
+/// limit must sit below the hard ceiling (budget - headroom), or pressure
+/// pruning never starts and the store suspends with prunable data on disk.
+/// Found by the accelerated 24 h collector test.
+#[test]
+fn large_headroom_still_prunes_before_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let mut o = opts(&root);
+    o.max_total_bytes = 6 * 1024 * 1024;
+    o.headroom_bytes = 1536 * 1024;
+    o.protected_summary_ns = NS_PER_HOUR;
+    let sid = "0b0b0b0b";
+    let (mut store, _) = Store::open(o.clone(), big_disk(), session(sid), ts(0)).unwrap();
+    for minute in 0..(24 * 60) {
+        let at = minute as i64 * 60 * NS_PER_SEC + NS_PER_SEC;
+        for k in 0..3 {
+            store
+                .write_raw(&raw(sid, at + k * 20 * NS_PER_SEC, (minute % 251) as u8))
+                .unwrap();
+        }
+        store
+            .write_visit(&visit(sid, minute, at), &[])
+            .unwrap_or_else(|e| panic!("minute {minute}: {e}"));
+        store.maintain(ts(at)).unwrap();
+        let s = store.status();
+        assert!(
+            s.usage_bytes + o.headroom_bytes <= o.max_total_bytes,
+            "minute {minute}: {s:?}"
+        );
+    }
+    let status = store.close(ts(25 * NS_PER_HOUR), "end").unwrap();
+    assert!(status.pruned_files > 0);
+    assert!(status.suspended.is_none());
+}
+
 #[test]
 fn shrinking_free_space_suspends_instead_of_filling_disk() {
     let dir = tempfile::tempdir().unwrap();

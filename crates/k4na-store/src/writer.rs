@@ -559,9 +559,12 @@ impl Store {
         )?;
 
         self.measure()?;
-        let budget = self.status.budget_bytes as f64;
-        let soft = (budget * self.opts.soft_limit_fraction) as u64;
-        let resume = (budget * self.opts.raw_resume_fraction) as u64;
+        // Thresholds are fractions of what may be used before the hard
+        // ceiling (budget minus headroom) trips; otherwise a soft limit could
+        // sit above the ceiling and pruning would never start.
+        let effective = self.status.budget_bytes.saturating_sub(self.opts.headroom_bytes) as f64;
+        let soft = (effective * self.opts.soft_limit_fraction) as u64;
+        let resume = (effective * self.opts.raw_resume_fraction) as u64;
 
         if self.status.usage_bytes > soft {
             if !self.status.raw_paused {

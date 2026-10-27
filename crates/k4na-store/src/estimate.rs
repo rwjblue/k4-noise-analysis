@@ -20,6 +20,10 @@ pub struct Estimate {
     pub protected_summary_bytes: u64,
     /// Raw bytes needed for the nominal raw retention.
     pub raw_retention_bytes: u64,
+    /// Pruning is per shard and open shards are never deleted, so up to one
+    /// extra summary shard beyond the protected window and one open raw
+    /// shard cannot be reclaimed.
+    pub unprunable_shard_bytes: u64,
     /// Days of summaries the byte cap can hold with raw sampling paused.
     pub summary_days_at_cap: f64,
 }
@@ -44,6 +48,8 @@ pub fn estimate(opts: &StoreOptions, pans: u32, visit_ms: u64, accepting_ms: u64
         raw_bytes_per_day,
         protected_summary_bytes: (summary_bytes_per_day as f64 * hours(opts.protected_summary_ns) / 24.0) as u64,
         raw_retention_bytes: (raw_bytes_per_day as f64 * hours(opts.raw_retention_ns) / 24.0) as u64,
+        unprunable_shard_bytes: ((summary_bytes_per_day + raw_bytes_per_day) as f64 * hours(opts.shard_duration_ns)
+            / 24.0) as u64,
         summary_days_at_cap: opts.max_total_bytes as f64 * opts.soft_limit_fraction
             / summary_bytes_per_day.max(1) as f64,
     }
@@ -55,14 +61,27 @@ pub fn admission(opts: &StoreOptions, est: &Estimate, usage_bytes: u64, free_byt
     let budget = opts
         .max_total_bytes
         .min((usage_bytes + free_bytes).saturating_sub(opts.min_free_bytes));
-    let usable = (budget as f64 * opts.soft_limit_fraction) as u64;
-    let need = est.protected_summary_bytes + opts.headroom_bytes;
+    // Same basis as the writer's soft limit: a fraction of what may be used
+    // before the hard ceiling (budget minus headroom).
+    let usable = (budget.saturating_sub(opts.headroom_bytes) as f64 * opts.soft_limit_fraction) as u64;
+    let need = est.protected_summary_bytes + est.unprunable_shard_bytes;
     if need > usable {
         return Err(format!(
-            "storage cannot hold the protected summary window: need ~{} bytes (upper bound) but only {} are usable \
-             (min(max_total_bytes {}, used {} + free {} - min_free_bytes {}) x soft_limit_fraction {}). \
-             Free disk space, raise max_total_bytes, lower min_free_bytes or protected_summary_hours.",
-            need, usable, opts.max_total_bytes, usage_bytes, free_bytes, opts.min_free_bytes, opts.soft_limit_fraction
+            "storage cannot hold the protected summary window: need ~{} bytes (upper bound: protected summaries {} + \
+             one unprunable shard {}) but only {} are usable \
+             ((min(max_total_bytes {}, used {} + free {} - min_free_bytes {}) - headroom {}) x soft_limit_fraction {}). \
+             Free disk space, raise max_total_bytes, lower min_free_bytes, protected_summary_hours or \
+             shard_duration_minutes.",
+            need,
+            est.protected_summary_bytes,
+            est.unprunable_shard_bytes,
+            usable,
+            opts.max_total_bytes,
+            usage_bytes,
+            free_bytes,
+            opts.min_free_bytes,
+            opts.headroom_bytes,
+            opts.soft_limit_fraction
         ));
     }
     Ok(())
@@ -96,5 +115,24 @@ mod tests {
         // 5.2 GiB free minus 5 GiB minimum leaves ~200 MiB: too small for a day.
         let err = admission(&o, &e, 0, 5_600_000_000).unwrap_err();
         assert!(err.contains("protected summary window"), "{err}");
+    }
+
+    #[test]
+    fn counts_the_shard_that_cannot_be_pruned() {
+        // 64 MiB with a 1 h protected window fits only if shard granularity
+        // is ignored: hourly shards keep up to 2 h of summaries plus an open
+        // raw shard.
+        let mut o = opts();
+        o.max_total_bytes = 64 << 20;
+        o.protected_summary_ns = 3_600_000_000_000;
+        let e = estimate(&o, 1, 3950, 3000, 1000);
+        assert!(
+            e.protected_summary_bytes + o.headroom_bytes < (o.max_total_bytes as f64 * o.soft_limit_fraction) as u64
+        );
+        assert!(admission(&o, &e, 0, 1 << 40).unwrap_err().contains("unprunable shard"));
+        o.shard_duration_ns = 15 * 60_000_000_000;
+        o.protected_summary_ns = 3_600_000_000_000;
+        let e = estimate(&o, 1, 3950, 3000, 1000);
+        assert!(admission(&o, &e, 0, 1 << 40).is_ok());
     }
 }
