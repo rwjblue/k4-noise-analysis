@@ -1,7 +1,9 @@
 # Acquisition and survey contract
 
-Status: proposed; details need live K4 validation before claiming calibrated
-measurements or fully unattended active survey.
+Status: implemented and tested against the bundled R39 fixtures and a
+simulated K4 (see [Implemented behavior](#implemented-behavior-v01)).
+Not yet validated on a physical K4: details need live K4 validation
+before claiming calibrated measurements or fully unattended active survey.
 
 ## Inputs and state
 
@@ -162,9 +164,71 @@ k4na inspect --data ./data
 k4na replay --input fixture.bin
 ~~~
 
-The commands above are a target interface, not implemented functionality.
+These commands are implemented (`capture` is the passive subcommand), plus
+`k4na simulate` for dry runs against a clearly labeled simulated K4. Pass
+`--json` before the subcommand for machine-readable output. Exit codes:
+0 success; 1 runtime failure (storage, CAT loss, no usable spectrum);
+2 refused before collection (config, consent, preflight, storage
+admission); 3 stopped for operator activity (transmit or external change).
+
 Passive capture must remain useful even if safe automated retuning turns out
 to be impossible on a particular K4 firmware or operating configuration.
+
+## Implemented behavior (v0.1)
+
+Passive (`capture`):
+- Reads :9201 only. With `radio.passive_cat_readback`, a separate task
+  polls GET-only state on a read-only CAT link that cannot encode setters.
+  CAT loss is recorded and capture continues.
+- Visits are fixed `passive_visit_ms` windows of stable observed geometry
+  on the configured pan. A geometry change (operator retune/span), stream
+  loss, host clock jump or stop closes the visit early as `partial`.
+  Band attribution comes only from the observed center; passive capture
+  never claims band coverage.
+
+Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
+- Setters are limited to `BN`, `FA` (rounded to 100 Hz), `#SPN` and
+  `#FXT`. Mode, antennas, gain and display reference are never set.
+- Preflight (GET-only) refuses unless `TQ` reads 0; `LK`, `FT`, `DV`,
+  `SB`, `RT`, `XT` read 0; `#FRZ` is not 1; FA/BN are readable; and,
+  when `require_firmware_readback`, `RV` answered.
+- Before each change the interlock (TQ plus FA, FB, BN, MD, FT, DV, SB,
+  LK, RT, XT, #SPN, #FXT, #FRZ) must equal the baseline. After setters,
+  the full state is read back. The setters must be confirmed, nothing they
+  should not affect may move, and the readback becomes the new baseline.
+  It is polled every 500 ms during a dwell.
+- Any transmit, unreadable TQ, or difference from the baseline is operator
+  activity. The survey **stops** with no further setters and leaves the
+  radio alone. Resuming means starting a new run (manual resume).
+- Lost CAT means unknown radio state: no retune and no restore.
+- The plan is built from the packet rate observed after a probe tune and
+  rebuilt if the rate changes. The pan-center offset from FA is learned
+  from headers, with one correction retune per tile. A tile whose header
+  coverage still misses its target becomes a `coverage_unverified` event,
+  not a visit. Settle frames are discarded and counted.
+- Clean ends (duration, signal, storage suspension, no usable spectrum)
+  restore the original BN/FA/#SPN/#FXT only if the radio still matches the
+  collector's last state. A mode change from band-stack recall is
+  reported, not corrected. Nothing is restored on a later restart.
+
+Both modes: bin-identical frames across a visit (frozen pan, stuck
+stream) produce an `aborted` visit. Frames from other pans are counted,
+not stored. Disconnects and stalls become `gap` events with intervals.
+
+### Unverified on hardware
+
+The simulator encodes assumptions that must be checked on a physical K4
+before unattended use. Do not treat them as K4 behavior:
+- `FA` readback equals the commanded 100 Hz-aligned value exactly.
+- `BN` recalls the band stack, and `FB`/`MD` changes after `BN` are the
+  only side effects.
+- `#FXT0` makes the pan follow FA with a stable center offset.
+- The `#SPN` to packet-rate mapping (simulator stand-in: smallest of
+  24/48/96/192/384 kHz at least twice the span; only `#SPN40000` to 96 kHz
+  is supported by the R39 fixtures).
+- `TQ`, `#FRZ` and `RV` are answered on the operator's firmware.
+- The 700 ms settle discards every pre-retune frame.
+Run a live 5-minute passive capture and a short 80/40/20 survey first.
 
 ## Quality gates for a believable baseline
 

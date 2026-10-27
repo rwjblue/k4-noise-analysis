@@ -1,6 +1,7 @@
 # Architecture: K4 noise surveying
 
-Status: **proposed design; not an implemented collector** (2026-10-27).
+Status: collector implemented as designed below and tested offline
+(fixtures and simulator); not yet validated on a physical K4 (2026-10-27).
 
 ## Goal and scope
 
@@ -97,7 +98,7 @@ timestamps, without assuming their nominal scales are calibrated or
 their feedlines and transformers identical. The physical K4D can already
 emit A and B packets on the local LAN; no 9204 dependency is required.
 
-## Rust module boundaries (proposed workspace)
+## Rust module boundaries (workspace)
 
 - crates/k4na-protocol: bounded K4 LAN framing/CRC/parser and packet types;
   zero radio control, no storage dependencies.
@@ -107,7 +108,10 @@ emit A and B packets on the local LAN; no 9204 dependency is required.
 - crates/k4na-collector: Tokio network sessions, CAT GET/control whitelist,
   interlocks, scheduler, lifecycle and metrics.
 - crates/k4na-cli: operator commands (check, estimate, capture, survey,
-  inspect, replay); one executable named k4na.
+  inspect, replay, simulate); one executable named k4na.
+- crates/k4na-sim: a simulated K4 (CAT and spectrum servers over one
+  fault-injecting radio model) for tests and dry runs; it logs every
+  received command so tests can assert that nothing forbidden was sent.
 - crates/k4na-analysis (later): read-only derived analysis.
 - crates/k4na-report (later): reports separate from the writer.
 

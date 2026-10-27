@@ -1,10 +1,21 @@
 # Agent handoff and implementation plan
 
-This repository's first PR is intentionally **design-only**. No CLI,
-protocol code, SQLite schema, radio hardware validation, or 24-hour
-recording is implemented by that PR. The implementation agent should
-execute this plan in small reviewable commits without conflating an
-unverified observation with a hardware guarantee.
+The first PR was design-only. Milestones 0-3 and most of 4 are now
+implemented and tested offline (fixtures, simulator, accelerated runs).
+**No physical K4 validation has been performed.** The live acceptance
+items below remain open, and the assumptions listed in
+[collection.md](collection.md#unverified-on-hardware) must be checked
+before unattended use. Continue in small reviewable commits without
+conflating an unverified observation with a hardware guarantee.
+
+| Milestone | Status |
+| --- | --- |
+| 0. Workspace, fixtures, CI | Done |
+| 1. Parser, passive capture | Done offline; live 5-minute capture open; byte-capped diagnostic dump not yet implemented |
+| 2. Storage, aggregation | Done, including accelerated 24 h under the minimum cap (`mise run long-run`) |
+| 3. Survey | Done against the simulator; live 80/40/20 survey and real 24 h dataset open |
+| 4. Quality | `k4na inspect` health summary done; troubleshooting guide and golden whole-survey replay open |
+| 5. Analysis | Not started (separate PRs) |
 
 ## Definition of the first useful release
 

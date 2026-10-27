@@ -1,6 +1,7 @@
 # On-disk format and bounded retention
 
-Status: design contract, schema version 1 proposed; no shipped migrations yet.
+Status: implemented (schema version 1) in crates/k4na-store; no migrations
+yet. Readers reject unsupported schema versions.
 
 ## Why storage must be designed before continuous capture
 

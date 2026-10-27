@@ -2,8 +2,28 @@
 
 Collector-first RF noise survey tooling for an Elecraft K4D, written in Rust.
 
-**Status: design only.** The first PR defines an implementable architecture,
-example TOML and agent handoff; it does not yet capture radio data.
+**Status: collector implemented; not yet validated on a physical K4.** The
+protocol decoder replays real R39 captures. Passive capture, the guarded
+survey, storage limits and recovery are tested against a simulated K4,
+including an accelerated 24-hour run under a 64 MiB cap. See
+[unverified hardware assumptions](docs/collection.md#unverified-on-hardware)
+before trusting unattended runs.
+
+## Quick start
+
+~~~text
+mise install                     # pinned stable Rust
+mise run ci                      # fmt, clippy, tests (no radio needed)
+cargo run -p k4na-cli -- check --config config/example.toml
+k4na estimate --config my.toml --duration 24h
+k4na capture  --config my.toml --duration 5m        # passive, no setters
+k4na survey   --config my.toml --duration 1m --dry-run
+k4na survey   --config my.toml --duration 24h --allow-retune
+k4na inspect  --data ./data
+k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
+~~~
+
+`mise run long-run` runs the accelerated 24-hour simulated survey.
 
 ## Motivation
 
@@ -13,18 +33,18 @@ antenna with a remote LoG using simultaneous K4D main/sub spectra.
 Keep collection, analysis and rendering independent, preserve measurements
 in original units, and never fill the host disk.
 
-## Proposed first release
+## First release
 
-A guarded, receive-only CLI will collect the K4's **LAN spectrum stream on
+A guarded, receive-only CLI collects the K4's **LAN spectrum stream on
 9201**, optionally querying and tuning over **CAT 9200** when explicitly
 authorized. Configurable full-band survey intervals (80-10m by default)
-will be visited repeatedly. All accepted spectrum frames during a dwell
+are visited repeatedly. All accepted spectrum frames during a dwell
 contribute to per-bin temporal summaries; a sparse sample of original
 checksum-valid packets is retained for replay. Versioned SQLite shards
 have independent summary/raw retention and a hard byte quota.
 
-Passive capture never retunes; active survey must be intentionally enabled
-and must pause on radio use, unknown TX state, state conflicts, unusable
+Passive capture never retunes. Active survey must be intentionally enabled,
+and it stops on radio use, unknown TX state, state conflicts, unusable
 spectrum coverage or resource exhaustion. The radio cannot transmit
 through the collector.
 
