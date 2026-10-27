@@ -20,6 +20,11 @@ run = [
 description = "Run the full offline test suite"
 run = "cargo test --workspace --locked"
 
+[tasks.long-run]
+description = "Accelerated 24 h simulated survey under the minimum disk cap (release build)"
+env = { K4NA_LONG_RUN_HOURS = "24" }
+run = "cargo test --release --locked -p k4na-collector --test long_run -- --nocapture"
+
 [tasks.ci]
 description = "Everything CI runs, in order"
 depends = ["lint"]
