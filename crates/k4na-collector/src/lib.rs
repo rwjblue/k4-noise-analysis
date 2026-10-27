@@ -7,6 +7,7 @@ pub mod passive;
 pub mod runtime;
 pub mod spectrum;
 pub mod store_task;
+pub mod survey;
 pub mod visit;
 
 use k4na_core::Config;
