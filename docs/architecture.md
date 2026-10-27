@@ -1,6 +1,9 @@
 # Architecture: K4 noise surveying
 
-Status: **proposed design; not an implemented collector** (2026-10-27).
+Status: **architecture in progress** (2026-10-27). The repository now has
+protocol/core/storage Rust code, while the collector lifecycle, CLI and
+web controller are still being implemented. See [operations](operations.md)
+for the simplified manual control model.
 
 ## Goal and scope
 
@@ -46,6 +49,10 @@ K4 local LAN                 collector (Rust, 2024 edition)
 - **Protocol** has an incremental, bounded decoder for the verified local LAN
   format and a trait/adapter to accept other transport formats in the future.
   A separate secure 9204 implementation is explicitly out of scope for v1.
+- **Control plane (near-term)** runs inside the same Rust process as the
+  collector, serving a minimal status/Start/Stop page on loopback by default
+  and optionally on an authenticated trusted-LAN interface. It does not
+  analyze or render RF measurements. See [operations](operations.md).
 
 ## Existing reliable inputs
 
@@ -83,13 +90,15 @@ connect to :9200 for GET-only metadata, but failure to read state must not
 block raw capture. Record exactly the changing spectral windows actually
 observed; never infer that passive recording covered an entire band.
 
-**Survey:** explicitly enabled CAT-driven frequency and pan state setup on
-:9200 plus acquisition on :9201. Iterate configured band intervals until
-the requested duration or stop condition. No transmit/keying commands.
-This reserves the selected receiver: do not quietly change a radio being
-used for QSOs, split, diversity, or a separate remote session. Survey is
-fail-closed on loss of transmit/operator interlock, unexpected VFO changes,
-or unverified frequency coverage. See collection.md.
+**Survey:** an operator-initiated, receive-only CAT frequency sweep on
+:9200 with spectra from :9201. Iterate configured bands at a target cadence
+of about one full sweep every five minutes, with actual timing and gaps
+recorded. The operator manually taps **Stop** before normal K4/QK4 use.
+There is no CAT ownership lease or mandatory external-VFO conflict detector.
+Retuning is vetoed while transmitting or when TX state is unknown, and
+unverified PAN coverage is never recorded as a valid tile. No TX/keying
+commands are available. See [collection](collection.md) and
+[operations](operations.md).
 
 A later **paired** mode records simultaneously observed A/B sweeps from
 separately configured antennas, keyed by exact frequency coverage and
@@ -107,13 +116,15 @@ emit A and B packets on the local LAN; no 9204 dependency is required.
 - crates/k4na-collector: Tokio network sessions, CAT GET/control whitelist,
   interlocks, scheduler, lifecycle and metrics.
 - crates/k4na-cli: operator commands (check, estimate, capture, survey,
-  inspect, replay); one executable named k4na.
+  serve, inspect, replay); one executable named k4na. The serve command
+  provides an embedded simple HTTP page and owns the collector lifecycle.
 - crates/k4na-analysis (later): read-only derived analysis.
 - crates/k4na-report (later): reports separate from the writer.
 
-Begin with a single workspace and binary; organize libraries when doing so
-improves testing. Avoid a network service, shared database server, or plugin
-framework until a real use requires one.
+Keep one Rust executable and a single collector owner. A tiny HTTP
+control listener in that process is now an explicit near-term requirement;
+avoid a separate backend service, shared database server, heavy frontend
+framework or plugin framework. The web page uses the same lifecycle as CLI.
 
 Suggested crates, selected at implementation time: tokio, clap, serde/toml,
 tracing, rusqlite with bundled SQLite, zstd and an appropriate time library.
@@ -144,16 +155,19 @@ Do not pin fictional future dependency versions.
 8. Changing antenna, receiver routing, gain, averaging, frequency mapping,
    or stream format starts a new comparability segment. No cross-segment
    noise ranking without explicit normalization/qualification.
-9. Collector exits and crashes must be safe: stop CAT writes first, persist
-   termination reason, and conditionally restore only settings still known
-   to be collector-owned. Never overwrite a newer human change.
+9. A user-requested Stop must cancel any further new CAT writes, flush
+   partial data, persist the session stop reason and **not** restore the old
+   VFO or pan settings. After a process restart the control service starts
+   Stopped, never automatically resuming CAT retunes.
 
 ## Data lifecycle / user experience
 
 Typical path: validate TOML and radio connectivity -> passive short run ->
 read/replay fixture and validate framing -> explicit dry-run survey plan ->
-overnight survey -> inspect coverage, gaps, size and health -> analyze later.
-All long runs are foreground/daemonized by the operator, not by this design PR.
+start a long-running local control service -> tap Start from a phone/browser
+-> inspect coverage, gaps, size and health -> tap Stop before using QK4.
+The control process persists while the collector is Stopped. See
+[operations](operations.md) for exact behavior and network boundaries.
 
 No precise geolocation, email, network password, or callsign is necessary in
 measurement shards. Store a user-controlled antenna label and optional
@@ -164,8 +178,10 @@ site notes; keep IP/host only in local config/logs and redact secrets.
 - **Survey is sampling, not continuous simultaneous monitoring of all HF.**
   Short bursts between visits can be missed; record actual dwell and revisit
   coverage and make selected frequency regions higher priority if needed.
-- **Operating interference:** survey requires exclusive main-RX consent,
-  honors TX state and external changes, and pauses rather than racing QK4.
+- **Operating interference:** the operator manually stops the survey
+  before using QK4. A cheap pre-retune TX-state veto remains, but the
+  collector does not attempt an automatic external-client ownership
+  protocol or promise race-free concurrent QK4 tuning.
 - **Uncalibrated spectrum:** preserve native data and radio state for later
   bench calibration; initially report relative differences only.
 - **Clock/retune transients:** reject settle frames and mark every incomplete

@@ -61,10 +61,15 @@ interpreting whether a tone was persistent.
 Thresholds are hypotheses, not measurement standards. Different
 antenna positions can change reception of legitimate RF and local RFI.
 A complete 80-10m scan is not simultaneous; "not observed" is NOT
-"absent." A radio sampling each tile for 3 seconds every few minutes
-will miss some brief intermittent noise. Quantify observed exposure
-and, if indicated, schedule a focused continuous monitor survey on
-suspect intervals.
+"absent." The [default operating cadence](operations.md) is roughly
+5 seconds per frequency window every 5–6 minutes, or about a **1.7%
+observation duty cycle** per frequency. This is excellent for measuring
+persistent carriers and slow time-of-day changes, but may miss short
+intermittent emissions entirely. Quantify observed exposure and
+confidence, and if necessary configure a focused monitoring run over
+only a few suspect frequency ranges. The temporal percentiles within
+a five-second visit must not be interpreted as percentiles of all 24
+hours of wall-clock RF activity.
 
 ## Export/report contracts (later milestones)
 

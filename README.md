@@ -2,8 +2,9 @@
 
 Collector-first RF noise survey tooling for an Elecraft K4D, written in Rust.
 
-**Status: design only.** The first PR defines an implementable architecture,
-example TOML and agent handoff; it does not yet capture radio data.
+**Status: implementation in progress.** Initial Rust protocol, core/planner
+and storage modules have landed; the collector CLI, active K4 survey and
+phone-accessible control UI are not yet complete.
 
 ## Motivation
 
@@ -28,6 +29,13 @@ and must pause on radio use, unknown TX state, state conflicts, unusable
 spectrum coverage or resource exhaustion. The radio cannot transmit
 through the collector.
 
+Recommended initial cadence is **5 seconds per frequency window** plus
+700 ms settling, repeating a full configured 80–10m sweep approximately
+every **5–6 minutes** at the observed 96 kHz main-pan sample rate. The
+collector runs until stopped via a small local web page or CLI.
+A future `k4na serve` process will be controllable from an authenticated
+phone browser on the trusted home LAN without detecting QK4 usage.
+
 The K4 LAN spectrum readings are in native tenths-of-dB units, **not yet
 established as calibrated dBm**. A stationary carrier is a candidate
 birdie, not automatically a confirmed household RFI source.
@@ -35,6 +43,7 @@ birdie, not automatically a confirmed household RFI source.
 ## Design and implementation entry points
 
 - [Architecture and invariants](docs/architecture.md)
+- [Survey cadence and manual web control](docs/operations.md)
 - [Survey and protocol acceptance](docs/collection.md)
 - [Storage, quotas and retention](docs/storage.md)
 - [Later analysis and near/far comparison](docs/analysis.md)
@@ -57,5 +66,7 @@ The local 9201 stream has a simpler implementation path than the TLS-PSK
 
 Use Rust stable (edition 2024) and follow
 [docs/implementation-plan.md](docs/implementation-plan.md) in small
-testable milestones. The initial deliverable is valid and bounded
-**acquisition**, not a speculative automatic signal classifier.
+testable milestones. The initial deliverable is valid, bounded **acquisition** with manual
+Start/Stop and real status from a lightweight mobile browser, not a
+speculative automatic signal classifier. See the follow-on operations
+contract before implementing complicated CAT conflict detection.

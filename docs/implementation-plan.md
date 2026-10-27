@@ -1,22 +1,27 @@
 # Agent handoff and implementation plan
 
-This repository's first PR is intentionally **design-only**. No CLI,
-protocol code, SQLite schema, radio hardware validation, or 24-hour
-recording is implemented by that PR. The implementation agent should
-execute this plan in small reviewable commits without conflating an
-unverified observation with a hardware guarantee.
+The first architecture PR has been merged. The repository now contains
+initial protocol decoding, strict config, survey planning, aggregation
+and versioned SQLite storage code; the CLI/collector remain scaffolds.
+Keep progress already landed on main. The follow-on
+[operations design](operations.md) supersedes the earlier heavyweight
+CAT interlock requirement and makes a minimal local Start/Stop UI part
+of the first useful release. Do not conflate inferred radio behavior
+with verified hardware measurements.
 
 ## Definition of the first useful release
 
-A Rust command-line program that can read a physical K4 LAN spectrum
-stream, validate/record passive main-pan observations, safely scan
-configured full HF band intervals when expressly authorized, accumulate
-per-bin visit summaries from all received frames, keep bounded raw
-original packets for replay, rotate/prune disk shards and report
-time/frequency coverage/gaps for a 24+ hour run.
+A Rust local-first program that reads a physical K4 LAN spectrum stream,
+records passive observations and performs operator-started surveys across
+configured HF bands. It must preserve all-frame per-bin visit summaries,
+retain only bounded raw examples, rotate/prune disk shards and report
+actual frequency/time coverage and gaps for 24+ hours. **Also provide
+a tiny authenticated LAN-capable Start/Stop/status page** so an operator
+can pause collection from a phone before using the K4/QK4.
 
-An offline birdie detector, near/far comparison dashboard and browser
-UI are **not** initial release gates.
+A detailed birdie analyzer, near/far comparison dashboard and graphical
+measurement plots are **not** first-release gates. The simple operations
+control page is distinct from a full analysis/rendering dashboard.
 
 ## Sequence / atomic goals
 
@@ -65,26 +70,59 @@ below configurable hard cap and records intentional missing data. Process
 kill/restart recovers, rotation and eviction work, and no user files outside
 the data root are removed.
 
-### 3. Opt-in active, full-band survey
-- CAT readbacks and whitelisted setters with explicit user consent and
-  an operator-state interlock. No TX, CW or arbitrary CAT scripts.
-- Snapshot/restore only collector-owned settings, comparing readbacks
-  before restoration to avoid overwriting human changes.
+### 3. Opt-in active, full-band survey and cadence
+- CAT readbacks and whitelisted receive-only setters with explicit
+  manual operator consent. No TX, CW or arbitrary CAT scripts.
+- Remove expensive external-VFO/operator detection and conditional
+  startup-frequency restoration. A requested Stop cancels further
+  retunes, flushes partial observations and leaves receiver frequency
+  unchanged. Fresh TX-state veto immediately before each retune remains.
 - Read actual sampleRate/center after each retune; dynamically tile
-  band intervals with guarded overlapping usable interior windows.
-  Fixed-display or mismatch -> reject/record, never mislabel coverage.
-- Fair scheduler, configurable dwell/settle, bounded runtime and
-  explicit stop/pause conditions. Streaming summaries per visit.
-- Cover 80/40/30/20/17/15/12/10m example configuration, including
-  the upper 10m band if requested.
+  bands with verified packet coverage. Fixed/mismatched pan -> gap or
+  replan, never mislabel frequency.
+- Default measured dwell **5 seconds** + **700 ms** settle, minimum
+  full-cycle start-to-start period **5 minutes**. Existing planner
+  yields **50 tiles** at 96 kHz and 80% usable fraction, i.e. 285
+  seconds before overhead. Report actual revisit time. Do not skip
+  tiles or overlap cycles to meet a timer.
+- Extend the strict config schema with `min_cycle_interval_ms`, update
+  the sample TOML, unit tests, estimation and operator documentation.
+  Remove/deprecate mandatory `pause_on_external_change` and
+  `manual_resume_on_conflict` fields.
+- Cover the entire configured 80/40/30/20/17/15/12/10m intervals.
 
-Acceptance: mock K4 exercises cross-band BN/FA, split/diversity conflict,
-human retune, TX activity, frozen PAN, rate change, wrong header, disconnect,
-low disk and graceful shutdown; no actual RF transmission possible via
-whitelist. Verify against the real K4 on 80/40/20 for short sessions
-before trusting 24-hour unattended collection. Produce a 24h dataset
-with per-band coverage and no unaccounted gaps (gaps are allowed if
-explicitly recorded).
+Acceptance: mock K4 exercises cross-band BN/FA, transmit-before-retune,
+a competing CAT client, frozen PAN, rate change, wrong header, disconnect,
+low disk and rapid Stop. The collector emits no TX commands or invalid
+measurements. Short real-K4 tests precede trust in unattended overnight
+surveys; 24-hour output includes honest band/time coverage and gaps.
+
+### 3b. Minimal persistent web Start/Stop control (first release)
+- Implement one collector lifecycle actor shared by headless CLI and
+  `k4na serve`. Serve starts the HTTP process with acquisition Stopped;
+  an authenticated Start begins a new configured survey session, and
+  Stop cancels immediately and gracefully. No child collector processes,
+  automatic retuning restart, or second SQLite writer.
+- Single embedded static mobile-first HTML page with Running/Stopped/
+  Error, Start and Stop, current band/tile, last sweep and disk quota.
+  `GET /api/status` (browser polls ~2 seconds),
+  `POST /api/start` and `POST /api/stop`. No live spectrum plot
+  or arbitrary CAT command API.
+- Bind loopback by default; opt-in LAN binding requires strong secret,
+  session auth/CSRF protections, and no public Internet exposure.
+  `[control]` config is initially a planned schema extension and must
+  be implemented/tested before uncommenting the example.
+- CLI `--allow-retune` remains the headless opt-in; a genuinely
+  authenticated web Start plus config `allow_retune=true` replaces
+  the CLI flag in serve mode.
+- Add integration tests for repeat Start/Stop, radio disconnect during
+  Stop, browser refresh, restart default Stopped, invalid auth, and
+  rapid cancellation without stale CAT writes or partial-data loss.
+
+Acceptance: an operator on the same trusted LAN can stop a running
+survey from an iPhone browser without reaching the collector host,
+then restart it later; web status matches the underlying collector
+and closing the phone browser never stops the service.
 
 ### 4. Collector quality and reproducibility
 - Health summary CLI: frame decode errors, received vs accepted visits,
@@ -122,10 +160,11 @@ Storage: schema upgrades/rejection, identical replay, crash in middle of
 transaction, WAL cleanup, raw/summary independent lifetime, disk-full,
 clock jump, quota including temp, and never deleting foreign files.
 
-Radio safety: asserting NO unsafe CAT opcodes can reach the socket,
-TX/external-retune pauses before next setter, conditional restoration
-and explicit operator intent for writes. Test a simulated transmitting
-station and concurrent CAT client.
+Radio safety: no unsafe CAT opcode can reach the socket; a fresh TX
+veto before every retune; explicit web/CLI Start consent; Stop immediately
+blocks new retunes without restoring startup VFO. A concurrent CAT
+client may race; never mislabel its observations or claim an exclusive
+lock. Test browser controls and a simulated transmitting station.
 
 Measurement integrity: no dBm claims without calibration, no false
 "silent" observations for skipped visits, immutable source units, and
@@ -135,9 +174,9 @@ profile/gain changes creating new comparability segments.
 
 No regex-guessing radio packets without replay; no OCR/screenshot-derived
 power readings; no full-rate indefinitely retained raw stream; no
-unbounded queues; no automatic background retuning during QSOs; no
-in-place overwriting user-maintained antenna configuration; no claiming
-a birdie is household RFI without corroborating evidence.
+unbounded queues; no **automatic restart of retuning surveys** after
+reboot; no in-place overwriting user-maintained antenna configuration;
+no claiming a birdie is household RFI without corroborating evidence.
 
 The agent may propose changes to defaults based on real radio tests, but
 must document what was measured, what was inferred and any unverified

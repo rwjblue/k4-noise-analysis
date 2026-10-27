@@ -35,54 +35,48 @@ Each sample/visit records:
 If some state cannot be read, explicitly mark it unknown and limit
 comparability; do not synthesize plausible values.
 
-## Initial safety model
+## Operator-initiated survey and minimal radio controls
 
-The **passive** subcommand opens :9201 and never mutates radio state.
-The **survey** subcommand requires BOTH an opt-in in TOML and
-an explicit CLI --allow-retune. A local operator must dedicate the selected
-receiver for the run. Do not enable a background survey automatically.
+The original design contemplated continuously watching for other CAT clients,
+pausing on external VFO changes and conditionally restoring the original
+receiver settings. **That is superseded** by [manual web Start/Stop and
+cadence](operations.md). This tool is for an operator-controlled receive
+survey, not an exclusive K4 CAT lease manager.
 
-Use a typed CAT whitelist with explicit reviewed setters (for example,
-BN/FA, track/fixed pan mode, span and optionally manual AutoRef). GET-only
-requests and a small K4 meta/reporting initialization subset are permitted.
-Never provide an arbitrary CAT-script field in TOML. No commands for
-PTT/TX, test transmit, tune carrier, CW or audio.
+- **Passive** always remains non-invasive: connect :9201, optionally read
+  CAT metadata, and never send setters.
+- **Survey** starts only after intentional consent: CLI `--allow-retune`
+  or authenticated web **Start**, plus `collection.allow_retune = true`.
+  The collector is stopped on server startup and requires an operator
+  Start even after a restart.
+- **Stop** cancels planned retunes immediately, flushes a partial visit
+  and ends the session. Leave the radio at its last frequency and do
+  **not** restore startup VFO/mode/pan settings. The operator may then
+  use QK4 normally.
+- The collector retains a strict typed whitelist for receive-frequency
+  and pan control; it can never key or transmit. Before each retune,
+  perform a fresh TX-state check; transmitting, stale or unknown state
+  vetoes frequency changes. This is a best-effort safeguard, not a
+  hardware interlock or atomic reservation.
+- Do **not** poll for operator/QK4 activity every 500 ms or demand
+  complex external-state arbitration. The operator is responsible for
+  stopping before use. Concurrent QK4 tuning may race if the operator
+  forgets. Unexpected actual frame geometry/readbacks still invalidate
+  measurements, create a gap and/or require safe replanning.
+- Every retune still requires readback and observed PAN header coverage.
+  Failures must never produce mislabelled tiles or missing-as-quiet data.
+  Only the simplest relevant state is queried; changing antenna routing
+  and transmit settings remains out of scope.
+- TCP disconnects, unsupported packets, low disk, invalid state and
+  crashes must leave the collector bounded and non-transmitting. The
+  web control page stays available while the collector is Stopped or
+  in Error, unless the hosting process itself has failed.
 
-Preflight:
-1. Probe CAT and :9201 independently; record firmware, settings and mode.
-   Fail on unsupported hardware/protocol, missing spectrum, no safe snapshot,
-   or unknown transmit state.
-2. Refuse active survey when transmitting, keying, split/diversity/receive
-   bindings are incompatible, or receiver ownership is uncertain. Detect
-   concurrent CAT changes; survey is not a cooperative tuner for QK4.
-3. Snapshot all settings the program intends to modify. Prefer changing
-   only the minimal state needed for coverage. Do not modify the TX antenna
-   or RX antenna routing in the first milestone; require the operator to
-   select the correct protected RX input manually.
-4. Check free space and estimated upper bound. Require capacity for at
-   least one intended retention window under the configured quota.
-5. Print the planned bands/tiles, expected maximum cycle time and disk
-   budget. Dry-run performs no CAT setters.
-
-Runtime:
-- Observe TX state and external VFO/state changes via CAT and relevant
-  unsolicited updates; poll/fresh-read before each retune as needed.
-  Unknown/stale TX state -> stop issuing CAT writes, pause and log a gap.
-- Each retune must be acknowledged/read back; verify subsequent PAN
-  headers cover the requested tile before accepting samples. Changes to
-  observed center/rate/gain mid-visit split or invalidate the visit.
-- Pause when the operator transmits or a second client changes frequency,
-  mode, pan or antenna selection. Do not fight a human/QK4 for control.
-  Resume only under documented explicit safe criteria; manual resume is
-  the conservative initial behavior.
-- On shutdown/signal/crash, flush durable data, stop writes and restore
-  the last collector-owned state **only if** current state still matches
-  the value the collector last set. Otherwise preserve the newer state
-  and report the skipped restoration. Recovery after abrupt termination
-  must not auto-restore stale values on restart.
-- No large unbounded channels; apply bounded backpressure/drop policy to
-  optional raw samples only. Still record frame losses/gaps and refuse to
-  claim complete coverage when writer/decoder cannot keep up.
+The current strict Rust TOML schema still contains legacy
+`pause_on_external_change` and `manual_resume_on_conflict` fields.
+The implementation agent should update that schema, its tests and the
+example when implementing this superseding design. See operations.md
+for the web API, LAN authentication and service lifecycle contracts.
 
 ## Band planner
 
@@ -102,14 +96,20 @@ centers/modes; reject unsupported or unreachable tiles and record them.
 On change of observed rate, rebuild the remaining plan and log why.
 Each accepted visit records its requested and actual interval.
 
-Start with sample survey settings of 3 seconds dwell plus 700 ms for
-tuning/settling. Actual acceptance begins only after a verified fresh PAN
-frame following the CAT retune. The values are tunable, not hardware claims.
-Use band-fair round-robin scheduling so the long 10m interval does not
-indefinitely starve small bands. Record the timestamp of every visit and
-actual revisit interval. Advertise the actual measured coverage fraction
-per band per hour and the largest revisit gaps: a full-band scan cannot
-detect every intermittent emission between visits.
+Start with **5 seconds measured dwell**, **700 ms settle**, and a
+configurable **five-minute minimum start-to-start cycle period**.
+The current 96 kHz, 2,048-bin, 80%-usable planner has 50 windows across
+the default eight bands, so 50 * 5.7 = 285 seconds before overhead.
+A practical sweep is approximately 5–6 minutes. Each frame must be
+captured after tuning has settled and actual PAN coverage is verified.
+Group tiles by band to avoid gratuitous filter switches and visit all
+bands on every complete cycle; never skip tiles to satisfy a target
+period. If a cycle finishes early, wait until the configured minimum
+interval; if late, run the next cycle without overlap. Report actual
+cycle time and observed revisit/coverage gaps, not a guaranteed
+five-minute cadence. Some rates/spans demand far more tiles.
+See [operations](operations.md) for the calculation and future focused
+monitoring alternative.
 
 Optional per-band weighting and higher-resolution followup windows
 are useful later, but not required for a functioning first full-band survey.
@@ -158,6 +158,7 @@ k4na estimate --config config.toml --duration 24h
 k4na capture --config config.toml --duration 5m
 k4na survey --config config.toml --duration 24h --dry-run
 k4na survey --config config.toml --duration 24h --allow-retune
+k4na serve --config config.toml  # default: stopped; web Start required
 k4na inspect --data ./data
 k4na replay --input fixture.bin
 ~~~
@@ -173,11 +174,12 @@ to be impossible on a particular K4 firmware or operating configuration.
   huge garbage, reconnection and bounded buffering.
 - Replay the author's R39 captures from HaLo, with appropriate license/
   provenance, to match the independently documented centers, rates and bins.
-- Simulated CAT session: TX begins while surveying; other user retunes;
-  CAT readback differs; fixed pan refuses to follow; network drops;
-  receiver disappears; writer becomes read-only/full. In each case no
-  transmit is sent, no bad-coverage row is accepted, and the run stays
-  bounded and tells the operator why.
+- Simulated CAT session: TX active before retune, an operator concurrently
+  retunes, CAT readback differs, fixed pan refuses to follow, network
+  drops, receiver disappears, or writer becomes read-only/full. In each
+  case no TX command is sent, no bad-coverage row is accepted, and the
+  run stays bounded and explains missing observations. No elaborate
+  operator-presence detector is required.
 - Live 5-minute passive and limited 80/40/20 survey acceptance against
   a physical K4 before enabling unattended 24-hour mode.
 - Observe manual vs AutoRef levels, display span vs packet sample rate and

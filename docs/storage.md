@@ -106,13 +106,15 @@ Initial defaults in ../config/example.toml:
 
 Illustrative upper-bound scale: five i16 summary arrays occupy
 5 * 2048 * 2 = 20,480 bytes per visit before compression and row
-overhead. An example 45-tile plan, 3 second dwell plus 700 ms settle
-per tile, makes about 23,350 visits/day and ~478 MB of summary arrays
-per day before compression. Capturing one original packet/second
-continuously would be ~360 MB/day. These are *planning estimates*;
-actual frame rates, tile counts, sample sizes and SQLite overhead are
-measured at runtime. A 24-hour retention target must not silently
-override the hard disk ceiling.
+overhead. With the proposed [five-minute cycle](operations.md) and
+the current 50-tile 96 kHz plan, 288 cycles/day yield about 14,400
+visits/day and ~295 MB of summary arrays before compression. Sampling
+five original 4,162-byte packets per tile/cycle yields about 300 MB
+of raw packets per day before compression and row overhead.
+These are *planning estimates*, not 24-hour live measurements: actual
+cycle times, frame counts, payloads and SQLite overhead must be measured.
+A 24-hour protected retention target and the 4 GiB cap take priority over
+nominal 30-day summary retention, so the full 30 days may not be possible.
 
 Implement both a preflight --estimate mode and live counters: bytes in
 each retention class, total including WAL and temp, volume free bytes,

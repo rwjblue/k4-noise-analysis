@@ -1,6 +1,8 @@
-# Proposed configuration contract; parsed commands are NOT implemented yet.
-# This file documents intended defaults for an initial 24h collection.
-# Running an active survey must additionally require CLI --allow-retune.
+# Partially implemented strict configuration contract. This remains
+# parseable by the current Rust core. The future web controller/cycle cadence
+# additions are documented in docs/operations.md.
+# CLI survey requires --allow-retune; authenticated web Start will itself
+# provide operator intent when its control service is implemented.
 
 [radio]
 host = "k4.local"
@@ -21,10 +23,15 @@ allow_retune = true           # CLI --allow-retune is ALSO mandatory
 requested_pan_span_hz = 40000 # scope setting; not the sampled packet width
 usable_fraction = 0.80       # leave 10% packet edges on both sides
 settle_ms = 700
-dwell_ms = 3000
+dwell_ms = 5000
 pause_on_transmit = true
+# Compatibility: the CURRENT strict parser requires these fields to be true.
+# The follow-on manual-control design removes the mandatory external-client
+# interlock once implemented; see docs/operations.md.
 pause_on_external_change = true
 manual_resume_on_conflict = true
+# Planned, NOT yet parsed (leave commented until Rust schema is updated):
+# min_cycle_interval_ms = 300000
 # During survey: full spectrum arrives, all valid frames are summarized.
 raw_sample_interval_ms = 1000 # at most one original packet per second/pan
 
