@@ -183,7 +183,12 @@ impl Halt {
 
 impl From<CatError> for Halt {
     fn from(e: CatError) -> Self {
-        Halt::CatLost(format!("CAT failed ({e}); radio state is unknown"))
+        match e {
+            // Refused locally: nothing was sent and the state is known, but
+            // the collector cannot continue as planned.
+            CatError::Unsafe(_) => Halt::Conflict(format!("collector {e}; nothing was sent")),
+            _ => Halt::CatLost(format!("CAT failed ({e}); radio state is unknown")),
+        }
     }
 }
 
@@ -270,8 +275,16 @@ impl BandMemory {
         }
     }
 
-    /// Setters that put this memory back, given the current readback.
+    /// Setters that put this memory back, given the current readback, and
+    /// the values that cannot be sent (left as the survey set them).
     fn put_back(&self, now: &Readback) -> (Vec<Setter>, Vec<String>) {
+        let (wanted, mut unsettable) = self.wanted(now);
+        let (setters, unsendable): (Vec<Setter>, Vec<Setter>) = wanted.into_iter().partition(|s| s.is_sendable());
+        unsettable.extend(unsendable.into_iter().map(|s| s.wire()));
+        (setters, unsettable)
+    }
+
+    fn wanted(&self, now: &Readback) -> (Vec<Setter>, Vec<String>) {
         let mut setters = Vec::new();
         let mut unsettable = Vec::new();
         if let Some(fa) = self.fa
@@ -767,7 +780,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             let _ = self.record(self.event(EventKind::StateChanged, msg)).await;
         }
         for s in unsettable {
-            let msg = format!("band {band}'s original RX input {s} cannot be selected by the collector");
+            let msg = format!("band {band}'s own {s} cannot be sent by the collector; left as the survey set it");
             let _ = self.record(self.event(EventKind::Warning, msg)).await;
         }
         Ok(wire)
@@ -1165,6 +1178,12 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             && self.baseline.flag(Query::FixedTune) != Some(fixed)
         {
             setters.push(Setter::FixedTune(fixed));
+        }
+        let (setters, unsendable): (Vec<Setter>, Vec<Setter>) = setters.into_iter().partition(|s| s.is_sendable());
+        let skipped: String = unsendable.iter().map(|s| s.wire()).collect();
+        if !skipped.is_empty() {
+            let msg = format!("original {skipped} cannot be sent by the collector; not restored");
+            let _ = self.record(self.event(EventKind::Warning, &msg)).await;
         }
         if setters.is_empty() && sent.is_empty() {
             let msg = "radio already in its original state".to_owned();

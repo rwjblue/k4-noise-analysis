@@ -218,6 +218,13 @@ impl Setter {
             Setter::RxInput(i) => format!("AR{};", i.0),
         }
     }
+
+    /// Whether the whitelist would send this setter. A value the radio
+    /// reported can still be outside the reviewed range (a K4D on R39
+    /// stored `#SPN5000`, below the documented 6000).
+    pub fn is_sendable(self) -> bool {
+        check_wire(&self.wire(), true).is_ok()
+    }
 }
 
 const SETTER_PREFIXES: [&str; 5] = ["BN", "FA", "#SPN", "#FXT", "AR"];

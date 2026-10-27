@@ -421,6 +421,31 @@ async fn per_band_span_track_and_vfo_memories_are_put_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_recalled_span_outside_the_whitelist_is_reported_not_fatal() {
+    // A K4D on R39 stored #SPN5000 for 30 m (K4 band 4), below the
+    // documented 6000..=368000 the whitelist allows.
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.band_span.insert(4, 5_000);
+    });
+    let run = survey(radio, 600, |_| {}).await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.restore.starts_with("restored"), "{}", r.restore);
+    assert!(!run.radio.setters_received().iter().any(|s| s == "#SPN5000;"));
+    let m = run.radio.model();
+    assert_eq!((m.bn, m.fa, m.span), (5, 14_074_000, 40_000));
+    assert_eq!(m.band_span.get(&4), Some(&40_000), "left as the survey set it");
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    assert!(
+        ds.visits()
+            .unwrap()
+            .iter()
+            .any(|v| v.band_id.as_deref() == Some("30m") && v.status == "complete")
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_band_recalling_a_fixed_pan_without_opt_in_ends_and_restores() {
     let radio = SimRadio::new(15);
     radio.update(|m| {
