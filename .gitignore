@@ -1,0 +1,21 @@
+# Local measurements and generated reports
+/data/
+/output/
+/reports/
+/config/local.toml
+
+# Future Rust workspace build products
+/target/
+
+# Operator-only settings/secrets
+.env
+.env.*
+!.env.example
+
+# SQLite journals (including outside default data directory)
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+
+# OS/editor
+.DS_Store
