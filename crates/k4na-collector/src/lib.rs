@@ -5,6 +5,7 @@ pub mod cat;
 pub mod measure;
 pub mod net;
 pub mod passive;
+pub mod recovery;
 pub mod runtime;
 pub mod spectrum;
 pub mod store_task;

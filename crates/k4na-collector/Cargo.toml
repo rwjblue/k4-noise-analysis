@@ -10,11 +10,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+hex = "0.4.3"
 k4na-core = { version = "0.1.0", path = "../k4na-core" }
 k4na-protocol = { version = "0.1.0", path = "../k4na-protocol" }
 k4na-store = { version = "0.1.0", path = "../k4na-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.1.8"

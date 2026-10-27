@@ -517,12 +517,14 @@ dependencies = [
 name = "k4na-collector"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "k4na-core",
  "k4na-protocol",
  "k4na-sim",
  "k4na-store",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
