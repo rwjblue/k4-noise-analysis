@@ -68,7 +68,9 @@ pub const MUST_BE_OFF: [Query; 6] = [
 pub const FA_STEP_HZ: u64 = 100;
 
 /// How often the interlock is polled during a dwell.
-pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
+fn poll_interval(cfg: &Config) -> Duration {
+    Duration::from_millis(cfg.collection.cat_poll_ms)
+}
 
 /// How long to wait for spectrum after tuning before giving up on a tile.
 const FRAME_WAIT: Duration = Duration::from_secs(5);
@@ -113,6 +115,13 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
         }
     }
     // #FRZ may be unsupported; refuse only if it is known to be on.
+    if rb.flag(Query::FixedTune) == Some(true) && !cfg.collection.set_pan_track_mode {
+        problems.push(
+            "the pan is fixed (#FXT1) and would not follow FA; set collection.set_pan_track_mode = true to let \
+             the survey switch it to track mode (restored afterwards)"
+                .to_owned(),
+        );
+    }
     if rb.flag(Query::Freeze) == Some(true) {
         problems.push("the pan display is frozen (#FRZ1), so frames would not be live".to_owned());
     }
@@ -463,14 +472,15 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// visit and the halt that ended it early, if any.
     async fn dwell(&mut self, mut v: VisitBuilder) -> (VisitBuilder, Option<Halt>) {
         let dwell_end = tokio::time::Instant::now() + Duration::from_millis(self.cfg.collection.dwell_ms);
-        let mut next_poll = tokio::time::Instant::now() + POLL_INTERVAL;
+        let poll = poll_interval(self.cfg);
+        let mut next_poll = tokio::time::Instant::now() + poll;
         loop {
             let now = tokio::time::Instant::now();
             if now >= dwell_end {
                 return (v, None);
             }
             if now >= next_poll {
-                next_poll = now + POLL_INTERVAL;
+                next_poll = now + poll;
                 if let Err(h) = self.check().await {
                     v.flag("interlock");
                     return (v, Some(h));
@@ -569,13 +579,16 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     ) -> Step<(u64, Settled)> {
         let mut fa = self.tune(center_hz).await?;
         let mut settled = self.settle().await?;
-        let Some(g) = settled.geometry else {
-            return Ok((fa, settled));
-        };
-        self.offset_hz = g.center_hz as i64 - fa as i64;
-        if let Some(target) = target
-            && !g.usable_range(self.cfg.collection.usable_fraction).covers(target)
-        {
+        let mut corrections = 0;
+        while let Some(g) = settled.geometry {
+            self.offset_hz = g.center_hz as i64 - fa as i64;
+            let Some(target) = target else { break };
+            if g.usable_range(self.cfg.collection.usable_fraction).covers(target)
+                || corrections >= self.cfg.collection.max_tile_corrections
+            {
+                break;
+            }
+            corrections += 1;
             let msg = format!(
                 "pan center {} Hz with FA {} Hz misses target {}..{} Hz; retuning with learned offset {} Hz",
                 g.center_hz, fa, target.low_hz, target.high_hz, self.offset_hz
@@ -584,9 +597,6 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 .await?;
             fa = self.tune(center_hz).await?;
             let again = self.settle().await?;
-            if let Some(g2) = again.geometry {
-                self.offset_hz = g2.center_hz as i64 - fa as i64;
-            }
             settled = Settled {
                 geometry: again.geometry,
                 discarded: settled.discarded + again.discarded,
@@ -731,7 +741,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         // Track mode and requested span, only if their originals are known
         // (so they can be restored).
         let mut setup = Vec::new();
-        if self.original.flag(Query::FixedTune) == Some(true) {
+        // Preflight refused a fixed pan unless set_pan_track_mode allows this.
+        if self.original.flag(Query::FixedTune) == Some(true) && self.cfg.collection.set_pan_track_mode {
             setup.push(Setter::FixedTune(false));
         }
         if let (Some(span), Some(_)) = (

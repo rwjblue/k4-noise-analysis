@@ -190,20 +190,24 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
 - Setters are limited to `BN`, `FA` (rounded to 100 Hz), `#SPN` and
   `#FXT`. Mode, antennas, gain and display reference are never set.
 - Preflight (GET-only) refuses unless `TQ` reads 0; `LK`, `FT`, `DV`,
-  `SB`, `RT`, `XT` read 0; `#FRZ` is not 1; FA/BN are readable; and,
-  when `require_firmware_readback`, `RV` answered.
+  `SB`, `RT`, `XT` read 0; `#FRZ` is not 1; FA/BN are readable; the pan
+  is not fixed (`#FXT1`) unless `collection.set_pan_track_mode = true`
+  lets the survey switch it to track; and, when
+  `require_firmware_readback`, `RV` answered.
 - Before each change the interlock (TQ plus FA, FB, BN, MD, FT, DV, SB,
   LK, RT, XT, #SPN, #FXT, #FRZ) must equal the baseline. After setters,
   the full state is read back. The setters must be confirmed, nothing they
   should not affect may move, and the readback becomes the new baseline.
-  It is polled every 500 ms during a dwell.
+  It is polled every `collection.cat_poll_ms` (default 500 ms) during a
+  dwell.
 - Any transmit, unreadable TQ, or difference from the baseline is operator
   activity. The survey **stops** with no further setters and leaves the
   radio alone. Resuming means starting a new run (manual resume).
 - Lost CAT means unknown radio state: no retune and no restore.
 - The plan is built from the packet rate observed after a probe tune and
   rebuilt if the rate changes. The pan-center offset from FA is learned
-  from headers, with one correction retune per tile. A tile whose header
+  from headers, with up to `collection.max_tile_corrections` (default 2)
+  correction retunes per tile. A tile whose header
   coverage still misses its target becomes a `coverage_unverified` event,
   not a visit. Settle frames are discarded and counted.
 - Clean ends (duration, signal, storage suspension, no usable spectrum)

@@ -55,7 +55,9 @@ async fn survey_with(
     script: impl FnOnce(SimRadio) + Send + 'static,
 ) -> Run {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = config(&dir.path().join("data"), "survey");
+    let mut cfg = config(&dir.path().join("data"), "survey");
+    // Some scenarios start from a fixed pan; opt in to switching it.
+    cfg.collection.set_pan_track_mode = true;
     let clock: Arc<dyn Clock> = clock();
     let mut cat = control(&radio).await;
     let pre = preflight(&mut cat, &cfg).await.unwrap();
@@ -285,6 +287,10 @@ async fn preflight_refuses_unsafe_or_unknown_states_without_setters() {
         ("no TQ", Box::new(|r: &SimRadio| r.faults(|f| f.no_tq = true))),
         ("no RV", Box::new(|r: &SimRadio| r.faults(|f| f.no_revisions = true))),
         ("frozen pan", Box::new(|r: &SimRadio| r.update(|m| m.freeze = true))),
+        (
+            "fixed pan without opt-in",
+            Box::new(|r: &SimRadio| r.update(|m| m.fixed = true)),
+        ),
     ] {
         let radio = SimRadio::new(15);
         setup(&radio);
