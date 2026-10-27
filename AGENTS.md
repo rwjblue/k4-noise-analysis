@@ -29,3 +29,5 @@ respect its MPL-2.0 obligations, record provenance, and verify any
 copying is permitted. Keep changes incremental with short focused
 commits; update docs and tests whenever behavior or contracts change.
 See docs/implementation-plan.md for the ordered acceptance gates.
+
+commit-message-default: auto
