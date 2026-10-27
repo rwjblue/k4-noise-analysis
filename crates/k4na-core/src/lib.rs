@@ -1,7 +1,12 @@
 //! Domain types, configuration, survey planning and online visit
 //! statistics. No networking or storage.
 
+pub mod aggregate;
+pub mod band;
 pub mod config;
+pub mod model;
+pub mod plan;
+pub mod time;
 pub mod units;
 
 pub use config::Config;
