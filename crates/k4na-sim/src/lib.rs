@@ -15,10 +15,10 @@ use k4na_protocol::synth::SyntheticFrame;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Commands the collector must never send. Seeing any of them is a test
-/// failure; the simulator records them separately.
+/// failure; the simulator records them separately. `K4n` would change the
+/// CAT meta-mode other clients parse; the collector only reads it.
 pub const FORBIDDEN_PREFIXES: &[&str] = &[
-    "TX", "RX", "TU", "TS", "KY", "SW", "DA", "PC", "EC", "EE", "PS", "MN", "AI", "K3", "FB", "MD", "PA", "RA", "AR",
-    "AN",
+    "TX", "RX", "TU", "TS", "KY", "SW", "DA", "PC", "EC", "EE", "PS", "MN", "AI", "K3", "K4", "FB", "MD", "AR", "AN",
 ];
 
 #[derive(Debug, Clone)]
@@ -38,8 +38,20 @@ pub struct RadioModel {
     pub fixed: bool,
     pub fixed_center: u64,
     pub freeze: bool,
-    pub preamp: u8,
-    pub attenuator: u8,
+    /// Current main-receiver measurement settings.
+    pub rx: RxSettings,
+    /// Where the K4 keeps `rx` (unverified on hardware, so tests run every
+    /// model): recalled by `BN` and, with `BandInput`, by `AR`.
+    pub rx_scope: RxScope,
+    /// Stored receiver settings keyed by (band, input); input 0 when the
+    /// scope is per band.
+    pub rx_memory: BTreeMap<(u8, u8), RxSettings>,
+    /// Panadapter noise blanker (0 off, 1 on, 2 auto), level and averaging.
+    pub pan_nb: u8,
+    pub pan_nb_level: u8,
+    pub pan_averaging: u8,
+    /// `K41` advanced response formats instead of `K40` basic ones.
+    pub meta_advanced: bool,
     /// Last FA per band, recalled by `BN` (band stack).
     pub band_stack: BTreeMap<u8, u64>,
     /// Main-RX input (`AR`): 1 RX ANT IN2, 2 TX antenna, 4 RX ANT IN1,
@@ -58,7 +70,172 @@ pub struct RadioModel {
     pub band_fixed: BTreeMap<u8, bool>,
 }
 
+/// Main-receiver settings that affect measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxSettings {
+    pub preamp_level: u8,
+    pub preamp_on: bool,
+    pub att_db: u8,
+    pub att_on: bool,
+    pub rf_gain_db: u8,
+    /// 0 off, 1 slow, 2 fast.
+    pub agc: u8,
+    pub nb_level: u8,
+    pub nb_on: bool,
+    pub nr_level: u8,
+    pub nr_on: bool,
+}
+
+impl Default for RxSettings {
+    /// The K4D's observed 40 m state: PRE1, no attenuator, AGC fast.
+    fn default() -> Self {
+        Self {
+            preamp_level: 1,
+            preamp_on: true,
+            att_db: 0,
+            att_on: false,
+            rf_gain_db: 0,
+            agc: 2,
+            nb_level: 5,
+            nb_on: false,
+            nr_level: 1,
+            nr_on: false,
+        }
+    }
+}
+
+impl RxSettings {
+    /// Synthetic level change (native units) from the front end, relative
+    /// to the default PRE1 state.
+    fn level_offset(&self) -> i16 {
+        fn abs(s: &RxSettings) -> i16 {
+            let pre = if s.preamp_on { i16::from(s.preamp_level) * 40 } else { 0 };
+            pre - if s.att_on { i16::from(s.att_db) * 10 } else { 0 }
+        }
+        abs(self) - abs(&RxSettings::default())
+    }
+}
+
+/// Storage scope of receiver settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RxScope {
+    /// One set for all bands.
+    Global,
+    /// Recalled by `BN`.
+    #[default]
+    Band,
+    /// Recalled by `BN` and by `AR` (per band and RX input).
+    BandInput,
+}
+
 impl RadioModel {
+    fn rx_key(&self, band: u8, input: u8) -> Option<(u8, u8)> {
+        match self.rx_scope {
+            RxScope::Global => None,
+            RxScope::Band => Some((band, 0)),
+            RxScope::BandInput => Some((band, input)),
+        }
+    }
+
+    /// Saves `rx` for the current context and recalls the one for
+    /// (`band`, `input`).
+    fn switch_rx_context(&mut self, band: u8, input: u8) {
+        if let Some(k) = self.rx_key(self.bn, self.rx_input) {
+            self.rx_memory.insert(k, self.rx);
+        }
+        if let Some(k) = self.rx_key(band, input) {
+            self.rx = self.rx_memory.get(&k).copied().unwrap_or(self.rx);
+        }
+    }
+
+    /// Stored receiver settings for (band, input), the current ones when
+    /// that context is active.
+    pub fn rx_settings(&self, band: u8, input: u8) -> RxSettings {
+        match self.rx_key(band, input) {
+            None => self.rx,
+            Some(k) if self.rx_key(self.bn, self.rx_input) == Some(k) => self.rx,
+            Some(k) => self.rx_memory.get(&k).copied().unwrap_or(self.rx),
+        }
+    }
+
+    fn rx_readback(&self, prefix: &str) -> String {
+        let f = |b: bool| u8::from(b);
+        let rx = &self.rx;
+        let adv = self.meta_advanced;
+        match prefix {
+            "PA" if adv => format!("{}{}", rx.preamp_level, f(rx.preamp_on)),
+            "PA" => format!("{}", if rx.preamp_on { rx.preamp_level } else { 0 }),
+            "RA" if adv => format!("{:02}{}", rx.att_db, f(rx.att_on)),
+            "RA" => format!("{:02}", f(rx.att_on)),
+            "RG" => format!("-{:02}", rx.rf_gain_db),
+            "GT" if adv => format!("{}", rx.agc),
+            "GT" => match rx.agc {
+                1 => "004",
+                2 => "002",
+                _ => "000",
+            }
+            .to_owned(),
+            "NB" if adv => format!("{:02}{}", rx.nb_level, f(rx.nb_on)),
+            "NB" => format!("{}", f(rx.nb_on)),
+            "NR" => format!("{:02}{}", rx.nr_level, f(rx.nr_on)),
+            _ => String::new(),
+        }
+    }
+
+    /// Applies a receiver setter; `false` if it is not one.
+    fn rx_set(&mut self, cmd: &str) -> bool {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let n = |s: &str| s.parse::<u8>().unwrap_or(0);
+        let rx = &mut self.rx;
+        if let Some(v) = cmd.strip_prefix("#NBL").filter(|v| digits(v)) {
+            self.pan_nb_level = n(v);
+        } else if let Some(v) = cmd.strip_prefix("#NB").filter(|v| digits(v)) {
+            self.pan_nb = n(v);
+        } else if let Some(v) = cmd.strip_prefix("#AVG").filter(|v| digits(v)) {
+            self.pan_averaging = n(v);
+        } else if let Some(v) = cmd.strip_prefix("PA").filter(|v| digits(v)) {
+            match v.len() {
+                1 => {
+                    rx.preamp_on = n(v) > 0;
+                    if n(v) > 0 {
+                        rx.preamp_level = n(v);
+                    }
+                }
+                _ => {
+                    rx.preamp_level = n(&v[..1]);
+                    rx.preamp_on = &v[1..] == "1";
+                }
+            }
+        } else if let Some(v) = cmd.strip_prefix("RA").filter(|v| digits(v)) {
+            match v.len() {
+                2 => rx.att_on = n(v) == 1,
+                _ => {
+                    rx.att_db = n(&v[..2]);
+                    rx.att_on = &v[2..] == "1";
+                }
+            }
+        } else if let Some(v) = cmd.strip_prefix("RG-").filter(|v| digits(v)) {
+            rx.rf_gain_db = n(v);
+        } else if let Some(v) = cmd.strip_prefix("GT").filter(|v| digits(v)) {
+            rx.agc = match v {
+                "002" => 2,
+                "004" => 1,
+                v => n(v),
+            };
+        } else if let Some(v) = cmd.strip_prefix("NB").filter(|v| digits(v)) {
+            if v.len() == 3 {
+                rx.nb_level = n(&v[..2]);
+            }
+            rx.nb_on = v.ends_with('1');
+        } else if let Some(v) = cmd.strip_prefix("NR").filter(|v| digits(v)) {
+            rx.nr_level = n(&v[..2]);
+            rx.nr_on = v.ends_with('1');
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// The port actually feeding the main receiver, in station-config
     /// terms.
     pub fn rx_port(&self) -> Option<&'static str> {
@@ -111,8 +288,13 @@ impl Default for RadioModel {
             fixed: false,
             fixed_center: 14_074_000,
             freeze: false,
-            preamp: 1,
-            attenuator: 0,
+            rx: RxSettings::default(),
+            rx_scope: RxScope::default(),
+            rx_memory: BTreeMap::new(),
+            pan_nb: 0,
+            pan_nb_level: 8,
+            pan_averaging: 2,
+            meta_advanced: false,
             band_stack,
             rx_input: 4,
             tx_antenna: 1,
@@ -148,6 +330,9 @@ pub struct Faults {
     pub extra_pans: bool,
     /// Do not answer `RV`.
     pub no_revisions: bool,
+    /// Accept but ignore setters with these prefixes (readback then
+    /// mismatches), e.g. `"PA"`.
+    pub ignore_setters: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -259,7 +444,7 @@ impl SimRadio {
             .strip_prefix("AR")
             .is_some_and(|v| matches!(v, "1" | "2" | "4" | "5" | "6" | "7"));
         if FORBIDDEN_PREFIXES.iter().any(|p| cmd.starts_with(p))
-            && !matches!(cmd, "AR" | "AN" | "PA" | "RA" | "MD" | "FB")
+            && !matches!(cmd, "AR" | "AN" | "MD" | "FB" | "K4")
             && !rx_input_setter
         {
             // Parameterless GET forms of these are allowed; anything else
@@ -272,7 +457,7 @@ impl SimRadio {
         let m = &mut inner.model;
         let flag = |b: bool| u8::from(b);
         let resp = match cmd {
-            "K4" => "K40".to_owned(),
+            "K4" => format!("K4{}", flag(m.meta_advanced)),
             "OM" => "OM -P-S----4---".to_owned(),
             "TQ" => {
                 if faults.no_tq {
@@ -297,20 +482,15 @@ impl SimRadio {
             "#REF" => "#REF-110".to_owned(),
             "#SCL" => "#SCL70".to_owned(),
             "#AR" => "#AR0906+081".to_owned(),
-            "#AVG" => "#AVG04".to_owned(),
-            "#NB" => "#NB0".to_owned(),
-            "#NBL" => "#NBL8".to_owned(),
+            "#AVG" => format!("#AVG{}", m.pan_averaging),
+            "#NB" => format!("#NB{}", m.pan_nb),
+            "#NBL" => format!("#NBL{}", m.pan_nb_level),
             "#PKM" => "#PKM0".to_owned(),
             "#FPS" => "#FPS15".to_owned(),
             "NA" => "NA0".to_owned(),
             "NM" => "NM01760".to_owned(),
             "OV" => "OV00".to_owned(),
-            "PA" => format!("PA{}", m.preamp),
-            "RA" => format!("RA{:02}", m.attenuator),
-            "GT" => "GT2".to_owned(),
-            "RG" => "RG-00".to_owned(),
-            "NB" => "NB0".to_owned(),
-            "NR" => "NR0".to_owned(),
+            "PA" | "RA" | "GT" | "RG" | "NB" | "NR" => format!("{cmd}{}", m.rx_readback(cmd)),
             "AR" => format!("AR{}", m.rx_input),
             "AN" => format!("AN{}", m.tx_antenna),
             "RV" => {
@@ -337,9 +517,11 @@ impl SimRadio {
                         m.band_rx_input.insert(cur, input);
                         m.band_span.insert(cur, span);
                         m.band_fixed.insert(cur, fixed);
+                        let new_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
+                        m.switch_rx_context(v, new_input);
                         m.bn = v;
                         m.fa = m.band_stack.get(&v).copied().unwrap_or(m.fa);
-                        m.rx_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
+                        m.rx_input = new_input;
                         m.span = m.band_span.get(&v).copied().unwrap_or(m.span);
                         m.fixed = m.band_fixed.get(&v).copied().unwrap_or(m.fixed);
                         m.fixed_center = m.fa;
@@ -349,8 +531,16 @@ impl SimRadio {
                 if rx_input_setter {
                     let v: u8 = cmd[2..].parse().unwrap_or(0);
                     if !m.transmitting && (m.atu || !(5..=7).contains(&v)) {
+                        let bn = m.bn;
+                        m.switch_rx_context(bn, v);
                         m.rx_input = v;
                     }
+                    return None;
+                }
+                if faults.ignore_setters.iter().any(|p| cmd.starts_with(p.as_str())) {
+                    return None;
+                }
+                if m.rx_set(cmd) {
                     return None;
                 }
                 if let Some(v) = cmd.strip_prefix("#SPN").and_then(|v| v.parse::<u32>().ok()) {
@@ -380,7 +570,7 @@ impl SimRadio {
         let seed_index = if freeze { 0 } else { frame_index };
         let port = self.lock().model.rx_port();
         let mut bins = synth_bins(center, rate, seed_index);
-        let offset = port_floor_offset(port);
+        let offset = port_floor_offset(port) + self.lock().model.rx.level_offset();
         for b in &mut bins {
             *b = b.saturating_add(offset);
         }

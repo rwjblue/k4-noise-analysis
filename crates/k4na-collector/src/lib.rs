@@ -2,6 +2,7 @@
 //! capture, opt-in survey and the storage writer thread.
 
 pub mod cat;
+pub mod measure;
 pub mod net;
 pub mod passive;
 pub mod runtime;

@@ -178,7 +178,7 @@ impl Query {
         format!("{};", self.prefix())
     }
 
-    fn from_prefix(p: &str) -> Option<Query> {
+    pub fn from_prefix(p: &str) -> Option<Query> {
         Query::ALL.into_iter().find(|q| q.prefix() == p)
     }
 }
@@ -224,6 +224,61 @@ pub enum Setter {
     FixedTune(bool),
     /// `ARn;` main-RX input (receive routing only).
     RxInput(RxInput),
+    /// Main-receiver measurement settings (receive path only).
+    Receiver(ReceiverSetter),
+}
+
+/// Main-receiver settings that change what the receiver and panadapter
+/// measure. `Basic` forms are the K3-compatible ones a `K40` radio reads
+/// back; `Advanced` forms are the documented K4 ones for `K41`. None
+/// affects the transmitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReceiverSetter {
+    /// `PAn;` preamp level 0..=3 (0 = off).
+    PreampBasic(u8),
+    /// `PAnm;` preamp level 0..=3 and on/off.
+    PreampAdvanced(u8, bool),
+    /// `RA00;` attenuator off (the only basic value with an unambiguous
+    /// readback).
+    AttenuatorOffBasic,
+    /// `RAnnm;` 0..=21 dB in 3 dB steps and on/off.
+    AttenuatorAdvanced(u8, bool),
+    /// `RG-nn;` RF gain reduction 0..=60 dB.
+    RfGain(u8),
+    /// `GT002;` fast or `GT004;` slow (K3 form).
+    AgcBasic { slow: bool },
+    /// `GTn;` 0 off, 1 slow, 2 fast.
+    AgcAdvanced(u8),
+    /// `NBm;` receiver noise blanker on/off.
+    NoiseBlankerBasic(bool),
+    /// `NBnnm;` level 0..=15 and on/off.
+    NoiseBlankerAdvanced(u8, bool),
+    /// `NRnnm;` level 1..=10 and on/off.
+    NoiseReduction(u8, bool),
+    /// `#NBn;` 0 off, 1 on, 2 auto.
+    PanNoiseBlanker(u8),
+    /// `#AVGnn;` 1..=20.
+    PanAveraging(u8),
+}
+
+impl ReceiverSetter {
+    pub fn wire(self) -> String {
+        let f = u8::from;
+        match self {
+            ReceiverSetter::PreampBasic(l) => format!("PA{l};"),
+            ReceiverSetter::PreampAdvanced(l, on) => format!("PA{l}{};", f(on)),
+            ReceiverSetter::AttenuatorOffBasic => "RA00;".to_owned(),
+            ReceiverSetter::AttenuatorAdvanced(db, on) => format!("RA{db:02}{};", f(on)),
+            ReceiverSetter::RfGain(db) => format!("RG-{db:02};"),
+            ReceiverSetter::AgcBasic { slow } => if slow { "GT004;" } else { "GT002;" }.to_owned(),
+            ReceiverSetter::AgcAdvanced(n) => format!("GT{n};"),
+            ReceiverSetter::NoiseBlankerBasic(on) => format!("NB{};", f(on)),
+            ReceiverSetter::NoiseBlankerAdvanced(l, on) => format!("NB{l:02}{};", f(on)),
+            ReceiverSetter::NoiseReduction(l, on) => format!("NR{l:02}{};", f(on)),
+            ReceiverSetter::PanNoiseBlanker(n) => format!("#NB{n};"),
+            ReceiverSetter::PanAveraging(n) => format!("#AVG{n:02};"),
+        }
+    }
 }
 
 impl Setter {
@@ -234,6 +289,28 @@ impl Setter {
             Setter::Span(hz) => format!("#SPN{hz};"),
             Setter::FixedTune(fixed) => format!("#FXT{};", u8::from(fixed)),
             Setter::RxInput(i) => format!("AR{};", i.0),
+            Setter::Receiver(r) => r.wire(),
+        }
+    }
+
+    /// The query whose readback verifies this setter.
+    pub fn query(self) -> Query {
+        match self {
+            Setter::Band(_) => Query::Band,
+            Setter::VfoA(_) => Query::VfoA,
+            Setter::Span(_) => Query::Span,
+            Setter::FixedTune(_) => Query::FixedTune,
+            Setter::RxInput(_) => Query::RxAntenna,
+            Setter::Receiver(r) => match r {
+                ReceiverSetter::PreampBasic(_) | ReceiverSetter::PreampAdvanced(..) => Query::Preamp,
+                ReceiverSetter::AttenuatorOffBasic | ReceiverSetter::AttenuatorAdvanced(..) => Query::Attenuator,
+                ReceiverSetter::RfGain(_) => Query::RfGain,
+                ReceiverSetter::AgcBasic { .. } | ReceiverSetter::AgcAdvanced(_) => Query::Agc,
+                ReceiverSetter::NoiseBlankerBasic(_) | ReceiverSetter::NoiseBlankerAdvanced(..) => Query::NoiseBlanker,
+                ReceiverSetter::NoiseReduction(..) => Query::NoiseReduction,
+                ReceiverSetter::PanNoiseBlanker(_) => Query::PanNoiseBlanker,
+                ReceiverSetter::PanAveraging(_) => Query::Averaging,
+            },
         }
     }
 
@@ -244,8 +321,6 @@ impl Setter {
         check_wire(&self.wire(), true).is_ok()
     }
 }
-
-const SETTER_PREFIXES: [&str; 5] = ["BN", "FA", "#SPN", "#FXT", "AR"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatError {
@@ -294,23 +369,52 @@ pub fn check_wire(wire: &str, allow_setters: bool) -> Result<(), CatError> {
         if params.is_empty() {
             continue;
         }
-        if !allow_setters || !SETTER_PREFIXES.contains(&prefix) || !params.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(unsafe_err());
-        }
-        let n: u64 = params.parse().map_err(|_| unsafe_err())?;
-        let ok = match prefix {
-            "BN" => params.len() == 2 && n <= 10,
-            "FA" => params.len() == 11 && (100_000..=54_000_000).contains(&n),
-            "#SPN" => (6_000..=368_000).contains(&n),
-            "#FXT" => params.len() == 1 && n <= 1,
-            "AR" => params.len() == 1 && rx_input_ok(n as u8),
-            _ => false,
-        };
-        if !ok {
+        if !allow_setters || !setter_params_ok(prefix, params) {
             return Err(unsafe_err());
         }
     }
     Ok(())
+}
+
+/// The reviewed setter grammar: exact parameter shapes and ranges for the
+/// only prefixes the collector may set. Everything else is refused.
+fn setter_params_ok(prefix: &str, params: &str) -> bool {
+    // RF gain is the one setter with a sign: exactly `-nn`.
+    if prefix == "RG" {
+        return params
+            .strip_prefix('-')
+            .filter(|d| d.len() == 2 && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<u8>().ok())
+            .is_some_and(|db| db <= 60);
+    }
+    if !params.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(n) = params.parse::<u64>() else {
+        return false;
+    };
+    let digit = |i: usize| u64::from(params.as_bytes()[i] - b'0');
+    let len = params.len();
+    match prefix {
+        "BN" => len == 2 && n <= 10,
+        "FA" => len == 11 && (100_000..=54_000_000).contains(&n),
+        "#SPN" => (6_000..=368_000).contains(&n),
+        "#FXT" => len == 1 && n <= 1,
+        "AR" => len == 1 && rx_input_ok(n as u8),
+        // PAn (basic level) or PAnm (level, on/off).
+        "PA" => (len == 1 && n <= 3) || (len == 2 && digit(0) <= 3 && digit(1) <= 1),
+        // RA00 (basic off) or RAnnm (dB in 3 dB steps, on/off).
+        "RA" => params == "00" || (len == 3 && n / 10 <= 21 && (n / 10) % 3 == 0 && digit(2) <= 1),
+        // GT002/GT004 (basic fast/slow) or GTn (0 off, 1 slow, 2 fast).
+        "GT" => matches!(params, "002" | "004") || (len == 1 && n <= 2),
+        // NBm or NBnnm (level 0..=15).
+        "NB" => (len == 1 && n <= 1) || (len == 3 && n / 10 <= 15 && digit(2) <= 1),
+        // NRnnm (level 1..=10).
+        "NR" => len == 3 && (1..=10).contains(&(n / 10)) && digit(2) <= 1,
+        "#NB" => len == 1 && n <= 2,
+        "#AVG" => len == 2 && (1..=20).contains(&n),
+        _ => false,
+    }
 }
 
 /// Parsed readbacks keyed by query. Missing entries are unknown.
@@ -328,6 +432,29 @@ impl Readback {
 
     pub fn insert(&mut self, q: Query, v: impl Into<String>) {
         self.values.insert(q, v.into());
+    }
+
+    pub fn remove(&mut self, q: Query) {
+        self.values.remove(&q);
+    }
+
+    /// Raw values keyed by prefix (the journal's representation).
+    pub fn to_map(&self) -> BTreeMap<String, String> {
+        self.values
+            .iter()
+            .map(|(q, v)| (q.prefix().to_owned(), v.clone()))
+            .collect()
+    }
+
+    /// Inverse of [`Readback::to_map`]; unknown prefixes are ignored.
+    pub fn from_map(m: &BTreeMap<String, String>) -> Self {
+        let mut rb = Readback::default();
+        for (k, v) in m {
+            if let Some(q) = Query::from_prefix(k) {
+                rb.values.insert(q, v.clone());
+            }
+        }
+        rb
     }
 
     pub fn u64(&self, q: Query) -> Option<u64> {
@@ -573,6 +700,23 @@ mod tests {
             Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::RxAntIn1)),
             Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)),
             Setter::RxInput(RxInput::from_readback("2").unwrap()),
+            Setter::Receiver(ReceiverSetter::PreampBasic(0)),
+            Setter::Receiver(ReceiverSetter::PreampBasic(3)),
+            Setter::Receiver(ReceiverSetter::PreampAdvanced(2, true)),
+            Setter::Receiver(ReceiverSetter::AttenuatorOffBasic),
+            Setter::Receiver(ReceiverSetter::AttenuatorAdvanced(21, true)),
+            Setter::Receiver(ReceiverSetter::AttenuatorAdvanced(0, false)),
+            Setter::Receiver(ReceiverSetter::RfGain(0)),
+            Setter::Receiver(ReceiverSetter::RfGain(60)),
+            Setter::Receiver(ReceiverSetter::AgcBasic { slow: true }),
+            Setter::Receiver(ReceiverSetter::AgcBasic { slow: false }),
+            Setter::Receiver(ReceiverSetter::AgcAdvanced(0)),
+            Setter::Receiver(ReceiverSetter::NoiseBlankerBasic(true)),
+            Setter::Receiver(ReceiverSetter::NoiseBlankerAdvanced(15, false)),
+            Setter::Receiver(ReceiverSetter::NoiseReduction(10, true)),
+            Setter::Receiver(ReceiverSetter::PanNoiseBlanker(2)),
+            Setter::Receiver(ReceiverSetter::PanAveraging(1)),
+            Setter::Receiver(ReceiverSetter::PanAveraging(20)),
         ];
         for s in ok {
             check_wire(&s.wire(), true).unwrap();
@@ -593,6 +737,17 @@ mod tests {
             Setter::VfoA(99_999),
             Setter::VfoA(54_000_001),
             Setter::Span(5_999),
+            Setter::Receiver(ReceiverSetter::PreampBasic(4)),
+            Setter::Receiver(ReceiverSetter::AttenuatorAdvanced(4, true)),
+            Setter::Receiver(ReceiverSetter::AttenuatorAdvanced(24, true)),
+            Setter::Receiver(ReceiverSetter::RfGain(61)),
+            Setter::Receiver(ReceiverSetter::AgcAdvanced(3)),
+            Setter::Receiver(ReceiverSetter::NoiseBlankerAdvanced(16, true)),
+            Setter::Receiver(ReceiverSetter::NoiseReduction(0, true)),
+            Setter::Receiver(ReceiverSetter::NoiseReduction(11, true)),
+            Setter::Receiver(ReceiverSetter::PanNoiseBlanker(3)),
+            Setter::Receiver(ReceiverSetter::PanAveraging(0)),
+            Setter::Receiver(ReceiverSetter::PanAveraging(21)),
         ] {
             assert!(check_wire(&bad.wire(), true).is_err(), "{bad:?}");
         }
@@ -624,8 +779,33 @@ mod tests {
             "FA$00014000000;",
             "BN$05;",
             "MD3;",
-            "PA1;",
+            "PA4;",
+            "PA12;",
+            "PA/;",
+            "PA$1;",
             "RA1;",
+            "RA01;",
+            "RA011;",
+            "RA241;",
+            "RG00;",
+            "RG-61;",
+            "RG+10;",
+            "RG-1;",
+            "GT3;",
+            "GT001;",
+            "NB2;",
+            "NB161;",
+            "NB$1;",
+            "NR001;",
+            "NR111;",
+            "#NB3;",
+            "#NBL5;",
+            "#AVG00;",
+            "#AVG21;",
+            "#AVG5;",
+            "NA1;",
+            "NM01760;",
+            "PC050;PA1;",
             "AR0;",
             "AR3;",
             "AR8;",

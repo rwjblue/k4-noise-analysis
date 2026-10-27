@@ -4,6 +4,7 @@
 pub mod aggregate;
 pub mod band;
 pub mod config;
+pub mod measure;
 pub mod model;
 pub mod plan;
 pub mod time;

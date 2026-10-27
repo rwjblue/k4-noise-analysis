@@ -415,6 +415,12 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     may_change.push(Query::FixedTune);
                     rb.flag(Query::FixedTune) == Some(f)
                 }
+                Setter::Receiver(_) => {
+                    let q = s.query();
+                    may_change.push(q);
+                    rb.raw(q).map(|r| crate::measure::norm(q, r))
+                        == Some(crate::measure::norm(q, &crate::measure::expected_readback(*s)))
+                }
             };
             if !ok {
                 problems.push(format!("{} not confirmed by readback", s.wire()));

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::band::k4_band_number;
+use crate::measure::MeasurementConfig;
 use crate::units::HzRange;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -292,6 +294,22 @@ pub struct SurveyProfile {
     #[serde(default)]
     pub requested_pan_span_hz: Option<u32>,
     pub ranges: Vec<RangeConfig>,
+    /// Receiver settings applied and verified before measuring, with band,
+    /// antenna and antenna+band overrides. See docs/measurement.md.
+    #[serde(default)]
+    pub measurement: MeasurementConfig,
+}
+
+impl SurveyProfile {
+    /// K4 bands (`None` = general coverage) the ranges touch.
+    pub fn k4_bands(&self) -> Vec<Option<u8>> {
+        let mut out = std::collections::BTreeSet::new();
+        for r in &self.ranges {
+            out.insert(k4_band_number(r.low_hz));
+            out.insert(k4_band_number(r.high_hz.saturating_sub(1)));
+        }
+        out.into_iter().collect()
+    }
 }
 
 /// A named frequency range to survey: a whole band or part of one. The id
@@ -662,6 +680,7 @@ impl Config {
                 p.push(format!("range {}: weight must be within 1..=10", b.id));
             }
         }
+        p.extend(s.measurement.problems(&s.antennas, &s.k4_bands()));
         let mut sorted: Vec<_> = s.ranges.iter().collect();
         sorted.sort_by_key(|b| b.low_hz);
         for w in sorted.windows(2) {
