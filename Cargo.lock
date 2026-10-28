@@ -493,6 +493,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "k4na-analysis"
+version = "0.1.0"
+dependencies = [
+ "k4na-core",
+ "k4na-protocol",
+ "k4na-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "k4na-cli"
 version = "0.1.0"
 dependencies = [
