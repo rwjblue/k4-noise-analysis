@@ -94,7 +94,7 @@ impl Heatmaps {
                 utc_ns: v.started_utc_ns,
                 tile: v.tile_id.clone(),
                 session: v.session_id.clone(),
-                segment: v.segment_id.clone(),
+                segment: k4na_analysis::analysis_segment(v),
                 floor: m.floor,
                 first_col,
                 excess: ex

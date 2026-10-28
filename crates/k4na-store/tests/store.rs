@@ -528,7 +528,9 @@ fn measurement_settings_round_trip_and_v2_shards_stay_readable() {
 fn verified_receiver_settings_decide_the_comparability_segment() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("data");
-    let at = |n: i64| n * NS_PER_SEC;
+    // Offset so every visit's first frame (3 s before `at`) is at a
+    // positive monotonic time and the delivered frame rate is known.
+    let at = |n: i64| (10 + n) * NS_PER_SEC;
     let with = |sid: &str, n: u64, pa: &str| {
         let mut v = visit(sid, n, at(n as i64));
         v.radio_state = [("PA".to_string(), pa.to_string()), ("FA".to_string(), format!("{n}"))].into();

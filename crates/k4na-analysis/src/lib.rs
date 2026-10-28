@@ -25,7 +25,31 @@ pub use families::{Family, find_families};
 pub use spectrum::VisitSpectrum;
 
 /// Bumped whenever an algorithm or default changes its output.
-pub const ALGORITHM_VERSION: &str = "k4na-analysis/1";
+/// 2: comparability segments are split by delivered frame rate.
+pub const ALGORITHM_VERSION: &str = "k4na-analysis/2";
+
+/// The comparability segment analysis uses for a visit: the stored
+/// segment plus the delivered frame rate, as `<segment_id>@<n>fps` (or
+/// `@?fps` without two frames). Shards written before the writer keyed
+/// segments by frame rate merged visits at different rates; this splits
+/// them, and is redundant but harmless for newer shards.
+pub fn analysis_segment(v: &k4na_store::reader::VisitRow) -> String {
+    match v.frame_rate() {
+        Some(f) => format!("{}@{f}fps", v.segment_id),
+        None => format!("{}@?fps", v.segment_id),
+    }
+}
+
+/// A segment label for people: the first 8 hex digits and the rate.
+pub fn short_segment(id: &str) -> String {
+    let (seg, rate) = id.split_once('@').unwrap_or((id, ""));
+    let seg = seg.get(..8).unwrap_or(seg);
+    if rate.is_empty() {
+        seg.to_owned()
+    } else {
+        format!("{seg}@{rate}")
+    }
+}
 
 /// What derived levels mean. Native K4 tenths of a dB divided by ten.
 pub const LEVEL_UNITS: &str = "dB on the K4's uncalibrated LAN panadapter scale (native tenths / 10); not dBm";

@@ -88,7 +88,7 @@ impl Carriers {
             low_hz: s.low_hz,
             high_hz: s.high_hz,
             utc_ns: v.started_utc_ns,
-            segment: v.segment_id.clone(),
+            segment: crate::analysis_segment(v),
             bin_hz: s.bin_hz,
         });
         for pk in peaks.iter().filter(|pk| pk.width_hz() <= p.max_carrier_width_hz) {

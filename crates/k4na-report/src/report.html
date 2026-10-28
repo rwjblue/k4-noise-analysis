@@ -67,6 +67,7 @@ function ramp(t) {
   const i = Math.min(STOPS.length - 2, Math.floor(t)), f = t - i, a = STOPS[i], b = STOPS[i + 1];
   return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
 }
+function shortSeg(id) { const [s, r] = id.split("@"); return r ? `${s.slice(0, 8)}@${r}` : s.slice(0, 8); }
 function b64(s) { const r = atob(s), u = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; }
 function fmtTime(ns) {
   const d = new Date(ns / 1e6);
@@ -172,7 +173,7 @@ function tables() {
     cs.map((c) => [c.band_id, c.antenna_id, (c.hz / 1e3).toFixed(3), c.class, `${c.detections}/${c.exposure}`, (c.persistence * 100).toFixed(0) + "%",
       (c.steady_fraction * 100).toFixed(0) + "%", c.median_excess_db.toFixed(1), c.median_width_hz.toFixed(0), fmtTime(c.first_utc_ns), fmtTime(c.last_utc_ns)]));
   table("hours", [["band", 1], ["antenna", 1], ["segment", 1], ["hour", 1], ["visits"], ["floor dB"], ["p10"], ["p90"], ["occupancy"], ["variability dB"], ["settings", 1]],
-    A.band_hours.map((r) => [r.band_id, r.antenna_id, r.segment_id.slice(0, 8), fmtTime(r.hour_start_utc_ns), r.visits, r.floor_db.toFixed(1),
+    A.band_hours.map((r) => [r.band_id, r.antenna_id, shortSeg(r.segment_id), fmtTime(r.hour_start_utc_ns), r.visits, r.floor_db.toFixed(1),
       r.floor_p10_db.toFixed(1), r.floor_p90_db.toFixed(1), (r.occupancy * 100).toFixed(1) + "%", r.variability_db.toFixed(1), r.measurement || ""]));
 }
 

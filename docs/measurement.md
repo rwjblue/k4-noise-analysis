@@ -45,7 +45,7 @@ them.
 | Pan averaging | `#AVGnn` 1-20 | `#AVG2` | yes (smoothing) | yes |
 | Pan span | `#SPNn` 6000-368000 | `#SPN40000` (30 m stored 5000) | packet rate | yes (survey) |
 | Pan ref/scale/auto-ref | `#REF`, `#SCL`, `#AR` | `#REF-121`, `#SCL47`, `#AR1206-041` | *unverified*; display | recorded only |
-| Peak mode, FPS | `#PKM`, `#FPS` | `#PKM0`, `#FPS15` | peak: *unverified*; FPS: frame count only | recorded only |
+| Peak mode, FPS | `#PKM`, `#FPS` | `#PKM0`, `#FPS15` | peak: *unverified*; FPS: frame count only | recorded only; the *delivered* rate is part of the segment key |
 
 All controllable settings are receive-path settings. None selects a
 transmit antenna, keys, tunes or changes transmit power.
@@ -113,11 +113,23 @@ Each survey visit stores in `measurement_json` the resolved settings
 values verified by readback as `verified.<prefix>` (raw readback text in
 that mode, for example `"verified.PA": "0"`). Its state readback
 includes every measurement key, so the comparability segment id (a hash
-of band, antenna, port, pan, rate, versions and the non-frequency state)
-changes whenever the verified settings differ, and is the same across
-cycles and sessions when they do not. `as-found` and an explicit setting
-with the same readback share a segment. Earlier visits keep their
-segment. Passive visits have no `measurement_json`.
+of band, antenna, port, pan, sample rate, delivered frame rate, versions
+and the non-frequency state) changes whenever the verified settings
+differ, and is the same across cycles and sessions when they do not.
+`as-found` and an explicit setting with the same readback share a
+segment. Earlier visits keep their segment. Passive visits have no
+`measurement_json`.
+
+The delivered frame rate is measured, not read back: `(accepted - 1) /
+(last - first frame)` on the monotonic clock, rounded to whole frames per
+second (`frame_rate=N` in the key, `unknown` with under two frames). On
+the K4D R39 it was 15/s while QK4 was also connected and 30/s once QK4
+exited, on every band, while `#FPS;` still read 15 for the first visits
+at 30/s. The rate sets how many frames each visit's percentiles
+summarize (about 75 versus 150 in a 5 s dwell): p50 is barely affected,
+the p10/p90 spread and min/max are. Shards written before the key
+included it merged both rates; analysis splits them on read (see
+[analysis.md](analysis.md#implemented-k4na-analysis2)).
 
 The pan span follows the same rule: a band that recalls a span the
 whitelist cannot send back (30 m's `#SPN5000`) is surveyed at that span,

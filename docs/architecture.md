@@ -158,7 +158,8 @@ Do not pin fictional future dependency versions.
 7. Clock readings come from the collector host (UTC plus monotonic elapsed
    time/sequence). Do not invent K4 hardware capture timestamps.
 8. Changing antenna, receiver routing, gain, averaging, frequency mapping,
-   or stream format starts a new comparability segment. No cross-segment
+   delivered frame rate or stream format starts a new comparability
+   segment. No cross-segment
    noise ranking without explicit normalization/qualification.
 9. Collector exits and crashes must be safe: stop CAT writes first, persist
    termination reason, and conditionally restore only settings still known

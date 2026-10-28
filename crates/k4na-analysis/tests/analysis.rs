@@ -13,7 +13,7 @@ use k4na_core::time::{NS_PER_HOUR, NS_PER_SEC, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::PanId;
 use k4na_store::codec::Compression;
-use k4na_store::reader::DataSet;
+use k4na_store::reader::{DataSet, VisitRow};
 use k4na_store::{SpaceProbe, Store, StoreOptions};
 
 const T0: i64 = 1_793_059_200 * NS_PER_SEC; // 2026-10-27T00:00:00Z
@@ -124,6 +124,12 @@ fn visit(n: u64, at: i64, status: VisitStatus) -> VisitRecord {
 
 /// Six hours, a visit every 5 minutes, plus one partial visit.
 fn write_root(root: &Path) -> u64 {
+    write_root_with(root, |_| 75)
+}
+
+/// As `write_root`, with `frames(hour)` accepted frames per visit over
+/// the same 4 s (75 frames = 19 fps).
+fn write_root_with(root: &Path, frames: impl Fn(i64) -> u32) -> u64 {
     let opts = StoreOptions {
         root: root.to_owned(),
         max_total_bytes: 1 << 30,
@@ -155,12 +161,12 @@ fn write_root(root: &Path) -> u64 {
     let (mut store, _) = Store::open(opts, Box::new(BigDisk), session, ts(0)).unwrap();
     let n = 6 * 12;
     for i in 0..n {
-        store
-            .write_visit(
-                &visit(i, i as i64 * 300 * NS_PER_SEC + NS_PER_SEC, VisitStatus::Complete),
-                &[],
-            )
-            .unwrap();
+        let at = i as i64 * 300 * NS_PER_SEC + NS_PER_SEC;
+        let mut v = visit(i, at, VisitStatus::Complete);
+        if let Some(s) = v.stats.as_mut() {
+            s.frame_count = frames(at / NS_PER_HOUR);
+        }
+        store.write_visit(&v, &[]).unwrap();
     }
     store
         .write_visit(&visit(999, 1000 * NS_PER_SEC, VisitStatus::Partial), &[])
@@ -223,6 +229,73 @@ fn finds_floors_by_hour_and_classifies_carriers() {
     let csv = carriers_csv(&a.carriers);
     assert_eq!(csv.lines().count(), 3);
     assert!(csv.lines().nth(1).unwrap().starts_with("20m,rx1,14030"));
+}
+
+#[test]
+fn visits_at_different_frame_rates_are_not_one_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    // 37 fps in hours 4-5, as when a second client stops sharing the radio.
+    let n = write_root_with(&root, |h| if h >= 4 { 149 } else { 75 });
+    let ds = DataSet::open(&root).unwrap();
+    let a = run(&ds, &Filter::default(), &Params::default(), |_, _, _| {}).unwrap();
+    let segs: Vec<&str> = a.band_hours.iter().map(|r| r.segment_id.as_str()).collect();
+    assert!(segs[..4].iter().all(|s| s.ends_with("@19fps")), "{segs:?}");
+    assert!(segs[4..].iter().all(|s| s.ends_with("@37fps")), "{segs:?}");
+    let stored = |s: &str| s.split_once('@').unwrap().0.to_owned();
+    assert_ne!(
+        stored(segs[0]),
+        stored(segs[4]),
+        "the writer keys segments by frame rate"
+    );
+    assert_eq!(a.carriers[0].detections, n);
+    assert_eq!(a.carriers[0].segments, 2);
+    assert_eq!(k4na_analysis::short_segment(segs[0]).len(), "01234567@19fps".len());
+}
+
+#[test]
+fn rows_from_shards_without_a_frame_rate_key_are_split_on_read() {
+    let row = |frames: i64, last_mono_ns: i64| VisitRow {
+        visit_id: "v".into(),
+        session_id: "s".into(),
+        segment_id: "0123456789abcdef01234567".into(),
+        pan: "A".into(),
+        band_id: Some("20m".into()),
+        tile_id: None,
+        target_low_hz: None,
+        target_high_hz: None,
+        requested_vfo_hz: None,
+        center_hz: 0,
+        sample_rate_hz: 0,
+        bin_count: 0,
+        actual_low_hz: 0,
+        actual_high_hz: 0,
+        started_utc_ns: 0,
+        ended_utc_ns: 0,
+        first_mono_ns: Some(1_000_000_000),
+        last_mono_ns: Some(last_mono_ns),
+        accepted_frames: frames,
+        rejected_frames: 0,
+        settle_discarded: 0,
+        status: "complete".into(),
+        flags: String::new(),
+        end_reason: String::new(),
+        antenna_id: "rx1".into(),
+        antenna_port: "rx_ant_in1".into(),
+        antenna_observed_port: None,
+        measurement_json: None,
+    };
+    // The K4D's two observed rates in one stored segment.
+    let slow = k4na_analysis::analysis_segment(&row(75, 5_900_000_000));
+    let fast = k4na_analysis::analysis_segment(&row(151, 5_934_000_000));
+    assert_eq!(slow, "0123456789abcdef01234567@15fps");
+    assert_eq!(fast, "0123456789abcdef01234567@30fps");
+    assert_eq!(
+        k4na_analysis::analysis_segment(&row(1, 1_000_000_000)),
+        "0123456789abcdef01234567@?fps"
+    );
+    assert_eq!(k4na_analysis::short_segment(&fast), "01234567@30fps");
+    assert_eq!(k4na_analysis::short_segment("0123456789"), "01234567");
 }
 
 #[test]

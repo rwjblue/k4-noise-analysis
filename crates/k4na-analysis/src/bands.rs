@@ -57,7 +57,7 @@ impl BandHours {
         let key = (
             v.band_id.clone().unwrap_or_else(|| "(no band)".into()),
             v.antenna_id.clone(),
-            v.segment_id.clone(),
+            crate::analysis_segment(v),
             hour,
         );
         let a = self.groups.entry(key).or_default();

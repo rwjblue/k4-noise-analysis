@@ -47,6 +47,10 @@ pub struct VisitRow {
     pub actual_high_hz: i64,
     pub started_utc_ns: i64,
     pub ended_utc_ns: i64,
+    /// Monotonic times of the first and last accepted frame (`None` with
+    /// no frames).
+    pub first_mono_ns: Option<i64>,
+    pub last_mono_ns: Option<i64>,
     pub accepted_frames: i64,
     pub rejected_frames: i64,
     pub settle_discarded: i64,
@@ -60,6 +64,19 @@ pub struct VisitRow {
     /// Profile measurement settings JSON (NULL for passive visits and v2
     /// shards).
     pub measurement_json: Option<String>,
+}
+
+impl VisitRow {
+    /// Delivered frames per second, rounded; see
+    /// [`k4na_core::model::delivered_frame_rate`].
+    pub fn frame_rate(&self) -> Option<u32> {
+        let mono = |t: Option<i64>| t.and_then(|t| u64::try_from(t).ok());
+        k4na_core::model::delivered_frame_rate(
+            u64::try_from(self.accepted_frames).unwrap_or(0),
+            mono(self.first_mono_ns),
+            mono(self.last_mono_ns),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -487,7 +504,7 @@ pub fn union_len(mut ranges: Vec<(i64, i64)>) -> u64 {
 }
 
 /// Number of columns [`visit_columns`] selects.
-const VISIT_COLUMNS: usize = 26;
+const VISIT_COLUMNS: usize = 28;
 
 /// The `visits v` columns [`visit_from_row`] reads, in order.
 fn visit_columns(c: &Connection) -> Result<String, StoreError> {
@@ -501,7 +518,7 @@ fn visit_columns(c: &Connection) -> Result<String, StoreError> {
         "v.visit_id, v.session_id, v.segment_id, v.pan, v.band_id, v.tile_id, v.target_low_hz, v.target_high_hz,
          v.requested_vfo_hz, v.center_hz, v.sample_rate_hz, v.bin_count, v.actual_low_hz, v.actual_high_hz,
          v.started_utc_ns, v.ended_utc_ns, v.accepted_frames, v.rejected_frames, v.settle_discarded, v.status, v.flags,
-         v.end_reason, v.antenna_id, v.antenna_port, v.antenna_observed_port, {measurement}"
+         v.end_reason, v.antenna_id, v.antenna_port, v.antenna_observed_port, {measurement}, v.first_mono_ns, v.last_mono_ns"
     ))
 }
 
@@ -533,6 +550,8 @@ fn visit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisitRow> {
         antenna_port: r.get(23)?,
         antenna_observed_port: r.get(24)?,
         measurement_json: r.get(25)?,
+        first_mono_ns: r.get(26)?,
+        last_mono_ns: r.get(27)?,
     })
 }
 

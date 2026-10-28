@@ -49,7 +49,14 @@ what the initial data must enable, NOT algorithms required in the v1 writer.
   signal level above background, not raw background reduction alone.
   Never subtract spectra as if both bins were independent calibrated dBm.
 
-## Implemented: `k4na-analysis/1`
+## Implemented: `k4na-analysis/2`
+
+Version 2 splits comparability segments by delivered frame rate:
+analysis segment ids are `<stored segment>@<n>fps` (shown as
+`01234567@30fps`), so shards written before the writer keyed segments by
+frame rate never compare 15/s and 30/s visits as one segment. See
+[measurement.md](measurement.md) for why the rate is measured rather
+than read back. Version 1 output is otherwise unchanged.
 
 The `k4na-analysis` crate and `k4na analyze` read a data root through
 the read-only store reader; they need no radio and can run while a

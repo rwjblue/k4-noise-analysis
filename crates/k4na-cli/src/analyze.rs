@@ -197,16 +197,16 @@ fn header(a: &Analysis) -> String {
     )
 }
 
-fn short(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
+fn short(id: &str) -> String {
+    k4na_analysis::short_segment(id)
 }
 
 fn bands_text(a: &Analysis) -> String {
     let mut s = header(a);
-    s += "band  antenna     segment   hour (UTC)         visits  floor  p10     p90     occ%   var\n";
+    s += "band  antenna     segment         hour (UTC)         visits  floor  p10     p90     occ%   var\n";
     for r in &a.band_hours {
         s += &format!(
-            "{:<5} {:<11} {:<9} {:<18} {:>6}  {:>6.1} {:>6.1} {:>6.1}  {:>5.1}  {:>4.1}\n",
+            "{:<5} {:<11} {:<15} {:<18} {:>6}  {:>6.1} {:>6.1} {:>6.1}  {:>5.1}  {:>4.1}\n",
             r.band_id,
             r.antenna_id,
             short(&r.segment_id),
@@ -238,7 +238,7 @@ fn bands_text(a: &Analysis) -> String {
                     .unwrap_or_default()
             };
             s += &format!(
-                "  {band:<5} {ant:<11} {:<9} {} / {} / {}\n",
+                "  {band:<5} {ant:<11} {:<15} {} / {} / {}\n",
                 short(seg),
                 pick(|r| r.floor_db, false),
                 pick(|r| r.floor_db, true),

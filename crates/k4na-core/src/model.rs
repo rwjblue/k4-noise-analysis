@@ -45,6 +45,24 @@ pub type RadioState = BTreeMap<String, String>;
 /// on every retune by design).
 pub const NON_COMPARABILITY_KEYS: &[&str] = &["FA", "FB", "BN", "TQ"];
 
+/// Delivered panadapter frame rate of one visit, rounded to whole frames
+/// per second: `(accepted - 1) / (last - first)` on the monotonic clock.
+///
+/// The K4 may deliver fewer frames than `#FPS` requests (observed: 15/s
+/// while a second client was connected, 30/s otherwise, with `#FPS;`
+/// lagging the change), and the rate changes how many frames each visit's
+/// percentiles summarize, so it is measured rather than read back. One
+/// dropped frame in a 5 s dwell moves the estimate by under 1%.
+/// `None` with fewer than two frames.
+pub fn delivered_frame_rate(accepted: u64, first_mono_ns: Option<u64>, last_mono_ns: Option<u64>) -> Option<u32> {
+    let (first, last) = (first_mono_ns?, last_mono_ns?);
+    if accepted < 2 || last <= first {
+        return None;
+    }
+    let fps = (accepted - 1) as f64 * 1e9 / (last - first) as f64;
+    Some(fps.round() as u32)
+}
+
 /// Identity of the session that produced a record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -147,9 +165,10 @@ impl VisitRecord {
         self.stats.as_ref().map_or(0, |s| s.frame_count)
     }
 
-    /// Comparability segment key: band, antenna, pan, mapping and the
-    /// verified readbacks (including receiver measurement settings) that
-    /// affect spectra. Equal keys may be compared directly.
+    /// Comparability segment key: band, antenna, pan, mapping, delivered
+    /// frame rate and the verified readbacks (including receiver
+    /// measurement settings) that affect spectra. Equal keys may be
+    /// compared directly.
     pub fn segment_key(&self, session: &SessionInfo) -> String {
         let mut parts = vec![
             format!("band={}", self.band_id.as_deref().unwrap_or("none")),
@@ -163,6 +182,15 @@ impl VisitRecord {
             format!("mapping={}", session.mapping_version),
             format!("decoder={}", session.decoder_version),
             format!("rate={}", self.geometry.sample_rate_hz),
+            format!(
+                "frame_rate={}",
+                delivered_frame_rate(
+                    self.accepted_frames().into(),
+                    self.first_frame.map(|t| t.mono_ns),
+                    self.last_frame.map(|t| t.mono_ns),
+                )
+                .map_or_else(|| "unknown".to_owned(), |f| f.to_string())
+            ),
         ];
         for (k, v) in &self.radio_state {
             if !NON_COMPARABILITY_KEYS.contains(&k.as_str()) {
@@ -316,4 +344,22 @@ pub struct RawFrameRecord {
     pub sample_rate_hz: u32,
     pub sampling_policy: String,
     pub bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delivered_frame_rate;
+
+    const S: u64 = 1_000_000_000;
+
+    #[test]
+    fn delivered_frame_rate_rounds_and_tolerates_a_dropped_frame() {
+        // As observed on a K4D: 151 frames over ~4.93 s, 75 over ~4.9 s.
+        assert_eq!(delivered_frame_rate(151, Some(0), Some(4_934_000_000)), Some(30));
+        assert_eq!(delivered_frame_rate(75, Some(0), Some(4_900_000_000)), Some(15));
+        assert_eq!(delivered_frame_rate(150, Some(0), Some(4_934_000_000)), Some(30));
+        assert_eq!(delivered_frame_rate(1, Some(0), Some(S)), None);
+        assert_eq!(delivered_frame_rate(10, Some(S), Some(S)), None);
+        assert_eq!(delivered_frame_rate(10, None, Some(S)), None);
+    }
 }
