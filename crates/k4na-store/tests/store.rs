@@ -203,6 +203,19 @@ fn rotates_hourly_and_round_trips_summaries() {
 
     // Identical arrays come back, validated by codec and checksum.
     assert_eq!(ds.summary("visit-7").unwrap().unwrap(), stats(7).stats);
+    // Bulk iteration across shards yields the same validated arrays.
+    let mut seen = Vec::new();
+    let n = ds
+        .for_each_summary(|v, s| {
+            let i: u64 = v.visit_id.trim_start_matches("visit-").parse().unwrap();
+            assert_eq!(s, stats(i).stats);
+            seen.push(i);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(n, 30);
+    seen.sort_unstable();
+    assert_eq!(seen, (0..30).collect::<Vec<_>>());
     let mut replayed = 0;
     ds.for_each_raw(|row| {
         let frames = k4na_protocol::Decoder::new().decode(&row.bytes);
@@ -502,6 +515,13 @@ fn measurement_settings_round_trip_and_v2_shards_stay_readable() {
     let v = ds.visits().unwrap().remove(0);
     assert_eq!(v.measurement_json, None);
     assert_eq!(v.antenna_id, "log");
+    let n = ds
+        .for_each_summary(|v, _| {
+            assert_eq!(v.measurement_json, None);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(n, 1);
 }
 
 #[test]

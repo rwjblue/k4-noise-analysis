@@ -238,51 +238,11 @@ impl DataSet {
     pub fn visits(&self) -> Result<Vec<VisitRow>, StoreError> {
         let mut out: Vec<VisitRow> = self
             .each_conn(ShardKind::Summary, |c| {
-                // Schema v2 shards predate measurement_json.
-                let measurement = if has_column(c, "visits", "measurement_json")? {
-                    "measurement_json"
-                } else {
-                    "NULL"
-                };
                 let mut st = c.prepare(&format!(
-                    "SELECT visit_id, session_id, segment_id, pan, band_id, tile_id, target_low_hz, target_high_hz, requested_vfo_hz,
-                        center_hz, sample_rate_hz, bin_count, actual_low_hz, actual_high_hz, started_utc_ns, ended_utc_ns,
-                        accepted_frames, rejected_frames, settle_discarded, status, flags, end_reason, antenna_id, antenna_port,
-                        antenna_observed_port, {measurement}
-                     FROM visits ORDER BY started_utc_ns",
+                    "SELECT {} FROM visits v ORDER BY v.started_utc_ns",
+                    visit_columns(c)?
                 ))?;
-                let rows = st
-                    .query_map([], |r| {
-                        Ok(VisitRow {
-                            visit_id: r.get(0)?,
-                            session_id: r.get(1)?,
-                            segment_id: r.get(2)?,
-                            pan: r.get(3)?,
-                            band_id: r.get(4)?,
-                            tile_id: r.get(5)?,
-                            target_low_hz: r.get(6)?,
-                            target_high_hz: r.get(7)?,
-                            requested_vfo_hz: r.get(8)?,
-                            center_hz: r.get(9)?,
-                            sample_rate_hz: r.get(10)?,
-                            bin_count: r.get(11)?,
-                            actual_low_hz: r.get(12)?,
-                            actual_high_hz: r.get(13)?,
-                            started_utc_ns: r.get(14)?,
-                            ended_utc_ns: r.get(15)?,
-                            accepted_frames: r.get(16)?,
-                            rejected_frames: r.get(17)?,
-                            settle_discarded: r.get(18)?,
-                            status: r.get(19)?,
-                            flags: r.get(20)?,
-                            end_reason: r.get(21)?,
-                            antenna_id: r.get(22)?,
-                            antenna_port: r.get(23)?,
-                            antenna_observed_port: r.get(24)?,
-                            measurement_json: r.get(25)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let rows = st.query_map([], visit_from_row)?.collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })?
             .into_iter()
@@ -349,6 +309,41 @@ impl DataSet {
             }
         }
         Ok(None)
+    }
+
+    /// Calls `f` with every visit that has a stored summary, together with
+    /// its validated `[min, p10, p50, p90, max]` arrays: one query per
+    /// shard, oldest first within a shard. A shard's visits are not sorted
+    /// across shards; callers needing global order sort by time.
+    pub fn for_each_summary(
+        &self,
+        mut f: impl FnMut(&VisitRow, [Vec<i16>; 5]) -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError> {
+        let mut n = 0;
+        for info in self.readable(ShardKind::Summary) {
+            let (conn, _) = open_read_only(&info.path)?;
+            let mut st = conn.prepare(&format!(
+                "SELECT {}, s.codec, s.compression, s.bin_count, s.uncompressed_len, s.sha256, s.data
+                 FROM visits v JOIN summaries s ON s.visit_id = v.visit_id AND s.pan = v.pan
+                 ORDER BY v.started_utc_ns",
+                visit_columns(&conn)?
+            ))?;
+            let mut rows = st.query([])?;
+            while let Some(r) = rows.next()? {
+                let visit = visit_from_row(r)?;
+                let stats = decode_stats(
+                    &r.get::<_, String>(VISIT_COLUMNS)?,
+                    &r.get::<_, String>(VISIT_COLUMNS + 1)?,
+                    r.get(VISIT_COLUMNS + 2)?,
+                    r.get(VISIT_COLUMNS + 3)?,
+                    &r.get::<_, String>(VISIT_COLUMNS + 4)?,
+                    &r.get::<_, Vec<u8>>(VISIT_COLUMNS + 5)?,
+                )?;
+                f(&visit, stats)?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Calls `f` with every stored original frame, oldest first per shard.
@@ -489,6 +484,56 @@ pub fn union_len(mut ranges: Vec<(i64, i64)>) -> u64 {
         total += e - s;
     }
     total as u64
+}
+
+/// Number of columns [`visit_columns`] selects.
+const VISIT_COLUMNS: usize = 26;
+
+/// The `visits v` columns [`visit_from_row`] reads, in order.
+fn visit_columns(c: &Connection) -> Result<String, StoreError> {
+    // Schema v2 shards predate measurement_json.
+    let measurement = if has_column(c, "visits", "measurement_json")? {
+        "v.measurement_json"
+    } else {
+        "NULL"
+    };
+    Ok(format!(
+        "v.visit_id, v.session_id, v.segment_id, v.pan, v.band_id, v.tile_id, v.target_low_hz, v.target_high_hz,
+         v.requested_vfo_hz, v.center_hz, v.sample_rate_hz, v.bin_count, v.actual_low_hz, v.actual_high_hz,
+         v.started_utc_ns, v.ended_utc_ns, v.accepted_frames, v.rejected_frames, v.settle_discarded, v.status, v.flags,
+         v.end_reason, v.antenna_id, v.antenna_port, v.antenna_observed_port, {measurement}"
+    ))
+}
+
+fn visit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisitRow> {
+    Ok(VisitRow {
+        visit_id: r.get(0)?,
+        session_id: r.get(1)?,
+        segment_id: r.get(2)?,
+        pan: r.get(3)?,
+        band_id: r.get(4)?,
+        tile_id: r.get(5)?,
+        target_low_hz: r.get(6)?,
+        target_high_hz: r.get(7)?,
+        requested_vfo_hz: r.get(8)?,
+        center_hz: r.get(9)?,
+        sample_rate_hz: r.get(10)?,
+        bin_count: r.get(11)?,
+        actual_low_hz: r.get(12)?,
+        actual_high_hz: r.get(13)?,
+        started_utc_ns: r.get(14)?,
+        ended_utc_ns: r.get(15)?,
+        accepted_frames: r.get(16)?,
+        rejected_frames: r.get(17)?,
+        settle_discarded: r.get(18)?,
+        status: r.get(19)?,
+        flags: r.get(20)?,
+        end_reason: r.get(21)?,
+        antenna_id: r.get(22)?,
+        antenna_port: r.get(23)?,
+        antenna_observed_port: r.get(24)?,
+        measurement_json: r.get(25)?,
+    })
 }
 
 fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
