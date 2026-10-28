@@ -67,6 +67,15 @@ background and the floor every second, plus confirmed changes. Type a
 note such as `breaker 12 off` and Enter while flipping breakers; with
 `--mark` the notes and changes are saved as marks.
 
+Device logs make marks without guessing times. Export a thermostat's or
+energy monitor's history as CSV and import the intervals when a column
+was on, for example:
+
+```sh
+k4na import-marks --data ./data thermostat.csv --time Date,Time \
+  --tz America/New_York --on "Heat Stage 1 (sec)" --label furnace
+```
+
 To scan bands, follow the [survey setup](docs/collection.md). Reserve the
 main receiver, preview with `--dry-run`, and start with a short, attended
 run. Retuning requires config consent **and** `--allow-retune`. There are

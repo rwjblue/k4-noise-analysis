@@ -6,6 +6,7 @@
 //! (transmit or external change) or a restore conflict.
 
 mod analyze;
+mod marks;
 mod recovery;
 mod watch;
 
@@ -214,6 +215,8 @@ enum Cmd {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
+    /// Import marks from a device log (thermostat, energy monitor) CSV.
+    ImportMarks(marks::ImportArgs),
     /// List the notes in a data root.
     Marks {
         #[arg(long)]
@@ -327,6 +330,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Report { filter, out } => analyze::report(&filter, &out, json),
         Cmd::Replay { input } => replay(&input, json),
         Cmd::Watch(args) => watch::run(args, json).await,
+        Cmd::ImportMarks(args) => marks::run(args, json),
         Cmd::Mark {
             data,
             at,

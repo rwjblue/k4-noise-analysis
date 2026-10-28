@@ -222,6 +222,97 @@ fn mark_refuses_zoneless_times_and_foreign_directories() {
 }
 
 #[test]
+fn import_marks_from_device_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("K4NA-DATA-ROOT"), "").unwrap();
+    // Thermostat-style export: a preamble, Date and Time columns in local
+    // time, 5-minute rows with runtime seconds.
+    let thermo = dir.path().join("thermostat.csv");
+    std::fs::write(
+        &thermo,
+        "#Thermostat export\n#Serial,123\nDate,Time,Heat Stage 1 (sec),Fan (sec)\n\
+         2026-10-28,01:30:00,0,0\n2026-10-28,01:35:00,300,300\n2026-10-28,01:40:00,180,300\n\
+         2026-10-28,01:45:00,0,60\n2026-10-28,01:50:00,0,0\n",
+    )
+    .unwrap();
+    let import = || {
+        let mut c = k4na();
+        c.args([
+            "import-marks",
+            "--time",
+            "Date,Time",
+            "--tz",
+            "America/New_York",
+            "--on",
+            "Heat Stage 1 (sec)",
+            "--label",
+            "furnace",
+            "--data",
+        ])
+        .arg(&data)
+        .arg(&thermo);
+        c
+    };
+    import()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2026-10-28T05:35:00.000Z .. 2026-10-28T05:45:00.000Z  furnace on (Heat Stage 1 (sec) > 0)",
+        ))
+        .stdout(predicate::str::contains("added 1 mark(s)"));
+    import()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added 0 mark(s)").and(predicate::str::contains("1 duplicate")));
+    // Without a zone the local times are refused, not read as UTC.
+    k4na()
+        .args(["import-marks", "--time", "Date,Time", "--on", "Fan (sec)", "--data"])
+        .arg(&data)
+        .arg(&thermo)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no time zone"));
+    // Event-style export with its own offsets.
+    let events = dir.path().join("plugs.csv");
+    std::fs::write(
+        &events,
+        "When,Device,Event\n2026-10-28T05:40:00-04:00,dehumidifier,\"turned off, by schedule\"\n,x,y\n2026-10-28T06:00:00Z,dehumidifier,\n",
+    )
+    .unwrap();
+    k4na()
+        .args([
+            "import-marks",
+            "--time",
+            "When",
+            "--text",
+            "Event",
+            "--dry-run",
+            "--data",
+        ])
+        .arg(&data)
+        .arg(&events)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2026-10-28T09:40:00.000Z  turned off, by schedule",
+        ))
+        .stdout(predicate::str::contains("would add 1 mark(s)"));
+    let listed = k4na()
+        .args(["--json", "marks", "--data"])
+        .arg(&data)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+    assert_eq!(v["annotations"].as_array().unwrap().len(), 1, "dry run wrote nothing");
+    assert_eq!(v["annotations"][0]["source"], "import:thermostat.csv");
+}
+
+#[test]
 fn replay_decodes_the_r39_fixture() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),

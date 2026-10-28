@@ -209,6 +209,34 @@ weigh, limited by the revisit cadence and by how well the mark's time
 is known. A note written later with `--at` records when it was written
 (`created_utc_ns`) as well.
 
+Marks also come from `k4na watch --mark` (see
+[collection.md](collection.md)) and from device logs: `k4na
+import-marks --data DIR FILE.csv --time COL[,COL] ...` reads a CSV
+export from a thermostat, energy monitor or smart plug. The header row is
+the first one naming every requested column, so preamble lines are
+skipped; several time columns (`Date,Time`) are joined with a space.
+Times may carry an offset; otherwise `--tz` is required (an IANA zone
+such as `America/New_York`, so daylight-saving changes are applied, or a
+fixed offset). Wall-clock times that occur twice at the fall-back take
+the earlier instant, and ones that do not exist at the spring-forward
+move forward; both are counted in a warning. Times are ISO 8601, common
+US forms (`10/28/2026 2:15 AM`) or a `--format` strftime pattern.
+
+- `--text COL`: each row with non-empty text is a mark, an interval
+  with `--end COL`.
+- `--on COL` (repeatable): each run of rows whose value is above
+  `--above` (default 0) is one interval mark, labeled `--label` or the
+  column name. A row covers the time until the next row, or the median
+  row spacing at the end and across gaps over three times it, so an
+  interval is only as precise as the export's rows (a 5-minute runtime
+  row with 180 s of runtime marks all 5 minutes). Unreadable values end
+  a run. `--merge-gap` joins nearby runs and `--min-duration` drops
+  short ones.
+
+Imported marks have source `import:<file name>`; a mark with the same
+start, end and text as an existing one is skipped, so re-importing an
+export adds only new rows. `--dry-run` shows them without writing.
+
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
 resources, data embedded as JSON with the analysis provenance. Per band
