@@ -57,6 +57,9 @@ pub struct VisitRow {
     pub antenna_port: String,
     /// `None` when the attribution was not verified by readback.
     pub antenna_observed_port: Option<String>,
+    /// Profile measurement settings JSON (NULL for passive visits and v2
+    /// shards).
+    pub measurement_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -235,13 +238,19 @@ impl DataSet {
     pub fn visits(&self) -> Result<Vec<VisitRow>, StoreError> {
         let mut out: Vec<VisitRow> = self
             .each_conn(ShardKind::Summary, |c| {
-                let mut st = c.prepare(
+                // Schema v2 shards predate measurement_json.
+                let measurement = if has_column(c, "visits", "measurement_json")? {
+                    "measurement_json"
+                } else {
+                    "NULL"
+                };
+                let mut st = c.prepare(&format!(
                     "SELECT visit_id, session_id, segment_id, pan, band_id, tile_id, target_low_hz, target_high_hz, requested_vfo_hz,
                         center_hz, sample_rate_hz, bin_count, actual_low_hz, actual_high_hz, started_utc_ns, ended_utc_ns,
                         accepted_frames, rejected_frames, settle_discarded, status, flags, end_reason, antenna_id, antenna_port,
-                        antenna_observed_port
+                        antenna_observed_port, {measurement}
                      FROM visits ORDER BY started_utc_ns",
-                )?;
+                ))?;
                 let rows = st
                     .query_map([], |r| {
                         Ok(VisitRow {
@@ -270,6 +279,7 @@ impl DataSet {
                             antenna_id: r.get(22)?,
                             antenna_port: r.get(23)?,
                             antenna_observed_port: r.get(24)?,
+                            measurement_json: r.get(25)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -479,6 +489,17 @@ pub fn union_len(mut ranges: Vec<(i64, i64)>) -> u64 {
         total += e - s;
     }
     total as u64
+}
+
+fn has_column(c: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut st = c.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+    let names = st.query_map([], |r| r.get::<_, String>(0))?;
+    for n in names {
+        if n? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn antenna_ids(json: &str) -> Vec<String> {

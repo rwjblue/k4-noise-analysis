@@ -129,6 +129,7 @@ fn visit(session_id: &str, n: u64, at: i64) -> VisitRecord {
         end_reason: "dwell complete".into(),
         antenna: VisitAntenna::configured(&log_antenna(), Some(K4Port::RxAntIn1)),
         radio_state: [("PA".to_string(), "PA1".to_string())].into(),
+        measurement: [("preamp".to_string(), "pre1".to_string())].into(),
         stats: Some(stats(n)),
     }
 }
@@ -472,6 +473,35 @@ fn retention_prunes_old_raw_independently() {
     let summary_shards = ds.shards().filter(|s| s.kind == "summary").count();
     assert!(raw_shards <= 3, "{raw_shards}");
     assert_eq!(summary_shards, 6);
+}
+
+#[test]
+fn measurement_settings_round_trip_and_v2_shards_stay_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let sid = "0e0e0e0e";
+    let (mut store, _) = Store::open(opts(&root), big_disk(), session(sid), ts(0)).unwrap();
+    store.write_visit(&visit(sid, 1, NS_PER_SEC), &[]).unwrap();
+    store.close(ts(2 * NS_PER_SEC), "end").unwrap();
+    let ds = DataSet::open(&root).unwrap();
+    let v = ds.visits().unwrap().remove(0);
+    assert_eq!(v.measurement_json.as_deref(), Some(r#"{"preamp":"pre1"}"#));
+
+    // A version 2 shard (no measurement_json column) written before this
+    // release must still read.
+    let shard = k4na_store::shard::discover(&root).unwrap().remove(0);
+    let conn = rusqlite::Connection::open(&shard.path).unwrap();
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS visits_antenna_band_time; ALTER TABLE visits DROP COLUMN measurement_json;
+         UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(conn);
+    let ds = DataSet::open(&root).unwrap();
+    assert!(ds.shards().all(|s| s.error.is_none()));
+    let v = ds.visits().unwrap().remove(0);
+    assert_eq!(v.measurement_json, None);
+    assert_eq!(v.antenna_id, "log");
 }
 
 #[test]

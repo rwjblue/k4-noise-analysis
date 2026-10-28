@@ -59,6 +59,8 @@ pub struct VisitBuilder {
     pub pan: PanId,
     pub started: Timestamp,
     pub band_id: Option<String>,
+    /// Profile measurement settings for the visit (see `VisitRecord`).
+    pub measurement: std::collections::BTreeMap<String, String>,
     pub tile: Option<TileRef>,
     pub requested_vfo_hz: Option<u64>,
     pub requested_span_hz: Option<u32>,
@@ -79,6 +81,7 @@ impl VisitBuilder {
             pan,
             started,
             band_id: None,
+            measurement: std::collections::BTreeMap::new(),
             tile: None,
             requested_vfo_hz: None,
             requested_span_hz: None,
@@ -192,6 +195,7 @@ impl VisitBuilder {
             end_reason,
             antenna,
             radio_state,
+            measurement: self.measurement,
             stats,
         })
     }

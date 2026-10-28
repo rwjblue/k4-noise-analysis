@@ -14,10 +14,14 @@ use sha2::{Digest, Sha256};
 
 use crate::StoreError;
 use crate::codec::{Compression, SUMMARY_CODEC, encode_raw, encode_stats};
-use crate::schema::{FORMAT, SCHEMA_VERSION, ddl};
+use crate::schema::{FORMAT, READABLE_VERSIONS, SCHEMA_VERSION, ddl};
 use crate::shard::{ShardFile, ShardKind, ShardName, discover, read_meta, shard_bytes};
 
 pub const ROOT_MARKER: &str = "K4NA-DATA-ROOT";
+
+/// Default survey recovery journal directory inside a data root; the store
+/// never prunes or counts it.
+pub const RECOVERY_DIR: &str = "recovery";
 pub const LOCK_FILE: &str = ".k4na-writer.lock";
 
 /// Source of free-space readings (replaceable to simulate disk pressure).
@@ -743,7 +747,9 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
         if !root.is_dir() {
             return Err(StoreError::BadRoot(format!("{} is not a directory", root.display())));
         }
-        if !marker.exists() && std::fs::read_dir(root)?.next().is_some() {
+        // A survey recovery journal directory may predate the marker.
+        let foreign = std::fs::read_dir(root)?.any(|e| e.is_ok_and(|e| e.file_name() != RECOVERY_DIR));
+        if !marker.exists() && foreign {
             return Err(StoreError::BadRoot(format!(
                 "{} is not empty and has no {ROOT_MARKER} marker; choose an empty or k4na-created directory",
                 root.display()
@@ -754,7 +760,7 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
     if !marker.exists() {
         std::fs::write(
             &marker,
-            "This directory is a k4na measurement data root.\nk4na only creates, finalizes and prunes YYYY/MM/DD/{summary,raw}-*.sqlite shards here.\n",
+            "This directory is a k4na measurement data root.\nk4na only creates, finalizes and prunes YYYY/MM/DD/{summary,raw}-*.sqlite shards here.\nrecovery/ holds survey recovery journals: never pruned, not counted against quotas.\n",
         )?;
     }
     Ok(())
@@ -798,9 +804,9 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
             actual_low_hz, actual_high_hz, started_utc_ns, started_mono_ns, first_utc_ns, first_mono_ns, last_utc_ns, last_mono_ns,
             ended_utc_ns, ended_mono_ns, settle_ms, settle_discarded, accepted_frames, rejected_frames, status, flags, end_reason,
             noise_field_min, noise_field_median, noise_field_max, sequence_repeats, antenna_id, antenna_revision, antenna_port,
-            antenna_observed_port, radio_state_json)
+            antenna_observed_port, radio_state_json, measurement_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
         params![
             v.visit_id,
             v.session_id,
@@ -844,7 +850,12 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
             v.antenna.revision,
             v.antenna.port.as_str(),
             v.antenna.observed_port.map(|p| p.as_str()),
-            serde_json::to_string(&v.radio_state)?
+            serde_json::to_string(&v.radio_state)?,
+            if v.measurement.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&v.measurement)?)
+            }
         ],
     )?;
     Ok(())
@@ -907,7 +918,9 @@ fn recover_one(
     if !meta.is_ours(kind) {
         return Err(StoreError::NotAShard(path.to_owned()));
     }
-    if meta.schema_version != Some(SCHEMA_VERSION) {
+    // Finalizing an older shard only touches `meta`, so any readable
+    // version may be recovered.
+    if !meta.schema_version.is_some_and(|v| READABLE_VERSIONS.contains(&v)) {
         return Err(StoreError::UnsupportedSchema {
             path: path.to_owned(),
             found: meta.schema_version,

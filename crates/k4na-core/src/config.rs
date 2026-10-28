@@ -268,6 +268,17 @@ pub struct StorageConfig {
     /// Fraction below which raw sampling resumes after pressure.
     #[serde(default = "default_resume_fraction")]
     pub raw_resume_fraction: f64,
+    /// Survey recovery journals (docs/recovery.md). Default
+    /// `<root>/recovery`. Never pruned and not counted against
+    /// `max_total_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_dir: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    pub fn recovery_dir(&self) -> PathBuf {
+        self.recovery_dir.clone().unwrap_or_else(|| self.root.join("recovery"))
+    }
 }
 
 /// What to survey and how often. Lives in its own file so alternative

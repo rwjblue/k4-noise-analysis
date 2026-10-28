@@ -1,11 +1,16 @@
-//! SQLite schema version 2. See docs/storage.md for semantics.
+//! SQLite schema version 3. See docs/storage.md for semantics.
 //!
-//! Version 2 moved antenna identity from the session to each visit (a
-//! session may survey several antennas). Version 1 was pre-release and
-//! only ever produced by tests and the simulator; it is not readable.
+//! Version 3 adds `visits.measurement_json` (the profile measurement
+//! settings in effect; NULL for passive visits). Version 2 moved antenna
+//! identity from the session to each visit; v2 shards stay readable and
+//! read the new column as NULL. Version 1 was pre-release and only ever
+//! produced by tests and the simulator; it is not readable.
 
 pub const FORMAT: &str = "k4na-shard";
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// Versions readers accept (and the writer may finalize after a crash).
+pub const READABLE_VERSIONS: [u32; 2] = [2, 3];
 
 /// Tables common to both shard kinds.
 const COMMON: &str = r#"
@@ -89,7 +94,8 @@ CREATE TABLE IF NOT EXISTS visits (
     antenna_revision    TEXT NOT NULL,
     antenna_port        TEXT NOT NULL,
     antenna_observed_port TEXT,
-    radio_state_json    TEXT NOT NULL
+    radio_state_json    TEXT NOT NULL,
+    measurement_json    TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS visits_antenna_band_time ON visits (antenna_id, band_id, started_utc_ns);
 CREATE INDEX IF NOT EXISTS visits_session_time ON visits (session_id, started_utc_ns);

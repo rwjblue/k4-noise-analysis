@@ -103,7 +103,13 @@ pub struct VisitRecord {
     pub flags: Vec<String>,
     pub end_reason: String,
     pub antenna: VisitAntenna,
+    /// Verified readbacks during the visit (raw K4 values by prefix).
     pub radio_state: RadioState,
+    /// Profile measurement settings in effect: each field `as-found` or the
+    /// configured value, plus `cat_meta_mode`. Empty for passive visits.
+    /// The verified values themselves are in `radio_state`.
+    #[serde(default)]
+    pub measurement: BTreeMap<String, String>,
     pub stats: Option<VisitStats>,
 }
 
@@ -141,10 +147,12 @@ impl VisitRecord {
         self.stats.as_ref().map_or(0, |s| s.frame_count)
     }
 
-    /// Comparability segment key: antenna, pan, mapping and the readback
-    /// subset that affects spectra. Equal keys may be compared directly.
+    /// Comparability segment key: band, antenna, pan, mapping and the
+    /// verified readbacks (including receiver measurement settings) that
+    /// affect spectra. Equal keys may be compared directly.
     pub fn segment_key(&self, session: &SessionInfo) -> String {
         let mut parts = vec![
+            format!("band={}", self.band_id.as_deref().unwrap_or("none")),
             format!("antenna={}", self.antenna.id),
             format!("antenna_revision={}", self.antenna.revision),
             format!(
@@ -202,6 +210,11 @@ pub enum EventKind {
     AntennaMismatch,
     /// A full survey cycle finished; `count` is the cycle number.
     CycleComplete,
+    /// Profile measurement settings were applied and verified.
+    MeasurementApplied,
+    /// A context could not be measured as configured; its tiles were
+    /// skipped without changing anything.
+    MeasurementSkipped,
 }
 
 impl EventKind {
@@ -210,6 +223,8 @@ impl EventKind {
             Self::AntennaSelected => "antenna_selected",
             Self::AntennaMismatch => "antenna_mismatch",
             Self::CycleComplete => "cycle_complete",
+            Self::MeasurementApplied => "measurement_applied",
+            Self::MeasurementSkipped => "measurement_skipped",
             Self::SessionStart => "session_start",
             Self::SessionEnd => "session_end",
             Self::SpectrumConnected => "spectrum_connected",

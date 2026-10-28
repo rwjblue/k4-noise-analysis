@@ -8,7 +8,7 @@ use k4na_core::time::{NS_PER_SEC, civil_from_days};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::StoreError;
-use crate::schema::{FORMAT, SCHEMA_VERSION};
+use crate::schema::{FORMAT, READABLE_VERSIONS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShardKind {
@@ -224,7 +224,7 @@ pub fn open_read_only(path: &Path) -> Result<(Connection, ShardMeta), StoreError
         return Err(StoreError::NotAShard(path.to_owned()));
     }
     match meta.schema_version {
-        Some(SCHEMA_VERSION) => Ok((conn, meta)),
+        Some(v) if READABLE_VERSIONS.contains(&v) => Ok((conn, meta)),
         other => Err(StoreError::UnsupportedSchema {
             path: path.to_owned(),
             found: other,
