@@ -7,6 +7,7 @@
 
 mod analyze;
 mod recovery;
+mod watch;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -187,6 +188,9 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Live line/floor monitor for source hunting on whatever the operator
+    /// has tuned. Receive-only: opens the spectrum stream, never CAT.
+    Watch(watch::WatchArgs),
     /// Note a moment or interval for analysis, such as "dehumidifier off".
     /// Appends to <data>/annotations.jsonl; never touches measurements or
     /// the radio, so it is safe while a survey runs.
@@ -322,6 +326,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Analyze { what } => analyze::run(what, json),
         Cmd::Report { filter, out } => analyze::report(&filter, &out, json),
         Cmd::Replay { input } => replay(&input, json),
+        Cmd::Watch(args) => watch::run(args, json).await,
         Cmd::Mark {
             data,
             at,
@@ -984,6 +989,7 @@ fn mark(
         end_utc_ns: end,
         text: text.to_owned(),
         created_utc_ns: now,
+        source: None,
     };
     k4na_store::annotations::append(data, &a).map_err(|e| refuse(e.to_string()))?;
     if json {

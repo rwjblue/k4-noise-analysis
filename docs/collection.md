@@ -40,6 +40,7 @@ comparability; do not synthesize plausible values.
 ## Initial safety model
 
 The **passive** subcommand opens :9201 and never mutates radio state.
+The **watch** subcommand opens only :9201 and never connects to CAT.
 The **survey** subcommand requires BOTH an opt-in in TOML and
 an explicit CLI --allow-retune. A local operator must dedicate the selected
 receiver for the run. Do not enable a background survey automatically.
@@ -191,6 +192,7 @@ k4na survey --config config.toml --duration 24h --allow-retune
 k4na survey --config config.toml --profile surveys/rx-vs-dxc.toml --duration 24h --allow-retune
 k4na inspect --data ./data
 k4na replay --input fixture.bin
+k4na watch --config config.toml --f0 15967.69 --mark
 ~~~
 
 These commands are implemented (`capture` is the passive subcommand), plus
@@ -301,6 +303,39 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
 Both modes: bin-identical frames across a visit (frozen pan, stuck
 stream) produce an `aborted` visit. Frames from other pans are counted,
 not stored. Disconnects and stalls become `gap` events with intervals.
+
+Watch (`k4na watch`, for source hunting):
+- Opens :9201 only. It never connects to CAT, not even for GETs, so it
+  cannot change the radio and can run beside a capture, survey or QK4.
+  The operator tunes the K4 by hand; it measures whatever the pan shows.
+- Coverage is each frame header's centre and packet rate, minus the
+  `collection.usable_fraction` edges. A target outside it is listed as
+  not in view rather than measured. A header change (retune, new span)
+  restarts every state and is reported.
+- Frames of the chosen pan (default the configured receiver's) are
+  averaged over `--every` (1 s). Per target (`--hz`, repeatable, or every
+  harmonic of `--f0` in view): peak within `--tolerance` (60 Hz) minus
+  the median of bins within 3 kHz outside twice the tolerance. Floor:
+  median of the usable bins; its baseline is the 10th percentile of the
+  last 15 minutes of interval floors, available after one minute.
+- A line is present at `--threshold` (6) dB over its background and
+  absent below 3 dB less; it is *masked*, not absent, when its
+  background has risen since it was last present so far that its level
+  then would not stand out now. The floor is raised at `--floor-rise`
+  (4) dB over its baseline and normal below half of that. A change must
+  last `--hold` (3 s); it is reported with its onset, the start of the
+  first interval in the new state.
+- With `--mark`, confirmed changes (not first readings, not masking)
+  and lines typed on stdin become marks in `storage.root` with source
+  `watch`; without it, typed notes are only echoed. `--log FILE` appends
+  a CSV row per target per interval; `--json` prints reports, events and
+  notes as JSON lines. Nothing else is written; it is not a measurement
+  session and is not in any shard.
+- Replaying the 2026-10-28 30 m raw frames through it showed the
+  15,967.69 Hz harmonics 632-635 at +8 to +19 dB over the raised floor
+  during every cycling episode and mostly below threshold between them:
+  on 30 m the broadband rise and the comb switch together. Harmonic 636
+  (10.1555 MHz) coincides with a carrier present all night.
 
 ### Observed on a K4D (firmware R39)
 

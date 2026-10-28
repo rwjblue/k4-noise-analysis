@@ -28,6 +28,10 @@ pub struct Annotation {
     /// When it was written; later than `start_utc_ns` for a note made
     /// after the fact.
     pub created_utc_ns: i64,
+    /// What wrote it when not typed with `k4na mark`: `watch`, or
+    /// `import:<file name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl Annotation {
@@ -101,6 +105,7 @@ mod tests {
             end_utc_ns: end,
             text: text.into(),
             created_utc_ns: 100,
+            source: None,
         }
     }
 

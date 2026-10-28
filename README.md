@@ -59,6 +59,14 @@ Open `report.html`. While a later run is recording, use another shell to
 note a test with `k4na mark --data ./data "shed power off"`, then
 regenerate the report.
 
+To hunt a source, tune the K4 to one of its lines and run
+`k4na watch --config config/local.toml --hz 10123.547k --mark` (or
+`--f0 <comb fundamental>` for every harmonic in view). It reads only
+the spectrum stream, never CAT, and prints each line's dB over its local
+background and the floor every second, plus confirmed changes. Type a
+note such as `breaker 12 off` and Enter while flipping breakers; with
+`--mark` the notes and changes are saved as marks.
+
 To scan bands, follow the [survey setup](docs/collection.md). Reserve the
 main receiver, preview with `--dry-run`, and start with a short, attended
 run. Retuning requires config consent **and** `--allow-retune`. There are

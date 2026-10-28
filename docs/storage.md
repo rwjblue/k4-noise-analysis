@@ -42,11 +42,12 @@ data/
   annotations.jsonl
 ~~~
 
-`annotations.jsonl` holds operator marks from `k4na mark`, one JSON
-object per line (`start_utc_ns`, optional `end_utc_ns`, `text` up to
-500 characters, `created_utc_ns`), each appended with one write and
-fsynced. It is operator input, not measurement: the collector never
-writes it, retention never prunes it (it is bytes per note), and its size
+`annotations.jsonl` holds operator marks from `k4na mark` and `k4na
+watch --mark`, one JSON object per line (`start_utc_ns`, optional
+`end_utc_ns`, `text` up to 500 characters, `created_utc_ns`, optional
+`source`, such as `watch`),
+each appended with one write and fsynced. It is operator input, not
+measurement: the collector never writes it, retention never prunes it (it is bytes per note), and its size
 counts in the root's usage. `k4na mark` writes only into an existing
 k4na data root. Readers skip lines they cannot parse (a torn last line
 after a crash) and report the count. Notes are free text, so keep

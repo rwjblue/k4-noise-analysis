@@ -11,6 +11,7 @@ pub mod spectrum;
 pub mod store_task;
 pub mod survey;
 pub mod visit;
+pub mod watch;
 
 use k4na_core::Config;
 use k4na_core::config::Mode;

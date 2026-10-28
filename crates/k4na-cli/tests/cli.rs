@@ -271,6 +271,57 @@ fn end_to_end_against_tcp_simulator() {
         radio.setters_received()
     );
 
+    // Watch reads the spectrum stream only: not one CAT command, even a GET.
+    let cat_before = radio.commands().len();
+    let out = k4na()
+        .args([
+            "--json",
+            "watch",
+            "--duration",
+            "3s",
+            "--hold",
+            "1s",
+            "--hz",
+            "14.1M",
+            "--hz",
+            "7M",
+            "--mark",
+            "--config",
+        ])
+        .arg(&passive)
+        .write_stdin("breaker 12 off\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        radio.commands().len(),
+        cat_before,
+        "watch sent CAT {:?}",
+        &radio.commands()[cat_before..]
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let report = rows.iter().find(|r| r["type"] == "report").expect("a report");
+    assert_eq!(report["lines"][0]["target_hz"], 14_100_000.0);
+    assert!(report["lines"][0]["excess_db"].as_f64().unwrap() > 30.0);
+    assert_eq!(
+        report["out_of_view_hz"][0], 7_000_000.0,
+        "coverage from the frame header"
+    );
+    assert!(rows.iter().any(|r| r["type"] == "event" && r["to"] == "present"));
+    // The typed note is a mark; the first reading (from unknown) is not.
+    k4na()
+        .args(["marks", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("breaker 12 off").and(predicate::str::contains("watch:").not()));
+
     let survey = write_config(dir.path(), "survey", sim.cat_addr.port(), sim.pan_addr.port());
     k4na()
         .args(["survey", "--dry-run", "--duration", "1m", "--config"])
