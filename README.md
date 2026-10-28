@@ -30,6 +30,7 @@ k4na analyze bands    --data ./data              # background per band/hour (rea
 k4na analyze carriers --data ./data --format csv # recurring narrow peaks
 k4na analyze families --data ./data              # combs: carriers on a common grid
 k4na analyze episodes --data ./data              # when each band's floor rose, duty, period
+k4na analyze groups   --data ./data              # floors and carriers that switch together
 k4na report  --data ./data --out report.html     # heatmaps + tables, one offline file
 k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
 ~~~

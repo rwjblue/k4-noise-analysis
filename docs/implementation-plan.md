@@ -18,7 +18,7 @@ conflating an unverified observation with a hardware guarantee.
 | 3. Survey | Done; live K4D 80-10 m passes on one and three antennas (see collection.md); real 24 h dataset open |
 | 3a. Measurement profiles, recovery | Done in the simulator ([measurement.md](measurement.md), [recovery.md](recovery.md)): per band/antenna receiver settings, durable journal, `k4na recovery`; one short live K4D check of setters and kill-and-recover on one RX input |
 | 4. Quality | `k4na inspect` health summary done; troubleshooting guide and golden whole-survey replay open |
-| 5. Analysis | Started: `k4na analyze bands`, `carriers`, `families` and `episodes` (crate `k4na-analysis`) and `k4na report` (crate `k4na-report`), see [analysis.md](analysis.md#implemented-k4na-analysis2); operator annotations, tunable thresholds and A/B comparison open |
+| 5. Analysis | Started: `k4na analyze bands`, `carriers`, `families`, `episodes` and `groups` (crate `k4na-analysis`) and `k4na report` (crate `k4na-report`), see [analysis.md](analysis.md#implemented-k4na-analysis2); operator annotations, tunable thresholds and A/B comparison open |
 
 ## Definition of the first useful release
 

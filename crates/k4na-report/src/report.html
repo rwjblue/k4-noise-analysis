@@ -44,6 +44,10 @@
     <span class="dim">gray = not observed</span>
   </div>
   <div id="bands"></div>
+  <h2>Timing groups (floors and carriers that switch together)</h2>
+  <div class="panel scroll"><table id="groups"></table></div>
+  <h2>Floor episodes</h2>
+  <div class="panel scroll"><table id="episodes"></table></div>
   <h2>Carrier families (combs)</h2>
   <div class="panel scroll"><table id="families"></table></div>
   <h2>Carriers</h2>
@@ -165,6 +169,18 @@ function table(id, head, rows) {
 }
 
 function tables() {
+  const mins = (s) => (s == null ? "-" : (s / 60).toFixed(1));
+  table("groups", [["#"], ["bands", 1], ["floors", 1], ["carriers"], ["families kHz", 1], ["phi"], ["period min"], ["onsets", 1]],
+    A.timing_groups.map((g, i) => {
+      const floors = g.members.filter((m) => m.kind === "floor").map((m) => m.band_id);
+      const fams = [...new Set(g.members.filter((m) => m.family_spacing_hz).map((m) => `${m.band_id} ${(m.family_spacing_hz / 1e3).toFixed(3)}`))];
+      return [i + 1, g.bands.join(", "), floors.join(", ") || "-", g.members.length - floors.length, fams.join("; ") || "-",
+        `${g.min_phi.toFixed(2)}–${g.max_phi.toFixed(2)}`, mins(g.median_period_s), g.onsets_utc_ns.map(fmtTime).join(", ")];
+    }));
+  table("episodes", [["band", 1], ["antenna", 1], ["segment", 1], ["after", 1], ["start", 1], ["end", 1], ["before", 1], ["visits"], ["tiles"], ["rise dB"], ["max dB"]],
+    A.floor_episodes.map((e) => [e.band_id, e.antenna_id, shortSeg(e.segment_id), e.start_after_utc_ns == null ? "?" : fmtTime(e.start_after_utc_ns),
+      fmtTime(e.start_utc_ns), fmtTime(e.end_utc_ns), e.end_before_utc_ns == null ? "?" : fmtTime(e.end_before_utc_ns), e.visits,
+      `${e.tiles}/${e.tiles_analyzed}`, e.median_rise_db.toFixed(1), e.max_rise_db.toFixed(1)]));
   table("families", [["band", 1], ["antenna", 1], ["spacing kHz"], ["members"], ["grid lines"], ["fill"], ["MHz", 1], ["rms Hz"], ["chance"]],
     A.families.map((f) => [f.band_id, f.antenna_id, (f.spacing_hz / 1e3).toFixed(3), f.members.length, f.grid_positions, (f.fill * 100).toFixed(0) + "%",
       `${mhz(f.first_hz)}–${mhz(f.last_hz)}`, f.residual_rms_hz.toFixed(0), f.false_alarm.toExponential(1)]));

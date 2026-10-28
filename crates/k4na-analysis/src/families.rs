@@ -275,6 +275,7 @@ mod tests {
             hour_exposure: [0; 24],
             segments: 1,
             class: "stationary",
+            timeline: Default::default(),
         }
     }
 

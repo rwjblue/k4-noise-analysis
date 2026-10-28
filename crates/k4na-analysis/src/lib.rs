@@ -11,6 +11,7 @@ pub mod carriers;
 pub mod episodes;
 pub mod families;
 pub mod spectrum;
+pub mod timing;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -25,6 +26,7 @@ pub use carriers::Carrier;
 pub use episodes::{FloorActivity, FloorEpisode};
 pub use families::{Family, find_families};
 pub use spectrum::VisitSpectrum;
+pub use timing::{Feature, TimingGroup};
 
 /// Bumped whenever an algorithm or default changes its output.
 /// 2: comparability segments are split by delivered frame rate.
@@ -94,6 +96,13 @@ pub struct Params {
     pub episode_min_tile_visits: u64,
     pub episode_gap_revisits: f64,
     pub episode_merge_revisits: f64,
+    /// Timing groups: two features join when the phi coefficient of their
+    /// on/off signals is at least `min_phi` and at least
+    /// `min_matched_edges` onsets/ends coincide one-to-one.
+    pub timing_min_phi: f64,
+    pub timing_min_matched_edges: u64,
+    /// Carrier timelines bridge this many consecutive missed detections.
+    pub timing_max_missed: u64,
 }
 
 impl Default for Params {
@@ -118,6 +127,9 @@ impl Default for Params {
             episode_min_tile_visits: 8,
             episode_gap_revisits: 3.0,
             episode_merge_revisits: 1.0,
+            timing_min_phi: 0.7,
+            timing_min_matched_edges: 3,
+            timing_max_missed: 1,
         }
     }
 }
@@ -177,6 +189,54 @@ pub struct Analysis {
     /// Floor on/off behaviour and episodes per band, antenna and segment.
     pub floor_activity: Vec<FloorActivity>,
     pub floor_episodes: Vec<FloorEpisode>,
+    /// Floors and carriers that switch on and off together.
+    pub timing_groups: Vec<TimingGroup>,
+}
+
+/// Timing features: each band floor with its episodes, and each carrier
+/// with its presence (and family, if any).
+fn timing_features(
+    activity: &[FloorActivity],
+    episodes: &[FloorEpisode],
+    carriers: &[Carrier],
+    families: &[Family],
+) -> Vec<Feature> {
+    let mut out = Vec::new();
+    for a in activity {
+        let eps = episodes
+            .iter()
+            .filter(|e| (&e.band_id, &e.antenna_id, &e.segment_id) == (&a.band_id, &a.antenna_id, &a.segment_id))
+            .map(|e| (e.start_after_utc_ns, e.start_utc_ns, e.end_utc_ns, e.end_before_utc_ns));
+        let t = timing::Timeline::from_bounded(a.first_utc_ns, a.last_utc_ns, a.revisit_s * 1e9, eps);
+        out.push(Feature {
+            kind: "floor",
+            band_id: a.band_id.clone(),
+            antenna_id: a.antenna_id.clone(),
+            segment_id: Some(a.segment_id.clone()),
+            hz: None,
+            family_spacing_hz: None,
+            episodes: a.episodes,
+            on_fraction: t.on_fraction(),
+            timeline: t,
+        });
+    }
+    for c in carriers {
+        let family = families.iter().find(|f| {
+            f.band_id == c.band_id && f.antenna_id == c.antenna_id && f.members.iter().any(|&m| (m - c.hz).abs() < 0.5)
+        });
+        out.push(Feature {
+            kind: "carrier",
+            band_id: c.band_id.clone(),
+            antenna_id: c.antenna_id.clone(),
+            segment_id: None,
+            hz: Some(c.hz),
+            family_spacing_hz: family.map(|f| f.spacing_hz),
+            episodes: c.timeline.on.len() as u64,
+            on_fraction: c.timeline.on_fraction(),
+            timeline: c.timeline.clone(),
+        });
+    }
+    out
 }
 
 /// Native tenths to (uncalibrated) dB.
@@ -239,6 +299,7 @@ pub fn run(
             .cmp(&(&b.band_id, &b.antenna_id))
             .then(a.hz.total_cmp(&b.hz))
     });
+    let families = find_families(&carriers, params);
     let name = |p: &std::path::Path| {
         p.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -269,7 +330,11 @@ pub fn run(
             last_utc_ns: last,
         },
         band_hours: hours.finish(),
-        families: find_families(&carriers, params),
+        timing_groups: timing::group(
+            timing_features(&floor_activity, &floor_episodes, &carriers, &families),
+            params,
+        ),
+        families,
         carriers,
         floor_activity,
         floor_episodes,
@@ -381,6 +446,35 @@ pub fn floor_activity_csv(rows: &[FloorActivity]) -> String {
             opt_f64(a.median_gap_s),
             opt_f64(a.median_period_s),
         );
+    }
+    s
+}
+
+/// Timing groups as CSV: one row per member, numbered by group.
+pub fn timing_groups_csv(rows: &[TimingGroup]) -> String {
+    let mut s = String::from(
+        "group,group_members,min_phi,max_phi,median_period_s,kind,band_id,antenna_id,segment_id,hz,family_spacing_hz,episodes,on_fraction\n",
+    );
+    for (i, g) in rows.iter().enumerate() {
+        for m in &g.members {
+            let _ = writeln!(
+                s,
+                "{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.3}",
+                i + 1,
+                g.members.len(),
+                g.min_phi,
+                g.max_phi,
+                opt_f64(g.median_period_s),
+                m.kind,
+                csv_field(&m.band_id),
+                csv_field(&m.antenna_id),
+                m.segment_id.as_deref().unwrap_or(""),
+                opt_f64(m.hz),
+                m.family_spacing_hz.map(|f| format!("{f:.1}")).unwrap_or_default(),
+                m.episodes,
+                m.on_fraction,
+            );
+        }
     }
     s
 }

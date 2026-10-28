@@ -38,6 +38,9 @@ pub struct Carrier {
     pub hour_exposure: [u32; 24],
     pub segments: u64,
     pub class: &'static str,
+    /// Presence across the visits that covered it (for timing groups).
+    #[serde(skip)]
+    pub timeline: crate::timing::Timeline,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ struct Seen {
     low_hz: i64,
     high_hz: i64,
     utc_ns: i64,
+    end_ns: i64,
     segment: String,
     bin_hz: f64,
 }
@@ -88,6 +92,7 @@ impl Carriers {
             low_hz: s.low_hz,
             high_hz: s.high_hz,
             utc_ns: v.started_utc_ns,
+            end_ns: v.ended_utc_ns,
             segment: crate::analysis_segment(v),
             bin_hz: s.bin_hz,
         });
@@ -187,6 +192,15 @@ fn cluster(
     let mut widths: Vec<f64> = per_visit.values().map(|d| d.width_hz).collect();
     widths.sort_by(f64::total_cmp);
     let times = per_visit.keys().map(|&vi| g.visits[vi].utc_ns);
+    let mut presence: Vec<(i64, i64, bool)> = g
+        .visits
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| per_visit.contains_key(i) || covers(s.low_hz, s.high_hz))
+        .map(|(i, s)| (s.utc_ns, s.end_ns, per_visit.contains_key(&i)))
+        .collect();
+    presence.sort_unstable();
+    let timeline = crate::timing::Timeline::from_observations(&presence, p);
     let persistence = detections as f64 / exposure.max(1) as f64;
     let (min_hz, max_hz) = (hz[0], hz[hz.len() - 1]);
     let class = if exposure < p.min_carrier_exposure {
@@ -217,5 +231,6 @@ fn cluster(
         hour_exposure,
         segments: segments.len() as u64,
         class,
+        timeline,
     })
 }

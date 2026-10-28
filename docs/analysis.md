@@ -132,6 +132,30 @@ Across visits:
   Timing resolution is the revisit interval; an episode says the floor
   rose, not why (a switched device, propagation and a nearby wideband
   signal all qualify).
+- `analyze groups` finds features that switch on and off together. A
+  feature is a band floor with episodes, or a carrier with its presence
+  over the visits that covered it (bridging one missed detection, so a
+  carrier near threshold does not flicker into many episodes). Each
+  timeline's on intervals are its episodes extended halfway to the
+  bounding quiet observations; its edges are the observed onsets and
+  ends. Two features join when, over the span both observed, the phi
+  coefficient of their on/off signals is at least 0.7 (chance-corrected,
+  unlike overlap: two sources each on 80% of the time overlap mostly by
+  chance) and at least 3 edges match one-to-one within the mean of their
+  revisit intervals (one or two coincident edges occur by chance over a
+  night). Features with fewer than 3 observed edges, such as always-on
+  carriers, cannot join. Groups are connected components; each lists
+  its members (with the comb family a carrier belongs to), the weakest
+  and strongest joining phi, and the onsets and median onset interval of
+  its anchor (a floor if it has one, else the member with most edges).
+  A group is a hypothesis that one switched source or one propagation
+  change drives its members, not an identification.
+
+  Caveat: a raised floor masks carriers, so a carrier can appear to
+  switch off exactly when wideband noise switches on. That correlation
+  is negative and does not join a group, but it adds spurious edges to
+  the carrier's timeline and onsets to groups anchored on carriers.
+  Data gaps count as off for both features.
 
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
@@ -148,7 +172,8 @@ and antenna, in frequency order:
   marks an outage longer than twice the typical pass interval;
 - the median visit floor per pass, and a warning when the grid mixes
   receiver-settings segments;
-- tables of families, carriers (by persistence) and band/hour floors.
+- tables of timing groups, floor episodes, families, carriers (by
+  persistence) and band/hour floors.
 
 Rows are passes, not uniform time, so the Y axis is labelled with the
 first and last pass times; hover shows each cell's time and values. UTC
@@ -170,6 +195,13 @@ families; a 40 m line at 7.0098 MHz is harmonic 439, a 20 m line at
 14.0196 MHz harmonic 878). A cycling switched load (an inverter
 compressor is one candidate) fits, unconfirmed. Separately, a 40 m
 9.995 kHz-spaced family was present ~03:30-08:55 UTC with sharp edges.
+`analyze groups` joins the four floors, both combs and three 30 m
+carriers 15.96 kHz apart into one group (anchored on the 40 m floor:
+onsets 05:35, 05:54, 06:12, 06:27, 06:53). It places the 40 m comb with
+three 30 m carriers in a second group; its lines lie near multiples of
+20 kHz (7000.05 ... 7280.08 and 10100.11-10140.09 kHz), so the 9.995 kHz
+fit is a sub-multiple. That comb also drops out while the cycling source
+raises the floor (masking, above).
 
 Caveats specific to v1: thresholds are the exploratory defaults above
 and are not yet exposed as options; a chain of nearby CW or FT8

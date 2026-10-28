@@ -272,6 +272,12 @@ fn end_to_end_against_tcp_simulator() {
         .stdout(predicate::str::starts_with(
             "band_id,antenna_id,segment_id,start_after_utc,",
         ));
+    k4na()
+        .args(["analyze", "groups", "--format", "csv", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("group,group_members,min_phi,"));
     let html = dir.path().join("report.html");
     k4na()
         .args(["report", "--out"])

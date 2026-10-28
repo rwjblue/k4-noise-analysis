@@ -80,6 +80,12 @@ pub enum AnalyzeCmd {
         #[command(flatten)]
         select: Select,
     },
+    /// Floors and carriers that switch on and off together (candidate
+    /// common sources).
+    Groups {
+        #[command(flatten)]
+        select: Select,
+    },
 }
 
 fn parse_time(s: &str) -> Result<i64> {
@@ -170,6 +176,15 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
                 }
                 Format::Csv => k4na_analysis::floor_episodes_csv(&a.floor_episodes),
                 Format::Text => episodes_text(&a),
+            };
+            select.emit(&out)?;
+        }
+        AnalyzeCmd::Groups { select } => {
+            let a = select.analyze()?;
+            let out = match format(&select) {
+                Format::Json => json_of(&a.provenance, "timing_groups", serde_json::to_value(&a.timing_groups)?)?,
+                Format::Csv => k4na_analysis::timing_groups_csv(&a.timing_groups),
+                Format::Text => groups_text(&a),
             };
             select.emit(&out)?;
         }
@@ -326,6 +341,44 @@ fn episodes_text(a: &Analysis) -> String {
     }
     s += "\nAn episode is a floor raised over that tile's quiet baseline: the onset lies between `after` and `start`,\nthe end between `end` and `before` (? = edge of the data or a gap). It does not say why the floor rose.\n";
     s += &format!("rise = median dB over baseline; levels: {LEVEL_UNITS}\n");
+    s
+}
+
+fn groups_text(a: &Analysis) -> String {
+    let mut s = header(a);
+    s += &format!("{} timing group(s)\n", a.timing_groups.len());
+    for (i, g) in a.timing_groups.iter().enumerate() {
+        let onsets: Vec<String> = g.onsets_utc_ns.iter().map(|&t| hms(t)[..5].to_owned()).collect();
+        s += &format!(
+            "\ngroup {}: {} members on {}; phi {:.2}-{:.2}; period {} min; onsets (UTC) {}\n",
+            i + 1,
+            g.members.len(),
+            g.bands.join(", "),
+            g.min_phi,
+            g.max_phi,
+            minutes(g.median_period_s),
+            onsets.join(" "),
+        );
+        for m in &g.members {
+            let what = match (m.kind, m.hz) {
+                ("carrier", Some(hz)) => format!("carrier {:.3} kHz", hz / 1000.0),
+                _ => format!("floor {}", m.segment_id.as_deref().map(short).unwrap_or_default()),
+            };
+            let fam = m
+                .family_spacing_hz
+                .map(|f| format!("  family {:.3} kHz", f / 1000.0))
+                .unwrap_or_default();
+            s += &format!(
+                "  {:<5} {:<11} {:<28} {:>3} episode(s), on {:>4.0}%{fam}\n",
+                m.band_id,
+                m.antenna_id,
+                what,
+                m.episodes,
+                m.on_fraction * 100.0,
+            );
+        }
+    }
+    s += "\nA timing group is a hypothesis that one switched source or one propagation change drives its\nmembers (their on/off signals correlate and several onsets/ends coincide), not a source identification.\n";
     s
 }
 
