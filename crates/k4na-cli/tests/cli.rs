@@ -264,6 +264,19 @@ fn end_to_end_against_tcp_simulator() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with("band_id,antenna_id,spacing_hz,"));
+    let html = dir.path().join("report.html");
+    k4na()
+        .args(["report", "--out"])
+        .arg(&html)
+        .arg("--data")
+        .arg(dir.path().join("data"))
+        .assert()
+        .success();
+    let html = std::fs::read_to_string(html).unwrap();
+    assert!(
+        html.starts_with("<!doctype html>") && html.contains("\"grids\":[{"),
+        "report has a heatmap"
+    );
     k4na()
         .args(["analyze", "bands", "--since", "yesterday", "--data"])
         .arg(dir.path().join("data"))

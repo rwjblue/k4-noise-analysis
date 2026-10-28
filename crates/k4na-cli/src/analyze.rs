@@ -18,6 +18,17 @@ pub enum Format {
 
 #[derive(Debug, clap::Args)]
 pub struct Select {
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+    /// Write to this file instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FilterArgs {
     /// Data root to read (never modified).
     #[arg(long)]
     pub data: PathBuf,
@@ -36,11 +47,6 @@ pub struct Select {
     /// Visits starting before this UTC time (RFC 3339).
     #[arg(long)]
     pub until: Option<String>,
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    pub format: Format,
-    /// Write to this file instead of stdout.
-    #[arg(long)]
-    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,7 +82,7 @@ fn parse_time(s: &str) -> Result<i64> {
     i64::try_from(d.as_nanos()).context("time out of range")
 }
 
-impl Select {
+impl FilterArgs {
     pub fn filter(&self) -> Result<Filter> {
         Ok(Filter {
             band: self.band.clone(),
@@ -87,11 +93,17 @@ impl Select {
         })
     }
 
+    pub fn open(&self) -> Result<DataSet> {
+        DataSet::open(&self.data).with_context(|| format!("open {}", self.data.display()))
+    }
+}
+
+impl Select {
     pub fn analyze(&self) -> Result<Analysis> {
-        let ds = DataSet::open(&self.data).with_context(|| format!("open {}", self.data.display()))?;
+        let ds = self.filter.open()?;
         Ok(k4na_analysis::run(
             &ds,
-            &self.filter()?,
+            &self.filter.filter()?,
             &Params::default(),
             |_, _, _| {},
         )?)
@@ -141,6 +153,24 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
             };
             select.emit(&out)?;
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `k4na report`: one self-contained HTML file.
+pub fn report(f: &FilterArgs, out: &std::path::Path, json: bool) -> Result<ExitCode> {
+    let ds = f.open()?;
+    let now = k4na_core::time::system_utc_ns();
+    let html = k4na_report::render(&ds, &f.filter()?, &Params::default(), now)?;
+    std::fs::write(out, &html).with_context(|| format!("write {}", out.display()))?;
+    if json {
+        println!("{}", serde_json::json!({ "out": out, "bytes": html.len() }));
+    } else {
+        println!(
+            "wrote {} ({} KiB); open it in a browser (no network needed)",
+            out.display(),
+            html.len() / 1024
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

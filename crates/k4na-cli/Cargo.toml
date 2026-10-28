@@ -21,6 +21,7 @@ k4na-analysis = { version = "0.1.0", path = "../k4na-analysis" }
 k4na-collector = { version = "0.1.0", path = "../k4na-collector" }
 k4na-core = { version = "0.1.0", path = "../k4na-core" }
 k4na-protocol = { version = "0.1.0", path = "../k4na-protocol" }
+k4na-report = { version = "0.1.0", path = "../k4na-report" }
 k4na-sim = { version = "0.1.0", path = "../k4na-sim" }
 k4na-store = { version = "0.1.0", path = "../k4na-store" }
 serde_json = "1.0.154"

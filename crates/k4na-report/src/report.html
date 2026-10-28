@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>k4na noise report</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --fg:#e6e6e6; --dim:#9aa3ad; --line:#2a2f3a; --accent:#7cc4ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--fg); }
+  header, section { padding:16px 24px; }
+  header { border-bottom:1px solid var(--line); }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:24px 0 8px; }
+  h3 { font-size:14px; margin:0 0 6px; }
+  .dim { color:var(--dim); }
+  .warn { color:#ffcf70; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin:12px 0; }
+  .controls { display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .map { position:relative; }
+  canvas.heat { width:100%; image-rendering:pixelated; display:block; border:1px solid var(--line); background:#3a3a3a; }
+  canvas.floor { width:100%; height:70px; display:block; margin-top:4px; }
+  .axis { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); }
+  .tip { position:fixed; pointer-events:none; background:#000c; border:1px solid var(--line); padding:4px 8px; border-radius:4px; font-size:12px; display:none; white-space:nowrap; }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th, td { border-bottom:1px solid var(--line); padding:3px 6px; text-align:right; }
+  th { color:var(--dim); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  td.l, th.l { text-align:left; }
+  .scroll { max-height:420px; overflow:auto; }
+  .legend { height:10px; width:220px; border:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>K4 receive noise report</h1>
+  <div id="summary" class="dim"></div>
+  <div class="warn">Levels are dB on the K4's uncalibrated LAN panadapter scale, not dBm. Compare floors only within one receiver-settings segment. Carrier classes describe timing only; no source is implied.</div>
+</header>
+<section>
+  <div class="controls">
+    <label>Color <select id="layer"><option value="excess">excess over local background</option><option value="level">panadapter level</option></select></label>
+    <label>Time <select id="tz"><option value="utc">UTC</option><option value="local">local</option></select></label>
+    <span>0 <canvas id="legend" class="legend" width="220" height="10"></canvas> <span id="legendmax"></span></span>
+    <span class="dim">gray = not observed</span>
+  </div>
+  <div id="bands"></div>
+  <h2>Carrier families (combs)</h2>
+  <div class="panel scroll"><table id="families"></table></div>
+  <h2>Carriers</h2>
+  <div class="panel scroll"><table id="carriers"></table></div>
+  <h2>Band / hour background</h2>
+  <div class="panel scroll"><table id="hours"></table></div>
+  <h2>Provenance</h2>
+  <div class="panel"><pre id="prov" class="dim" style="white-space:pre-wrap;margin:0"></pre></div>
+</section>
+<div id="tip" class="tip"></div>
+<script id="k4na-data" type="application/json">/*K4NA_DATA*/null</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("k4na-data").textContent);
+const A = D.analysis, P = A.provenance;
+const $ = (id) => document.getElementById(id);
+const MISSING = 255;
+const STOPS = [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],[245,125,21],[250,193,39],[252,255,164]];
+function ramp(t) {
+  t = Math.max(0, Math.min(1, t)) * (STOPS.length - 1);
+  const i = Math.min(STOPS.length - 2, Math.floor(t)), f = t - i, a = STOPS[i], b = STOPS[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+function b64(s) { const r = atob(s), u = new Uint8Array(r.length); for (let i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; }
+function fmtTime(ns) {
+  const d = new Date(ns / 1e6);
+  return $("tz").value === "utc" ? d.toISOString().slice(0, 16).replace("T", " ") + "Z"
+    : d.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+const mhz = (hz) => (hz / 1e6).toFixed(4);
+const EXCESS_MAX = 30; // dB at the top of the excess scale
+const val = {
+  excess: (q) => q / 4,                // dB above local background
+  level: (q) => q / 2 - 170,           // uncalibrated dB
+};
+const grids = D.grids.map((g) => ({ ...g, ex: b64(g.excess), lv: b64(g.level) }));
+
+function levelRange(g) {
+  const v = []; for (const q of g.lv) if (q !== MISSING) v.push(q);
+  v.sort((a, b) => a - b);
+  if (!v.length) return [0, 1];
+  return [v[Math.floor(v.length * 0.02)], v[Math.floor(v.length * 0.995)] || v[v.length - 1]];
+}
+
+function drawHeat(g, canvas) {
+  const layer = $("layer").value, data = layer === "excess" ? g.ex : g.lv;
+  const rows = g.rows.length, cols = g.cols;
+  canvas.width = cols; canvas.height = rows;
+  canvas.style.height = Math.max(120, Math.min(700, rows * 3)) + "px";
+  const ctx = canvas.getContext("2d"), img = ctx.createImageData(cols, rows);
+  const [lo, hi] = layer === "level" ? (g.range ||= levelRange(g)) : [0, EXCESS_MAX * 4];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const q = data[r * cols + c], o = (r * cols + c) * 4;
+    if (q === MISSING) { img.data.set([58, 58, 58, 255], o); continue; }
+    const [R, G, B] = ramp((q - lo) / Math.max(1, hi - lo));
+    img.data.set([R, G, B, 255], o);
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function drawFloor(g, canvas) {
+  const w = canvas.clientWidth || 800, h = 70;
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d"), pts = g.rows.map((r, i) => [i, r.floor]).filter((p) => p[1] !== null);
+  ctx.clearRect(0, 0, w, h);
+  if (pts.length < 2) return;
+  const ys = pts.map((p) => p[1] / 10), lo = Math.min(...ys), hi = Math.max(...ys), span = Math.max(1, hi - lo);
+  ctx.strokeStyle = "#7cc4ff"; ctx.lineWidth = 1.5; ctx.beginPath();
+  pts.forEach(([i, f], k) => {
+    const x = (i / Math.max(1, g.rows.length - 1)) * (w - 1), y = h - 12 - ((f / 10 - lo) / span) * (h - 24);
+    k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+  ctx.fillStyle = "#9aa3ad"; ctx.font = "11px system-ui";
+  ctx.fillText(`floor over time (median local background per pass): ${lo.toFixed(1)} to ${hi.toFixed(1)} dB`, 4, 11);
+}
+
+function renderBands() {
+  const root = $("bands"); root.innerHTML = "";
+  for (const g of grids) {
+    const p = document.createElement("div"); p.className = "panel";
+    const first = g.rows[0], last = g.rows[g.rows.length - 1];
+    const segs = g.segments.length > 1 ? ` <span class="warn">${g.segments.length} receiver-settings segments (levels not comparable across them)</span>` : "";
+    p.innerHTML = `<h3>${g.band_id} · ${g.antenna_id} <span class="dim">${mhz(g.low_hz)}–${mhz(g.low_hz + g.cols * g.col_hz)} MHz · ${g.col_hz} Hz/column · ${g.rows.filter((r) => !r.gap).length} passes</span>${segs}</h3>
+      <div class="axis"><span>${mhz(g.low_hz)} MHz</span><span>${mhz(g.low_hz + g.cols * g.col_hz / 2)}</span><span>${mhz(g.low_hz + g.cols * g.col_hz)} MHz</span></div>
+      <div class="map"><canvas class="heat"></canvas></div>
+      <div class="axis"><span>top: ${fmtTime(first.utc_ns)}</span><span>bottom: ${fmtTime(last.utc_ns)}</span></div>
+      <canvas class="floor"></canvas>`;
+    root.appendChild(p);
+    const heat = p.querySelector("canvas.heat");
+    drawHeat(g, heat);
+    drawFloor(g, p.querySelector("canvas.floor"));
+    heat.addEventListener("mousemove", (e) => {
+      const rect = heat.getBoundingClientRect();
+      const c = Math.floor(((e.clientX - rect.left) / rect.width) * g.cols), r = Math.floor(((e.clientY - rect.top) / rect.height) * g.rows.length);
+      if (c < 0 || c >= g.cols || r < 0 || r >= g.rows.length) return;
+      const row = g.rows[r], qe = g.ex[r * g.cols + c], ql = g.lv[r * g.cols + c];
+      const f0 = g.low_hz + c * g.col_hz;
+      const tip = $("tip"); tip.style.display = "block"; tip.style.left = e.clientX + 14 + "px"; tip.style.top = e.clientY + 14 + "px";
+      tip.textContent = row.gap ? `${fmtTime(row.utc_ns)} · no observation` :
+        `${(f0 / 1e3).toFixed(2)}–${((f0 + g.col_hz) / 1e3).toFixed(2)} kHz · ${fmtTime(row.utc_ns)} · ` +
+        (qe === MISSING ? "not observed" : `+${val.excess(qe).toFixed(1)} dB over background · level ${val.level(ql).toFixed(1)} dB`);
+    });
+    heat.addEventListener("mouseleave", () => ($("tip").style.display = "none"));
+  }
+}
+
+function legend() {
+  const c = $("legend"), ctx = c.getContext("2d");
+  for (let x = 0; x < c.width; x++) { const [r, g, b] = ramp(x / (c.width - 1)); ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fillRect(x, 0, 1, c.height); }
+  $("legendmax").textContent = $("layer").value === "excess" ? `${EXCESS_MAX}+ dB over background` : "high (per-band 2nd–99.5th percentile)";
+}
+
+function table(id, head, rows) {
+  const t = $(id);
+  t.innerHTML = "<tr>" + head.map(([h, l]) => `<th class="${l ? "l" : ""}">${h}</th>`).join("") + "</tr>" +
+    rows.map((r) => "<tr>" + r.map((v, i) => `<td class="${head[i][1] ? "l" : ""}">${v}</td>`).join("") + "</tr>").join("");
+}
+
+function tables() {
+  table("families", [["band", 1], ["antenna", 1], ["spacing kHz"], ["members"], ["grid lines"], ["fill"], ["MHz", 1], ["rms Hz"], ["chance"]],
+    A.families.map((f) => [f.band_id, f.antenna_id, (f.spacing_hz / 1e3).toFixed(3), f.members.length, f.grid_positions, (f.fill * 100).toFixed(0) + "%",
+      `${mhz(f.first_hz)}–${mhz(f.last_hz)}`, f.residual_rms_hz.toFixed(0), f.false_alarm.toExponential(1)]));
+  const cs = [...A.carriers].sort((a, b) => b.persistence - a.persistence || b.median_excess_db - a.median_excess_db);
+  table("carriers", [["band", 1], ["antenna", 1], ["kHz"], ["class", 1], ["seen/covered"], ["persistence"], ["steady"], ["excess dB"], ["width Hz"], ["first", 1], ["last", 1]],
+    cs.map((c) => [c.band_id, c.antenna_id, (c.hz / 1e3).toFixed(3), c.class, `${c.detections}/${c.exposure}`, (c.persistence * 100).toFixed(0) + "%",
+      (c.steady_fraction * 100).toFixed(0) + "%", c.median_excess_db.toFixed(1), c.median_width_hz.toFixed(0), fmtTime(c.first_utc_ns), fmtTime(c.last_utc_ns)]));
+  table("hours", [["band", 1], ["antenna", 1], ["segment", 1], ["hour", 1], ["visits"], ["floor dB"], ["p10"], ["p90"], ["occupancy"], ["variability dB"], ["settings", 1]],
+    A.band_hours.map((r) => [r.band_id, r.antenna_id, r.segment_id.slice(0, 8), fmtTime(r.hour_start_utc_ns), r.visits, r.floor_db.toFixed(1),
+      r.floor_p10_db.toFixed(1), r.floor_p90_db.toFixed(1), (r.occupancy * 100).toFixed(1) + "%", r.variability_db.toFixed(1), r.measurement || ""]));
+}
+
+function summary() {
+  const span = P.first_utc_ns ? `${fmtTime(P.first_utc_ns)} to ${fmtTime(P.last_utc_ns)}` : "no data";
+  $("summary").textContent = `${P.visits_analyzed} visits (${P.visits_skipped} incomplete skipped) · ${span} · ${P.sessions.length} session(s) · profiles ${P.profiles.join(", ") || "-"} · ${A.carriers.length} carriers · ${A.families.length} families · ${D.report} / ${P.algorithm} · generated ${fmtTime(D.generated_utc_ns)}`;
+  $("prov").textContent = JSON.stringify(P, null, 2);
+}
+
+function all() { legend(); summary(); renderBands(); tables(); }
+$("layer").addEventListener("change", () => { legend(); renderBands(); });
+$("tz").addEventListener("change", all);
+all();
+</script>
+</body>
+</html>

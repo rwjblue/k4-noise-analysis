@@ -516,6 +516,7 @@ dependencies = [
  "k4na-collector",
  "k4na-core",
  "k4na-protocol",
+ "k4na-report",
  "k4na-sim",
  "k4na-store",
  "predicates",
@@ -567,6 +568,17 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "k4na-report"
+version = "0.1.0"
+dependencies = [
+ "k4na-analysis",
+ "k4na-store",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

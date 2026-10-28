@@ -1,0 +1,19 @@
+[package]
+name = "k4na-report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k4na-analysis = { version = "0.1.0", path = "../k4na-analysis" }
+k4na-store = { version = "0.1.0", path = "../k4na-store" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

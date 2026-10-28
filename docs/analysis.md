@@ -106,6 +106,27 @@ Across visits:
   (harmonics of one switching or clock source are a common cause), not
   a source identification.
 
+`k4na report --data DIR --out report.html` (crate `k4na-report`,
+`k4na-report/1`) writes one self-contained HTML file: no network
+resources, data embedded as JSON with the analysis provenance. Per band
+and antenna, in frequency order:
+
+- a heatmap with RF on X and passes on Y (a pass is a run of
+  consecutive tile visits; it ends after a pause over a minute, on a new
+  session, or when a tile repeats). Visits are binned at 250 Hz and
+  merged to at most 1600 columns, keeping the *maximum* excess per
+  column so a one-bin carrier stays visible, and the mean level. Color
+  is excess over local background (0-30 dB) or the uncalibrated level
+  (per-band 2nd-99.5th percentile); gray is not observed, and a gray row
+  marks an outage longer than twice the typical pass interval;
+- the median visit floor per pass, and a warning when the grid mixes
+  receiver-settings segments;
+- tables of families, carriers (by persistence) and band/hour floors.
+
+Rows are passes, not uniform time, so the Y axis is labelled with the
+first and last pass times; hover shows each cell's time and values. UTC
+or browser-local time can be selected.
+
 First observation (2026-10-27 data, 10 m, RX ANT IN1 at `PRE1`): 34
 carriers on 34 consecutive grid lines spaced 35.087 kHz, 28.526-29.684
 MHz, RMS 13 Hz from the grid, seen in every covering visit (only five

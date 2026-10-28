@@ -122,6 +122,15 @@ enum Cmd {
         #[command(subcommand)]
         what: analyze::AnalyzeCmd,
     },
+    /// Write a self-contained HTML report (heatmaps, carriers, families,
+    /// band/hour floors) from a data root (read-only).
+    Report {
+        #[command(flatten)]
+        filter: analyze::FilterArgs,
+        /// Output HTML file.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Decode a raw :9201 byte capture offline.
     Replay {
         #[arg(long)]
@@ -221,6 +230,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Recovery { action } => recovery::run(action, json).await,
         Cmd::Inspect { data } => inspect(&data, json),
         Cmd::Analyze { what } => analyze::run(what, json),
+        Cmd::Report { filter, out } => analyze::report(&filter, &out, json),
         Cmd::Replay { input } => replay(&input, json),
         Cmd::Simulate {
             host,

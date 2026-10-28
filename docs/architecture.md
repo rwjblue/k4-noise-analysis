@@ -115,15 +115,17 @@ emit A and B packets on the local LAN; no 9204 dependency is required.
   receiver measurement codecs, interlocks, scheduler, the survey recovery
   journal and restoration engine, lifecycle and metrics.
 - crates/k4na-cli: operator commands (check, estimate, capture, probe,
-  survey, recovery, inspect, analyze, replay, simulate); one executable
-  named k4na.
+  survey, recovery, inspect, analyze, report, replay, simulate); one
+  executable named k4na.
 - crates/k4na-sim: a simulated K4 (CAT and spectrum servers over one
   fault-injecting radio model) for tests and dry runs; it logs every
   received command so tests can assert that nothing forbidden was sent.
 - crates/k4na-analysis: read-only derived analysis (local background,
   band/hour summaries, recurring carriers) over the store's read API;
   depends on k4na-core and k4na-store only, never on the collector.
-- crates/k4na-report (later): reports separate from the writer.
+- crates/k4na-report: a self-contained static HTML report (heatmaps,
+  floors, carrier/family/band-hour tables) rendered from k4na-analysis;
+  separate from the writer and needing no network to view.
 
 Begin with a single workspace and binary; organize libraries when doing so
 improves testing. Avoid a network service, shared database server, or plugin
