@@ -39,7 +39,7 @@ frequencies and times to check them against.
 You'll need a K4 on your LAN and Rust. From the checkout:
 
 ```sh
-mise install                     # the project's pinned Rust toolchain
+mise install                     # pinned Rust, Python and uv toolchains
 cargo install --locked --path crates/k4na-cli
 cp config/example.toml config/local.toml
 ```
@@ -75,6 +75,20 @@ was on, for example:
 k4na import-marks --data ./data thermostat.csv --time Date,Time \
   --tz America/New_York --on "Heat Stage 1 (sec)" --label furnace
 ```
+
+For automatic Carrier HVAC marks, create an ignored `.env` from
+[.env.example](.env.example) with your SmartHome credentials, then start
+both collectors with one command:
+
+```sh
+mise run record --duration 8h
+```
+
+This defaults to passive RF capture and refuses startup without fresh HVAC
+readings unless you explicitly pass `--without-hvac`. Python and uv are
+mise-pinned; Python dependencies are locked with uv. See
+[Carrier setup, storage and coverage limits](docs/carrier.md). The helper
+has offline tests but has not yet been validated against a live Carrier account.
 
 To scan bands, follow the [survey setup](docs/collection.md). Reserve the
 main receiver, preview with `--dry-run`, and start with a short, attended

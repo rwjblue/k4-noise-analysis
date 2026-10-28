@@ -238,6 +238,13 @@ Imported marks have source `import:<file name>`; a mark with the same
 start, end and text as an existing one is skipped, so re-importing an
 export adds only new rows. `--dry-run` shows them without writing.
 
+The optional [Carrier helper](carrier.md) polls equipment state and imports
+completed observed/unknown intervals through the same command. Detailed numeric
+readings remain in separately versioned auxiliary shards. HVAC marks distinguish
+reported off states from missing telemetry; they do not add capacity plots or
+automatic source attribution. Their time resolution is limited by polling and
+Carrier's cached status/source timestamps, not just the annotation nanoseconds.
+
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
 resources, data embedded as JSON with the analysis provenance. Per band

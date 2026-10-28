@@ -210,6 +210,13 @@ admission); 3 stopped for operator activity (transmit or external change).
 Passive capture must remain useful even if safe automated retuning turns out
 to be impossible on a particular K4 firmware or operating configuration.
 
+`mise run record --duration 8h` optionally starts the independent Carrier
+logger and passive capture together. It does not change this CLI's consent,
+interlock, restoration or storage behavior. Active use requires `--mode survey
+--allow-retune` plus station consent, and the usual attended preview/checks.
+See [carrier.md](carrier.md) for setup, tool/dependency locks, status and explicit
+RF-only operation.
+
 ## Implemented behavior (v0.1)
 
 Passive (`capture`):

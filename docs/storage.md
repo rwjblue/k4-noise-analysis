@@ -59,6 +59,16 @@ after a crash) and report the count. Notes are free text, so keep
 people's names and addresses out of them like any other data-root
 content.
 
+The optional [Carrier logger](carrier.md) imports completed derived intervals
+as `import:carrier-marks.csv`. Its source observations are not RF measurement
+rows and live outside this root, by default in `output/carrier`: version-1
+SQLite shards with an independent 64 MiB cap, 4 MiB/hourly rotation, free-space
+reserve, transactional checkpoints and restartable import bookkeeping. The RF
+quota does not cover those files. The helper never deletes telemetry and stops
+logging at its cap; RF continues with explicit missing HVAC coverage. It also
+refuses unattended imports once annotations exceed 16 MiB. No measurement
+schema or existing annotation contract changes.
+
 - One writer owns shards; readers open completed shards read-only.
 - Hourly UTC rotation, by shard timestamp, not estimated size. At rotation
   checkpoint WAL, close, atomically mark finalized, and continue in new

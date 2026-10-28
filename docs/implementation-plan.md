@@ -137,6 +137,21 @@ No interface requiring a running radio is necessary for offline analysis.
 - Investigate per-band hardware calibration before emitting dBm.
   Do not let these block collector readiness.
 
+### Independent Carrier telemetry
+
+Implemented offline: the Python adapter in `integrations/carrier`, pinned
+mise Python/uv toolchains and `uv.lock`, ignored mise-loaded `.env`
+credentials, supervised `mise run record` (passive default; explicit survey
+consent), versioned/capped auxiliary shards, unknown/stale/restart coverage,
+and deduplicated completed intervals through `import-marks`. Offline checks
+run in CI and `mise run ci`; see [carrier.md](carrier.md).
+
+Acceptance still open: authenticate against the operator's actual SmartHome
+account, verify supported systems and source timestamp cadence, compare
+reported indoor/outdoor states and output values with the app, and conduct an
+attended combined passive run. Do not claim historical backfill, exact switch
+timing, automatic attribution or unattended live validation from synthetic tests.
+
 ## Cross-cutting tests
 
 Protocol: known hardware fixtures; randomized chunk boundaries; malformed

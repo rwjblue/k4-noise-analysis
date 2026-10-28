@@ -200,5 +200,19 @@ site notes; keep IP/host only in local config/logs and redact secrets.
 - **Firmware changes:** keep provenance and replay tests from actual captures;
   refuse unknown formats instead of silently guessing.
 
+## Independent household telemetry
+
+`integrations/carrier` is a read-only Python adapter using the unofficial
+Carrier client, isolated from the Rust collector. A file-based mise `record`
+task supervises the adapter and existing RF CLI; passive mode remains the
+default, and active survey still requires both consents and all interlocks.
+Auxiliary source observations have their own versioned, capped storage outside
+the measurement root. Derived completed intervals enter the existing marks
+importer; offline reports do not need Python, Carrier access or the helper.
+Neither a cloud outage nor a telemetry-storage failure changes radio state or
+silently stops RF recording. See [carrier.md](carrier.md) for startup refusal,
+coverage gaps, supervision and lockfile/environment contracts. Carrier account
+compatibility remains unverified live.
+
 See collection.md, storage.md, analysis.md, implementation-plan.md and
 ../config/example.toml for the executable contract.
