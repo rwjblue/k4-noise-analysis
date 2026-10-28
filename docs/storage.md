@@ -1,9 +1,17 @@
 # On-disk format and bounded retention
 
-Status: implemented (schema version 2) in crates/k4na-store; no migrations
-yet. Readers reject unsupported schema versions. Version 2 moved antenna
-identity from the session to each visit, because one survey session can
-measure several antennas. Version 1 was pre-release and is not read.
+Status: implemented (schema version 3) in crates/k4na-store; no migrations
+yet. Readers reject unsupported schema versions. Version 3 added
+`visits.measurement_json`; readers still open version 2 shards (the
+column reads as NULL). Version 2 moved antenna identity from the session
+to each visit, because one survey session can measure several antennas.
+Version 1 was pre-release and is not read.
+
+Survey recovery journals ([recovery.md](recovery.md)) are not
+measurement data. They live in `storage.recovery_dir` (default
+`<root>/recovery`), are never pruned and are not counted against the
+byte quota. Each is bounded by compaction (well under 300 KiB); resolved
+or acknowledged journals may be deleted by hand.
 
 ## Why storage must be designed before continuous capture
 
@@ -69,7 +77,10 @@ elapsed, observed center/sample rate/bin count, accepted and rejected
 counts, settle period, actual frequency coverage, completeness flags
 and abort/gap reason. Actual bands are half-open [low_hz, high_hz).
 The `band_id` is the survey profile's range id (for example `40m` or
-`40m-cw`).
+`40m-cw`). Survey visits store the resolved measurement settings and CAT
+meta-mode as `measurement_json` (a JSON object of strings, `as-found`
+where the profile left a setting alone); the verified values are in the
+segment's state.
 
 Each visit also records its antenna: `antenna_id`, `antenna_revision`,
 `antenna_port` (the registry port) and `antenna_observed_port` (the port

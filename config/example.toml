@@ -55,3 +55,6 @@ summary_retention_days = 30
 protected_summary_hours = 24   # if not feasible, fail safely; never fill disk
 shard_duration_minutes = 60    # UTC hourly, raw and summary separate
 compression = "zstd"
+# Survey recovery journals (docs/recovery.md): never pruned, not counted
+# against max_total_bytes. Default "<root>/recovery".
+# recovery_dir = "./data/recovery"

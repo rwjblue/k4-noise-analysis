@@ -2,10 +2,11 @@
 
 Collector-first RF noise survey tooling for an Elecraft K4D, written in Rust.
 
-**Status: collector implemented; not yet validated on a physical K4.** The
-protocol decoder replays real R39 captures. Passive capture, the guarded
-survey, storage limits and recovery are tested against a simulated K4,
-including an accelerated 24-hour run under a 64 MiB cap. See
+**Status: collector implemented.** The protocol decoder replays real R39
+captures. Passive capture and band/antenna survey passes have run on a
+K4D (R39). Receiver measurement settings and the crash-recovery journal
+are tested only against a simulated K4, as are storage limits (including
+an accelerated 24-hour run under a 64 MiB cap). See
 [unverified hardware assumptions](docs/collection.md#unverified-on-hardware)
 before trusting unattended runs.
 
@@ -20,9 +21,16 @@ k4na capture  --config my.toml --duration 5m        # passive, no setters
 k4na survey   --config my.toml --duration 1m --dry-run
 k4na survey   --config my.toml --duration 24h --allow-retune
 k4na survey   --config my.toml --profile config/surveys/hf-cw-us.toml --duration 24h --allow-retune
+k4na probe    --config my.toml                      # GET-only state readout
+k4na recovery list --config my.toml                 # interrupted surveys
+k4na recovery restore <session> --dry-run --config my.toml
 k4na inspect  --data ./data
 k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
 ~~~
+
+A survey journals every radio change before sending it. If one is
+interrupted, new surveys refuse to start until `k4na recovery restore`
+or `acknowledge` settles it; see [docs/recovery.md](docs/recovery.md).
 
 `mise run long-run` runs the accelerated 24-hour simulated survey.
 
@@ -62,6 +70,8 @@ birdie, not automatically a confirmed household RFI source.
 
 - [Architecture and invariants](docs/architecture.md)
 - [Survey and protocol acceptance](docs/collection.md)
+- [Receiver measurement settings](docs/measurement.md)
+- [Survey recovery journal](docs/recovery.md)
 - [Storage, quotas and retention](docs/storage.md)
 - [Later analysis and near/far comparison](docs/analysis.md)
 - [Ordered implementation plan and acceptance tests](docs/implementation-plan.md)

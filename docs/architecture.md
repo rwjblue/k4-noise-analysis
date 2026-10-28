@@ -112,9 +112,10 @@ emit A and B packets on the local LAN; no 9204 dependency is required.
   visit, quality flags, timestamps), survey planning and online summaries.
 - crates/k4na-store: versioned SQLite shards, encoding, retention, read API.
 - crates/k4na-collector: Tokio network sessions, CAT GET/control whitelist,
-  interlocks, scheduler, lifecycle and metrics.
-- crates/k4na-cli: operator commands (check, estimate, capture, survey,
-  inspect, replay, simulate); one executable named k4na.
+  receiver measurement codecs, interlocks, scheduler, the survey recovery
+  journal and restoration engine, lifecycle and metrics.
+- crates/k4na-cli: operator commands (check, estimate, capture, probe,
+  survey, recovery, inspect, replay, simulate); one executable named k4na.
 - crates/k4na-sim: a simulated K4 (CAT and spectrum servers over one
   fault-injecting radio model) for tests and dry runs; it logs every
   received command so tests can assert that nothing forbidden was sent.
@@ -156,7 +157,9 @@ Do not pin fictional future dependency versions.
    noise ranking without explicit normalization/qualification.
 9. Collector exits and crashes must be safe: stop CAT writes first, persist
    termination reason, and conditionally restore only settings still known
-   to be collector-owned. Never overwrite a newer human change.
+   to be collector-owned. Never overwrite a newer human change. Every
+   change is journaled durably before it is sent, so a crash leaves a
+   record that `k4na recovery` can restore from ([recovery.md](recovery.md)).
 
 ## Data lifecycle / user experience
 

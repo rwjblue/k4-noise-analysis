@@ -1,7 +1,7 @@
 # Receiver measurement settings
 
-Status: research and contract for deterministic measurement profiles.
-Sources: the K4 Programmer's Reference rev. D4 (public HTML from
+Status: implemented for surveys and tested against the simulator. **No
+measurement setter has been sent to a physical K4 yet.** Sources: the K4 Programmer's Reference rev. D4 (public HTML from
 ftp.elecraft.com), GET-only `k4na probe` readbacks from a K4D on
 firmware R39, and the per-visit state recorded by earlier live runs. Any
 row marked *unverified* is an assumption the collector must check by
@@ -62,3 +62,52 @@ that input is first selected. Before switching inputs it puts the current
 context back; before leaving a band it puts the band back. Restoring in
 that order is correct whether a setting is global, per band or per band
 and input.
+
+## Measurement profiles in a survey
+
+A survey profile's `[measurement]` table chooses each setting as a value
+or `"as-found"`. Built-in defaults put the front end and DSP that alter
+the spectrum in a known state (attenuator off, RF gain 0, NB, NR and pan
+NB off) and leave preamp, AGC and averaging as found. `[[measurement.override]]`
+entries refine by `band`, `antenna`, or both; the most specific value
+wins per field.
+
+~~~toml
+[measurement]
+preamp = "pre1"
+agc = "fast"
+
+[[measurement.override]]
+antenna = "dxc"
+preamp = "off"
+~~~
+
+For each tile, after `BN`, `FA` and the antenna's `AR`, the survey:
+
+1. resolves the settings for the band and antenna;
+2. plans the setters from the current readback in the radio's CAT
+   meta-mode. A context is measured only if every target is a
+   whitelisted setter **and** every found value it would change can be
+   sent back. Otherwise the tile is skipped with a `measurement_skipped`
+   event (and counted in the report), and nothing is changed: for
+   example, an attenuator level in basic mode;
+3. journals the found values and the intent, sends the setters, and
+   verifies the readback (a mismatch stops the survey);
+4. records a `measurement_applied` event.
+
+Before switching RX input the current input's settings are put back, and
+before leaving a band its memory is put back
+([recovery.md](recovery.md)). The interlock watches every measurement
+key, so an operator change mid-survey stops it without further setters.
+`survey --dry-run` prints what each antenna's settings would change on
+the current band.
+
+Each survey visit stores the resolved settings (including `as-found`
+fields) and the CAT meta-mode in `measurement_json`. Its state readback
+includes every measurement key, so comparability segments split whenever
+the verified settings differ; `as-found` and an explicit setting with the
+same readback share a segment. Passive visits have no `measurement_json`.
+
+The pan span follows the same rule: a band that recalls a span the
+whitelist cannot send back (30 m's `#SPN5000`) is surveyed at that span,
+with a `warning`, rather than changed and left changed.

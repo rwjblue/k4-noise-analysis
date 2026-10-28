@@ -226,9 +226,15 @@ Passive (`capture`):
 
 Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
 - Setters are limited to `BN`, `FA` (rounded to 100 Hz), `#SPN`,
-  `#FXT` and, only with `collection.allow_rx_antenna_switch = true`, `AR`
-  for a main-RX port in the registry (`AR1`, `AR4`-`AR7`). The TX antenna
-  (`AN`), mode, gain and display reference are never set.
+  `#FXT`, the typed receiver measurement setters of
+  [measurement.md](measurement.md) (`PA`, `RA`, `RG`, `GT`, `NB`, `NR`,
+  `#NB`, `#AVG`, with exact per-command parameter checks) and, only with
+  `collection.allow_rx_antenna_switch = true`, `AR` for a main-RX port
+  in the registry (`AR1`, `AR4`-`AR7`). The TX antenna (`AN`), CAT
+  meta-mode (`K4n`), mode and display reference are never set.
+- Every change is journaled before it is sent
+  ([recovery.md](recovery.md)). A survey refuses to start while an
+  earlier journal is unresolved.
 - Antennas: before measuring a tile, the main-RX input read back after
   `BN`/`FA` must resolve to the profile antenna's port. Otherwise the
   survey selects it with `AR` (when allowed, then verified by readback; a
@@ -246,11 +252,11 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   and the profile span with `FA`. Before leaving a band, holding between
   cycles or restoring, it puts those settings back (a `state_changed`
   event), so every band's memory is as the operator left it. A recalled
-  value the whitelist cannot send (30 m stored `#SPN5000`, below the
-  documented 6000) is left as the survey set it, with a `warning`. A band
-  that
-  recalls a fixed pan without `set_pan_track_mode` ends the survey
-  (restoring) instead of measuring it.
+  span the whitelist cannot send back (30 m stored `#SPN5000`, below the
+  documented 6000) is never changed: the band is surveyed at that span,
+  with a `warning`. The same rule applies to `AR` and receiver settings.
+  A band that recalls a fixed pan without `set_pan_track_mode` ends the
+  survey (restoring) instead of measuring it.
 - Cadence: a cycle visits every tile once per antenna. `min_cycle_ms` is
   the target start-to-start period. A faster cycle puts back the band's
   settings and holds there (still polling the interlock; frames are not
@@ -262,8 +268,12 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   is not fixed (`#FXT1`) unless `collection.set_pan_track_mode = true`
   lets the survey switch it to track; and, when
   `require_firmware_readback`, `RV` answered.
-- Before each change the interlock (TQ plus FA, FB, BN, MD, FT, DV, SB,
-  LK, RT, XT, AR, AN, #SPN, #FXT, #FRZ) must equal the baseline. After setters,
+- Preflight also reads the CAT meta-mode (`K4;`); measurement settings
+  are encoded for that mode, and a mode change mid-survey is operator
+  activity.
+- Before each change the interlock (TQ plus K4, FA, FB, BN, MD, FT, DV,
+  SB, LK, RT, XT, AR, AN, #SPN, #FXT, #FRZ and every measurement key)
+  must equal the baseline. After setters,
   the full state is read back. The setters must be confirmed, nothing they
   should not affect may move, and the readback becomes the new baseline.
   It is polled every `collection.cat_poll_ms` (default 500 ms) during a
@@ -280,11 +290,13 @@ Survey (`survey --allow-retune`, with `collection.allow_retune = true`):
   coverage still misses its target becomes a `coverage_unverified` event,
   not a visit. Settle frames are discarded and counted.
 - Clean ends (duration, signal, storage suspension, no usable spectrum)
-  put back the current band's settings, select the original band with
-  `BN` alone, then send only the original FA/#SPN/#FXT and `AR` that its
-  recalled memory did not already restore, only if the radio still
-  matches the collector's last state. A mode change from band-stack recall is
-  reported, not corrected. Nothing is restored on a later restart.
+  restore through the journal's engine: each field the collector changed
+  is put back only if the radio still holds a value the collector set;
+  anything else is a reported conflict and left alone. Ends after
+  operator activity, lost CAT or an unconfirmed readback restore
+  nothing and leave the journal pending; the report lists manual steps.
+  Nothing is restored automatically on a later start: run
+  `k4na recovery restore` (see [recovery.md](recovery.md)).
 
 Both modes: bin-identical frames across a visit (frozen pan, stuck
 stream) produce an `aborted` visit. Frames from other pans are counted,
