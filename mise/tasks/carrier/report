@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Print a read-only report of saved Carrier equipment events"
+#USAGE flag "--telemetry-dir <dir>" default="output/carrier" help="Existing HVAC telemetry directory (no radio/account needed)"
+#USAGE flag "--limit <rows>" default="25" help="Recent event, interval and unit-summary rows per section (1..1000)"
+set -euo pipefail
+cd "${MISE_PROJECT_ROOT:?}"
+exec uv run --locked --project integrations/carrier python integrations/carrier/run.py report "$@"

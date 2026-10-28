@@ -5,8 +5,12 @@ collector. It uses the unofficial [carrier-api](https://github.com/dahlb/carrier
 client's authentication and `get_systems` query, never equipment setters.
 It needs a compatible Carrier Infinity/SmartHome account. Entry-level systems
 are not supported by this first adapter; the app name alone does not establish
-compatibility. Account access and actual hardware fields have **not** been
-validated live. All automated tests use synthetic responses and a fake RF process.
+compatibility. Authentication, repeated read-only polling, console output,
+private SQLite recording and offline reporting passed a short Carrier-only
+live smoke test. No thermostat settings changed, no radio was connected, and
+smoke-test marks were not imported into RF data. Heating/cooling transitions,
+stage/output changes and combined RF operation remain unverified live. All
+automated tests use synthetic responses and a fake RF process.
 
 ## Setup and the normal command
 
@@ -15,7 +19,7 @@ platform downloads. `integrations/carrier/uv.lock` locks the helper's Python
 dependencies. Tasks use `uv run --locked`; no global pip install or Home
 Assistant installation is needed.
 
-All three argument-taking tasks declare Usage flags for native help, defaults,
+Recording, logging, import and report tasks declare Usage flags for native help, defaults,
 file/directory completion and `capture`/`survey` choices. Flags follow the task
 name directly; no extra `--` is needed. Try `mise run record --help`,
 `mise run carrier:log --help`, or `mise run carrier:import --help`. Mise's shell
@@ -89,6 +93,32 @@ printed. A change means the equipment snapshots differ, not that exact hardware
 switching time is known. No profiles, credentials, or raw account responses are
 printed; terminal controls in returned strings are removed.
 
+## Offline event report
+
+```sh
+mise run carrier:report
+mise run carrier:report --telemetry-dir output/carrier-test --limit 10
+mise run carrier:report --help
+```
+
+This small task reads existing SQLite shards in read-only mode, without a cloud
+client, radio connection, credential requirement, Rust build, mark import or
+checkpoint update. It prints sample/quality totals, per-session unit summaries,
+reported variable-capacity ranges, a recent event timeline, and completed
+intervals with their import status. `--limit` bounds rows in each section
+(default 25, maximum 1000); totals still cover the whole selected directory.
+The reader streams rows with explicit shard, unit/session and payload limits.
+
+Events are derived from consecutive equipment snapshots: initial, change,
+unknown and resumed. Cache timestamp refreshes alone are not changes; blower
+RPM or pressure changes are. Repeated states across shard rotation are not new
+cycles. Unit aliases are grouped by logger session, not assumed identical
+across reconnects/restarts. A short run may show no heating/cooling transition;
+that is different from showing no observations. Reported `opstat=off` does not
+imply that blower airflow or electrical consumption is zero. No electrical
+power measurements are recorded. The report never modifies source files, even
+when a shard needs recovery; use the logger or offline importer for recovery.
+
 ## What is recorded and displayed
 
 The first version **polls every 30 seconds**, not a push event subscription.
@@ -145,6 +175,23 @@ source observations; `intervals` holds derived marks and mutable import status;
 `meta` holds format/client/session information and the recovery checkpoint.
 Readers can open them read-only without a radio, account or running logger.
 Shard sequence numbers, not wall-clock names, establish recovery order.
+
+### Recorded data model (version 1)
+
+| Table | Fields and meaning |
+| --- | --- |
+| `samples` | `id` is shard-local; `observed_utc_ns` is host receive time; `elapsed_ns` is monotonic time since logger start; `unit` is a session-local alias; nullable `reported_utc_ns` is parsed Carrier source time; `quality` distinguishes observed from stale/disconnected/missing data; `values_json` retains native allowlisted fields. |
+| `intervals` | Shard-local `id`; `start_utc_ns` and `end_utc_ns`; descriptive `text`; `imported` is 0 until successful deduplicated mark import and 1 afterward. These are derived observed/unknown/transition spans, not a complete device event archive. |
+| `meta` | Key/value format and client versions, random logger `session` ID, shard creation UTC, and mutable crash-recovery `checkpoint` with the latest observations and unfinished interval state. |
+
+`values_json` allows `utcTime`, `isDisconnected`, `mode`, `cfgem`, `oat`,
+`odu.{type,opstat,iducfm}`, and `idu.{type,opstat,cfm,statpress,blwrpm}` when
+supplied. Numeric-looking source strings remain strings; the original source
+UTC string is retained as well as its parsed timestamp. `mode` is the selected
+thermostat mode, not proof that equipment is running. Status and measured
+blower/airflow values are kept independently, without inventing consistency or
+missing zeroes. There is no new `events` table: console/report events are views
+over canonical samples, while intervals feed the existing RF annotations.
 
 There is **no automatic deletion** of telemetry. At the cap, archive the whole
 telemetry directory and start a new one, or explicitly raise its budget. Unknown

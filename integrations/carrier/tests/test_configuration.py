@@ -26,7 +26,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("/output/", ignored)
 
     def test_task_wrappers_use_uv_locked_without_reading_credentials(self):
-        for name in ("record", "carrier/log", "carrier/import"):
+        for name in ("record", "carrier/log", "carrier/import", "carrier/report"):
             text = (ROOT / "mise/tasks" / name).read_text()
             self.assertIn("uv run --locked", text)
             self.assertNotIn("source ", text)

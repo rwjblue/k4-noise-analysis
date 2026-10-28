@@ -146,11 +146,15 @@ consent), versioned/capped auxiliary shards, unknown/stale/restart coverage,
 and deduplicated completed intervals through `import-marks`. Offline checks
 run in CI and `mise run ci`; see [carrier.md](carrier.md).
 
-Acceptance still open: authenticate against the operator's actual SmartHome
-account, verify supported systems and source timestamp cadence, compare
-reported indoor/outdoor states and output values with the app, and conduct an
+Completed live smoke validation: Carrier authentication, repeated read-only
+status polling, private auxiliary recording, detailed console output and the
+offline event report. No radio access, thermostat writes or RF dataset imports
+were part of the smoke test.
+
+Acceptance still open: verify source timestamp cadence across operating
+cycles, compare reported states/output changes with the app, and conduct an
 attended combined passive run. Do not claim historical backfill, exact switch
-timing, automatic attribution or unattended live validation from synthetic tests.
+timing, automatic attribution or unattended validation from a short smoke test.
 
 ## Cross-cutting tests
 

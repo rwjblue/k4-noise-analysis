@@ -18,7 +18,12 @@ from pathlib import Path
 from k4na_carrier.cli import Refused, parser, rf_command
 
 ROOT = Path(__file__).resolve().parents[3]
-TASKS = {"record": "record", "carrier/log": "log", "carrier/import": "import"}
+TASKS = {
+    "record": "record",
+    "carrier/log": "log",
+    "carrier/import": "import",
+    "carrier/report": "report",
+}
 PREFIX = "K4NA_USAGE_PROBE="
 
 
@@ -164,6 +169,7 @@ class MiseTaskTests(unittest.TestCase):
                 "1073741824",
             ],
         }
+        cases["carrier/report"] = ["--telemetry-dir", "a telemetry directory", "--limit", "10"]
         for task, args in cases.items():
             with self.subTest(task=task):
                 result, payload = self.invoke(task, *args)

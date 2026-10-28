@@ -16,6 +16,7 @@ from pathlib import Path
 from .api import CarrierClient
 from .display import Console
 from .recorder import Recorder
+from .report import write_report
 from .store import Journal, JournalError, StorageFull, child_env, iso
 
 
@@ -76,6 +77,9 @@ def parser() -> argparse.ArgumentParser:
     sub.add_argument("--telemetry-dir", type=Path, default=Path("output/carrier"))
     sub.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
     sub.add_argument("--min-free-bytes", type=int, default=1024 * 1024 * 1024)
+    sub = commands.add_parser("report", help="print saved HVAC events offline; read-only")
+    sub.add_argument("--telemetry-dir", type=Path, default=Path("output/carrier"))
+    sub.add_argument("--limit", type=int, default=25, help="recent rows per section (1..1000)")
     return p
 
 
@@ -363,6 +367,9 @@ async def supervise(
 
 
 async def run(args) -> int:
+    if args.command == "report":
+        write_report(args.telemetry_dir, args.limit)
+        return 0
     if args.command == "import":
         if not (args.data / "K4NA-DATA-ROOT").is_file():
             raise Refused("--data is not an existing k4na measurement root")

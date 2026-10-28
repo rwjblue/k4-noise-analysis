@@ -211,8 +211,9 @@ the measurement root. Derived completed intervals enter the existing marks
 importer; offline reports do not need Python, Carrier access or the helper.
 Neither a cloud outage nor a telemetry-storage failure changes radio state or
 silently stops RF recording. See [carrier.md](carrier.md) for startup refusal,
-coverage gaps, supervision and lockfile/environment contracts. Carrier account
-compatibility remains unverified live.
+coverage gaps, supervision and lockfile/environment contracts. Carrier-only
+account access, polling and offline reporting have passed a read-only smoke
+test; operating-cycle/output changes and combined RF acceptance remain open.
 
 See collection.md, storage.md, analysis.md, implementation-plan.md and
 ../config/example.toml for the executable contract.

@@ -84,11 +84,16 @@ both collectors with one command:
 mise run record --duration 8h
 ```
 
+For a Carrier-only check, use `mise run carrier:log --duration 2m`.
+The logger prints equipment observations and changes to the console;
+`mise run carrier:report` prints an offline event summary from saved telemetry.
+
 This defaults to passive RF capture and refuses startup without fresh HVAC
 readings unless you explicitly pass `--without-hvac`. Python and uv are
 mise-pinned; Python dependencies are locked with uv. See
 [Carrier setup, storage and coverage limits](docs/carrier.md). The helper
-has offline tests but has not yet been validated against a live Carrier account.
+has passed a short Carrier-only live check of polling, console output and offline
+reporting. Equipment transitions and combined RF operation remain unverified.
 
 To scan bands, follow the [survey setup](docs/collection.md). Reserve the
 main receiver, preview with `--dry-run`, and start with a short, attended
