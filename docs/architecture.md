@@ -191,6 +191,8 @@ site notes; keep IP/host only in local config/logs and redact secrets.
   visit, so transient retuning cannot masquerade as a signal.
 - **Raw 15 fps stream:** do not write every packet by default; aggregate
   incoming frames, retain sparse samples within a disk quota, and rotate shards.
+  An explicit, time- and byte-capped `--raw-full-rate` capture keeps every
+  frame for targeted investigations (see storage.md).
 - **Firmware changes:** keep provenance and replay tests from actual captures;
   refuse unknown formats instead of silently guessing.
 

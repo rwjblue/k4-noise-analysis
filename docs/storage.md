@@ -1,8 +1,11 @@
 # On-disk format and bounded retention
 
-Status: implemented (schema version 3) in crates/k4na-store; no migrations
-yet. Readers reject unsupported schema versions. Version 3 added
-`visits.measurement_json`; readers still open version 2 shards (the
+Status: implemented (schema version 4) in crates/k4na-store; no migrations
+yet. Readers reject unsupported schema versions. Version 4 changed only
+how raw frames are stored (the `shuffle2+zstd` codec and 16 KiB raw-shard
+pages, below); readers still decode version 2 and 3 `zstd` frames, and
+older binaries refuse version 4 shards at open rather than failing on an
+unknown codec per frame. Version 3 added `visits.measurement_json`; readers still open version 2 shards (the
 column reads as NULL). Version 2 moved antenna identity from the session
 to each visit, because one survey session can measure several antennas.
 Version 1 was pre-release and is not read.
@@ -103,9 +106,44 @@ original measurement.
 
 Raw: a sampled original complete :9201 packet BLOB with CRC, associated
 visit UUID, receiver, received UTC timestamp, monotonic delta, sampling
-policy and capture quality. Optional zstd compression; bytes MUST replay
-through the independent protocol decoder. There is no promise that the
-raw subset includes rare transients.
+policy and capture quality. Bytes MUST replay through the independent
+protocol decoder. There is no promise that the raw subset includes rare
+transients. Each row's `sampling_policy` names the rule that kept it:
+interval sampling (`first accepted frame then >= N ms apart per pan`) or
+a full-rate capture (`every accepted frame (full-rate capture ...)`).
+
+Raw codecs (`raw_frames.compression`):
+- `shuffle2+zstd` (written since schema 4): the packet's even bytes, then
+  its odd bytes, zstd-compressed. Bins are big-endian `i16` at an even
+  offset, so this separates each bin's slowly varying high byte from its
+  noisy low byte. Lossless for any length.
+- `zstd` (schemas 2-3): the packet zstd-compressed as is.
+- `none`: stored as is.
+
+Raw shards use 16 KiB SQLite pages. Spectra are noise-dominated and barely
+compress (about 2.3 KB of a 4,164-byte packet), so with the default 4 KiB
+pages each frame row occupied a page of its own. Measured on one real
+K4D survey hour (3,081 frames):
+
+| Raw shard layout | Size |
+| --- | --- |
+| schema 3: `zstd`, 4 KiB pages | 13.0 MB |
+| `shuffle2+zstd`, 4 KiB pages | 13.0 MB |
+| `shuffle2+zstd`, 16 KiB pages (schema 4) | 8.9 MB |
+| `shuffle2+zstd`, 32 or 64 KiB pages | 8.7-8.8 MB |
+
+Larger pages save almost nothing more and add a page per table and index
+to every shard's fixed size. Compressing several frames together saved
+only about 10% and was not adopted. Summary shards keep 4 KiB pages:
+their rows are larger and pack well (64 KiB pages made one 8.5 MB hour
+9.4 MB).
+
+The writer commits raw frames in batches (up to 64 frames or 5 s, and at
+close) because each SQLite commit appends whole pages, a table leaf and
+two index leaves, to the WAL; per-frame commits would write several
+times the data at full rate. A crash can lose the unflushed batch; raw
+frames are expendable. WAL auto-checkpoints at about 1 MiB whatever the
+page size.
 
 Event/gap: time, session/segment/tile ID, typed reason (TX, external
 retune, unknown center, malformed packet, state change, reconnect,
@@ -127,7 +165,8 @@ Initial defaults in ../config/example.toml:
 - 4 GiB hard cap over all data (including temporary files and WAL);
 - 5 GiB minimum remaining filesystem space, with active admission control;
 - 48 hours raw retention, up to 30 days summary retention;
-- at most one raw PAN frame/second/receiver while a tile is active;
+- at most one raw PAN frame/second/receiver while a tile is active,
+  except during an explicit full-rate capture (below);
 - preserve at least 24 hours of **summary** coverage as the target
   protected window, subject to physical disk feasibility and safety.
 - summarize all valid packets per dwell at native 2,048-bin resolution.
@@ -207,6 +246,36 @@ Screenshots lose exact bins and headers. Parquet is useful **export** later,
 but versioned SQLite + compressed i16 arrays provides transactional writes,
 indexing, robust recovery and simple Rust readers without a full analytics
 stack. Full-rate raw is expensive and unnecessary for an initial baseline;
-an explicit debug mode can temporarily capture every packet with a short
+an explicit capture keeps every accepted frame temporarily, with a
 duration and strict byte cap. User-visible coverage and gap accounting are
 more valuable than an enormous undifferentiated dump.
+
+The default sample keeps about 3% of frames: 5 of the ~151 accepted in a
+5 s dwell at 30 fps. Measured on the 2026-10-28 overnight survey, one
+hour took 8.1 MB of summaries and 13.0 MB of raw sample under schema 3,
+about 8.9 MB under schema 4 (about 2.9 KB per frame with its row and
+indexes). Keeping every frame would be about 93,000 frames, roughly 270 MB
+per survey hour or 6.5 GB per day: about 30 times the summaries, which already hold min/p10/p50/p90/max of every frame per bin.
+What full rate adds is time structure inside a dwell (bursts, impulse
+trains, pulse rates up to half the frame rate) and the freedom to
+re-summarize differently later. It does not make a survey continuous:
+each tile is still seen for one dwell per cycle.
+
+### Full-rate raw capture
+
+`k4na capture` and `k4na survey` accept `--raw-full-rate <DURATION>` and
+`--raw-full-rate-max-bytes <BYTES>` (default 1 GiB; units B, KB, MB, GB,
+KiB, MiB, GiB). From the first accepted frame the sampler keeps every
+accepted frame until the duration passes or the original packet bytes
+kept would exceed the cap, then falls back to
+`collection.raw_sample_interval_ms`. Packet bytes bound disk use, since
+frames are stored compressed. There is no config-file key: a full-rate
+capture is never a default.
+
+It is refused unless it lasts more than 0 and at most 24 hours, ends
+within `storage.raw_retention_hours`, keeps at most half of
+`storage.max_total_bytes`, and fits beside the protected summary window
+and an unprunable shard in the usable budget. A full-rate capture is
+still expendable raw data: storage pressure pauses it and prunes raw
+shards before summaries. The start and end (with the reason and bytes
+kept) are recorded as `raw_capture` events.

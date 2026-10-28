@@ -19,6 +19,8 @@ mise run ci                      # fmt, clippy, tests (no radio needed)
 cargo run -p k4na-cli -- check --config config/example.toml
 k4na estimate --config my.toml --duration 24h
 k4na capture  --config my.toml --duration 5m        # passive, no setters
+k4na capture  --config my.toml --duration 1h --raw-full-rate 30m --raw-full-rate-max-bytes 500MiB
+                                                    # also keep every frame for 30 min (docs/storage.md)
 k4na survey   --config my.toml --duration 1m --dry-run
 k4na survey   --config my.toml --duration 24h --allow-retune
 k4na survey   --config my.toml --profile config/surveys/hf-cw-us.toml --duration 24h --allow-retune
