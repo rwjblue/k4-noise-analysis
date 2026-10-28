@@ -3,7 +3,8 @@
 The first PR was design-only. Milestones 0-3 and most of 4 are now
 implemented and tested offline (fixtures, simulator, accelerated runs).
 Passive capture and band/antenna surveys have been validated on a K4D;
-**receiver measurement setters and journal recovery have not.** The
+receiver measurement setters and kill-and-recover have had one short
+live check on one RX input. The
 remaining live acceptance items stay open, and the assumptions listed in
 [collection.md](collection.md#unverified-on-hardware) must be checked
 before unattended use. Continue in small reviewable commits without
@@ -15,7 +16,7 @@ conflating an unverified observation with a hardware guarantee.
 | 1. Parser, passive capture | Done, including a live 5-minute K4D capture; byte-capped diagnostic dump not yet implemented |
 | 2. Storage, aggregation | Done, including accelerated 24 h under the minimum cap (`mise run long-run`) |
 | 3. Survey | Done; live K4D 80-10 m passes on one and three antennas (see collection.md); real 24 h dataset open |
-| 3a. Measurement profiles, recovery | Done in the simulator ([measurement.md](measurement.md), [recovery.md](recovery.md)): per band/antenna receiver settings, durable journal, `k4na recovery`; no setter or recovery restore sent to a K4 yet |
+| 3a. Measurement profiles, recovery | Done in the simulator ([measurement.md](measurement.md), [recovery.md](recovery.md)): per band/antenna receiver settings, durable journal, `k4na recovery`; one short live K4D check of setters and kill-and-recover on one RX input |
 | 4. Quality | `k4na inspect` health summary done; troubleshooting guide and golden whole-survey replay open |
 | 5. Analysis | Not started (separate PRs) |
 
@@ -99,8 +100,9 @@ the data root are removed.
 - Deterministic receiver measurement settings per band/antenna and a
   durable recovery journal: change only what can be put back, journal
   before sending, restore only the collector's own values, block new
-  surveys until an interrupted one is settled. Simulator only, including
-  a SIGKILLed survey restored by `k4na recovery`.
+  surveys until an interrupted one is settled. Simulator-tested,
+  including a SIGKILLed survey restored by `k4na recovery`; one short
+  live K4D check (survey plus `kill -9` and recovery) on one RX input.
 
 Acceptance: mock K4 exercises cross-band BN/FA, split/diversity conflict,
 human retune, TX activity, frozen PAN, rate change, wrong header, disconnect,

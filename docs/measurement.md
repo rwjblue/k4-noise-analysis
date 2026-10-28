@@ -1,7 +1,10 @@
 # Receiver measurement settings
 
-Status: implemented for surveys and tested against the simulator. **No
-measurement setter has been sent to a physical K4 yet.** Sources: the K4 Programmer's Reference rev. D4 (public HTML from
+Status: implemented for surveys and tested against the simulator. On
+2026-10-28 a K4D (R39, basic CAT mode) accepted and read back `PA0`,
+`PA1`, `GT004`, `GT002`, `#AVG04` and `#AVG02` from a live survey, with
+every setting put back; RF gain, attenuator, NB, NR and pan NB were
+already at their targets and were not sent. Sources: the K4 Programmer's Reference rev. D4 (public HTML from
 ftp.elecraft.com), GET-only `k4na probe` readbacks from a K4D on
 firmware R39, and the per-visit state recorded by earlier live runs. Any
 row marked *unverified* is an assumption the collector must check by
@@ -30,10 +33,10 @@ them.
 
 | Setting | CAT (advanced) | Basic readback (K4D R39) | Affects pan data | Controllable |
 | --- | --- | --- | --- | --- |
-| Preamp | `PAnm` n 0-3, m on | `PAn` (observed 1, 2) | yes, ahead of ADC | yes; basic sets `PAn` (*unverified*) |
+| Preamp | `PAnm` n 0-3, m on | `PAn` (observed 1, 2) | yes, ahead of ADC | yes; basic `PA0`/`PA1` verified on K4D |
 | Attenuator | `RAnnm` 0-21 dB step 3 | `RA00` (K3 on/off form) | yes, ahead of ADC | advanced: any; basic: off only |
 | RF gain | `RG-nn` 0-60 | `RG-00` | *unverified*; DSP scalar after the ADC | yes |
-| AGC | `GTn` 0 off 1 slow 2 fast | `GT002` fast, `GT004` slow | no (audio) | advanced: any; basic: slow/fast |
+| AGC | `GTn` 0 off 1 slow 2 fast | `GT002` fast, `GT004` slow | no (audio) | advanced: any; basic: slow/fast (`GT004`/`GT002` verified on K4D) |
 | Noise blanker | `NBnnm` | `NBm` | only with pan NB on auto | on/off, level kept |
 | Noise reduction | `NRnnm` | `NRnnm` (`010`) | no (audio) | on/off, level kept |
 | Auto/manual notch | `NAn`, `NMnnnnm` | same | no (audio) | recorded only |
@@ -55,6 +58,9 @@ the preamp differs per band (80/30 m `PA1`, 20 m `PA2`) and `#REF` moves
 with auto-ref. Whether the preamp, attenuator, RF gain, AGC and noise
 settings are stored per band, per band and RX input, or globally is not
 documented and is **unverified**; `#FXT`, `#NB` and `#AVG` may be global.
+On 2026-10-28 `BN` recalled 40 m's own `NR050` (30 m reads `NR010`), so
+the NR level is recalled per band; `#REF` drifts by a unit or two with
+auto-ref between readings.
 
 The collector therefore assumes no scope. It records each band's
 recalled state when it arrives, and each RX-input context's state when

@@ -4,9 +4,10 @@ Collector-first RF noise survey tooling for an Elecraft K4D, written in Rust.
 
 **Status: collector implemented.** The protocol decoder replays real R39
 captures. Passive capture and band/antenna survey passes have run on a
-K4D (R39). Receiver measurement settings and the crash-recovery journal
-are tested only against a simulated K4, as are storage limits (including
-an accelerated 24-hour run under a 64 MiB cap). See
+K4D (R39), as has a short check of receiver measurement settings and
+kill-and-recover through the journal. Conflict handling and storage
+limits (including an accelerated 24-hour run under a 64 MiB cap) are
+tested against a simulated K4. See
 [unverified hardware assumptions](docs/collection.md#unverified-on-hardware)
 before trusting unattended runs.
 

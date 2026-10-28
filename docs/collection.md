@@ -322,6 +322,11 @@ ANT2 with `AR` switching; about 500 visits) observed:
   stayed 2 throughout. Every band visited recalled `AR4`, so per-band RX
   input memory was neither shown nor ruled out.
 - A full 80-10 m pass took 289 s on one antenna and 861 s on three.
+- 2026-10-28, 40/20 m on RX ANT IN1 with a measurement profile (preamp
+  off on 40 m, AGC slow on 20 m, pan averaging 4): 23 visits in 2
+  minutes, every setting put back on each band change and at the end;
+  a GET-only probe afterwards matched the one before. A survey killed
+  mid-run was restored with `k4na recovery restore` (see recovery.md).
 - Median levels differed by antenna by 3-20 native units per band. These
   are uncalibrated readings that include each input's gain (a LoG has
   low output), so they do not rank antennas by signal-to-noise.

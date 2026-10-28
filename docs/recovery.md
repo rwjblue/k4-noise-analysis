@@ -2,7 +2,12 @@
 
 Status: implemented in `crates/k4na-collector/src/recovery/` and
 `k4na recovery`. Tested against the simulator, including a survey process
-killed with SIGKILL. **Not yet exercised on a physical K4.**
+killed with SIGKILL, and on a K4D (R39) on 2026-10-28: a survey killed
+with `kill -9` after 6 s left 40 m with `PA0`, `#AVG4`, `#FXT0` and a
+retuned `FA`; new surveys were refused; `restore --dry-run` sent nothing;
+`restore --allow-retune` put back all five fields and the original band
+and frequency (only auto-ref `#REF` differed by one unit); a second
+restore was refused as already resolved.
 
 A survey changes radio state: `BN`, `FA`, `#SPN`, `#FXT`, optionally `AR`,
 and the receiver measurement settings of the profile
@@ -121,7 +126,8 @@ journal.
 
 ## Not yet verified
 
-- Restoration against a physical K4: no measurement setter or recovery
-  restore has been sent to the operator's K4D.
+- Conflict handling on a physical K4 (an operator change during a
+  survey); it is simulator-tested only.
+- Per-input contexts on hardware: the live check used one RX input.
 - Whether the K4 stores receiver settings globally, per band, or per band
   and input. The scope order above is correct for each case.
