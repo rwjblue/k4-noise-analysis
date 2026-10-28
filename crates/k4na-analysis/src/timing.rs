@@ -27,6 +27,10 @@ pub struct Timeline {
     pub edges: Vec<i64>,
     /// Estimated onsets only.
     pub onsets: Vec<i64>,
+    /// Intervals within the span with no usable observation (a recording
+    /// pause, or a carrier masked by a raised floor), sorted and
+    /// disjoint. Neither on nor off: agreement ignores them.
+    pub unobserved: Vec<(i64, i64)>,
 }
 
 /// An episode with its bounds: `(start_after, start, end, end_before)`.
@@ -58,31 +62,42 @@ impl Timeline {
         t
     }
 
-    /// From `(start, end, on)` observations in time order: runs of `on`
-    /// are episodes, bridging up to `timing_max_missed` consecutive off
-    /// observations (a detector flickering near its threshold); a pause
-    /// over `episode_gap_revisits` revisits leaves the bounds on either
-    /// side unobserved.
-    pub fn from_observations(obs: &[(i64, i64, bool)], p: &Params) -> Self {
+    /// From `(start, end, state)` observations in time order, where
+    /// `state` is `Some(on)` or `None` when the observation could not
+    /// tell (a carrier masked by a raised floor). Runs of `on` are
+    /// episodes, bridging up to `timing_max_missed` consecutive off
+    /// observations (a detector flickering near its threshold). An
+    /// unobserved run, or a pause over `episode_gap_revisits` revisits,
+    /// is recorded in [`Timeline::unobserved`] and leaves the episode
+    /// bounds on either side unobserved, so it creates no edges.
+    pub fn from_observations(obs: &[(i64, i64, Option<bool>)], p: &Params) -> Self {
         let Some((&(first, _, _), &(_, last, _))) = obs.first().zip(obs.last()) else {
             return Self::default();
         };
         let mut steps: Vec<i64> = obs.windows(2).map(|w| w[1].0 - w[0].0).collect();
         steps.sort_unstable();
         let revisit = steps.get(steps.len().saturating_sub(1) / 2).copied().unwrap_or(0) as f64;
-        let gap = |i: usize| i > 0 && (obs[i].0 - obs[i - 1].1) as f64 > p.episode_gap_revisits * revisit;
         let mut eps: Vec<Bounded> = Vec::new();
+        let mut unobserved: Vec<(i64, i64)> = Vec::new();
         let mut open: Option<Bounded> = None;
         // Start of the first off observation after the last on one, and
         // how many off observations have followed it.
         let (mut pending, mut misses) = (None::<i64>, 0u64);
-        for (i, &(s, e, on)) in obs.iter().enumerate() {
-            if gap(i)
-                && let Some(mut x) = open.take()
-            {
-                x.3 = pending;
-                eps.push(x);
+        // End of the last usable observation, and the start of the
+        // unobserved stretch since it, if any.
+        let (mut last_end, mut blind_from) = (None::<i64>, None::<i64>);
+        for &(s, e, state) in obs {
+            let paused = last_end.is_some_and(|le| (s - le) as f64 > p.episode_gap_revisits * revisit);
+            if state.is_none() || paused {
+                if let Some(mut x) = open.take() {
+                    x.3 = pending;
+                    eps.push(x);
+                }
+                (pending, misses) = (None, 0);
+                blind_from.get_or_insert(last_end.unwrap_or(s));
             }
+            let Some(on) = state else { continue };
+            let blind = blind_from.take().map(|b| unobserved.push((b, s))).is_some();
             match (&mut open, on) {
                 (Some(x), true) => x.2 = e,
                 (Some(_), false) => {
@@ -95,25 +110,65 @@ impl Timeline {
                         eps.push(x);
                     }
                 }
-                (None, true) => open = Some(((i > 0 && !gap(i)).then(|| obs[i - 1].1), s, e, None)),
+                (None, true) => open = Some((last_end.filter(|_| !blind), s, e, None)),
                 (None, false) => {}
             }
             if on || open.is_none() {
                 (pending, misses) = (None, 0);
             }
+            last_end = Some(e);
         }
         if let Some(mut x) = open {
             x.3 = pending;
             eps.push(x);
         }
-        Self::from_bounded(first, last, revisit, eps)
+        if let Some(b) = blind_from {
+            unobserved.push((b, last));
+        }
+        let mut t = Self::from_bounded(first, last, revisit, eps);
+        t.unobserved = unobserved.into_iter().filter(|(s, e)| e > s).collect();
+        t
     }
 
-    /// Fraction of the observed span estimated on.
+    /// Fraction of the observed (not unobserved) span estimated on.
     pub fn on_fraction(&self) -> f64 {
-        let span = (self.last_utc_ns - self.first_utc_ns).max(1) as f64;
+        let span = (self.last_utc_ns - self.first_utc_ns - total(&self.unobserved)).max(1) as f64;
         self.on.iter().map(|(s, e)| (e - s) as f64).sum::<f64>() / span
     }
+}
+
+/// Sorted, merged union of interval sets.
+fn union(sets: &[&[(i64, i64)]]) -> Vec<(i64, i64)> {
+    let mut all: Vec<(i64, i64)> = sets.iter().flat_map(|s| s.iter().copied()).collect();
+    all.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(all.len());
+    for (s, e) in all {
+        match out.last_mut() {
+            Some(l) if s <= l.1 => l.1 = l.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// `on` (sorted, disjoint) with the sorted, disjoint `holes` removed.
+fn subtract(on: &[(i64, i64)], holes: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for &(mut s, e) in on {
+        for &(hs, he) in holes {
+            if he <= s || hs >= e {
+                continue;
+            }
+            if hs > s {
+                out.push((s, hs));
+            }
+            s = s.max(he);
+        }
+        if e > s {
+            out.push((s, e));
+        }
+    }
+    out
 }
 
 /// Total length of `on` within `[lo, hi)`, and of the intersection of
@@ -141,7 +196,8 @@ fn intersection(a: &[(i64, i64)], b: &[(i64, i64)]) -> i64 {
     t
 }
 
-/// How two timelines agree over the span both observed.
+/// How two timelines agree over the time both observed: their common
+/// span minus either one's unobserved intervals.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Agreement {
     /// Phi coefficient of the two on/off signals (1 = identical, 0 =
@@ -172,11 +228,13 @@ pub fn agreement(a: &Timeline, b: &Timeline) -> Agreement {
             j += 1;
         }
     }
-    let span = hi - lo;
-    let phi = (span > 0)
+    let blind = clipped(&union(&[&a.unobserved, &b.unobserved]), lo, hi);
+    let seen = hi - lo - total(&blind);
+    let phi = (seen > 0)
         .then(|| {
-            let (ca, cb) = (clipped(&a.on, lo, hi), clipped(&b.on, lo, hi));
-            let t = span as f64;
+            let ca = subtract(&clipped(&union(&[&a.on]), lo, hi), &blind);
+            let cb = subtract(&clipped(&union(&[&b.on]), lo, hi), &blind);
+            let t = seen as f64;
             let (pa, pb) = (total(&ca) as f64 / t, total(&cb) as f64 / t);
             let p11 = intersection(&ca, &cb) as f64 / t;
             let d = (pa * (1.0 - pa) * pb * (1.0 - pb)).sqrt();
@@ -312,11 +370,11 @@ mod tests {
     const MIN: i64 = 60_000_000_000;
 
     /// Observations every `step` minutes for `n` steps, on when `on(t)`.
-    fn obs(n: i64, step: i64, offset: i64, on: impl Fn(i64) -> bool) -> Vec<(i64, i64, bool)> {
+    fn obs(n: i64, step: i64, offset: i64, on: impl Fn(i64) -> bool) -> Vec<(i64, i64, Option<bool>)> {
         (0..n)
             .map(|i| {
                 let t = offset + i * step * MIN;
-                (t, t + 5_000_000_000, on(t))
+                (t, t + 5_000_000_000, Some(on(t)))
             })
             .collect()
     }
@@ -358,6 +416,39 @@ mod tests {
         assert_eq!(t.edges.len(), 3, "onset, end, onset");
         let (last_on_end, first_miss) = (24 * MIN + 5_000_000_000, 28 * MIN);
         assert_eq!(t.on[0].1, last_on_end + (first_miss - last_on_end) / 2);
+    }
+
+    #[test]
+    fn masked_observations_are_neither_on_nor_off() {
+        let p = Params::default();
+        let floor = Timeline::from_observations(&obs(120, 4, 0, cycling), &p);
+        // A steady carrier hidden whenever the floor is raised.
+        let masked: Vec<_> = obs(120, 4, 20_000_000_000, |_| true)
+            .into_iter()
+            .map(|(s, e, on)| (s, e, if cycling(s) { None } else { on }))
+            .collect();
+        let t = Timeline::from_observations(&masked, &p);
+        assert!(t.edges.is_empty(), "masking creates no transitions: {:?}", t.edges);
+        assert!(!t.unobserved.is_empty());
+        assert!((t.on_fraction() - 1.0).abs() < 0.05, "{}", t.on_fraction());
+        let ag = agreement(&floor, &t);
+        assert_eq!(ag.matched_edges, 0);
+        assert!(ag.phi.is_none_or(|phi| phi.abs() < 0.2), "{ag:?}");
+        // Counting the masked visits as off makes it look like the floor's
+        // inverse, which is the artifact this avoids.
+        let naive: Vec<_> = masked
+            .iter()
+            .map(|&(s, e, on)| (s, e, Some(on.unwrap_or(false))))
+            .collect();
+        let naive = Timeline::from_observations(&naive, &p);
+        assert!(naive.edges.len() >= 20);
+        assert!(agreement(&floor, &naive).phi.unwrap() < -0.7);
+        // A recording pause is unobserved too, and bounds no edge.
+        let mut paused = obs(10, 4, 0, |t| t >= 24 * MIN);
+        paused.drain(3..6);
+        let t = Timeline::from_observations(&paused, &p);
+        assert_eq!(t.unobserved, [(8 * MIN + 5_000_000_000, 24 * MIN)]);
+        assert!(t.edges.is_empty(), "{:?}", t.edges);
     }
 
     #[test]

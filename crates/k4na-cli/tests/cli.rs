@@ -301,7 +301,7 @@ fn end_to_end_against_tcp_simulator() {
     let bands: serde_json::Value = serde_json::from_slice(&out).unwrap();
     let prov = &bands["provenance"];
     assert!(prov["visits_analyzed"].as_u64().unwrap() >= 1, "{prov}");
-    assert_eq!(prov["algorithm"], "k4na-analysis/2");
+    assert_eq!(prov["algorithm"], "k4na-analysis/3");
     assert!(prov["level_units"].as_str().unwrap().contains("not dBm"));
     assert!(!bands["band_hours"].as_array().unwrap().is_empty(), "{bands}");
     k4na()

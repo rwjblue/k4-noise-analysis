@@ -220,7 +220,15 @@ fn finds_floors_by_hour_and_classifies_carriers() {
     assert_eq!(steady.hour_detections[..6], [12; 6]);
     let sometimes = &a.carriers[1];
     assert!((sometimes.hz - SOMETIMES_HZ).abs() < 47.0);
-    assert_eq!((sometimes.detections, sometimes.exposure), (n / 4, n));
+    // At its usual level (-118 dB) it would stand only 7 dB over hour 3's
+    // -125 dB floor, under the 8 dB threshold: hour 3's nine visits
+    // without it are masked, not absences.
+    assert_eq!(
+        (sometimes.detections, sometimes.exposure, sometimes.masked),
+        (n / 4, n - 9, 9)
+    );
+    assert!((sometimes.median_level_db - -118.0).abs() <= 0.5);
+    assert_eq!(steady.masked, 0, "20 dB over the floor stays visible");
     assert_eq!(sometimes.class, "recurring");
     assert_eq!(sometimes.steady_fraction, 0.0);
 

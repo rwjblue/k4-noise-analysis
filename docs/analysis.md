@@ -49,9 +49,12 @@ what the initial data must enable, NOT algorithms required in the v1 writer.
   signal level above background, not raw background reduction alone.
   Never subtract spectra as if both bins were independent calibrated dBm.
 
-## Implemented: `k4na-analysis/2`
+## Implemented: `k4na-analysis/3`
 
-Version 2 splits comparability segments by delivered frame rate:
+Version 3 stops counting a masked carrier as absent: a covering visit
+where a raised local background would have hidden the carrier is
+unobserved, so it leaves exposure, persistence and timing edges alone
+(see `analyze carriers` and `analyze groups`). Version 2 splits comparability segments by delivered frame rate:
 analysis segment ids are `<stored segment>@<n>fps` (shown as
 `01234567@30fps`), so shards written before the writer keyed segments by
 frame rate never compare 15/s and 30/s visits as one segment. See
@@ -94,9 +97,15 @@ Across visits:
 - `analyze carriers` clusters peaks at most 300 Hz wide whose
   frequencies chain within 100 Hz (or 1.5 bins) on one band and
   antenna, keeping clusters seen in at least 3 visits. Exposure counts
-  visits whose coverage included the cluster's median frequency, so
-  persistence = detections / exposure and "not seen" is distinguished
-  from "not covered". Hourly detection and exposure histograms are in
+  visits whose coverage included the cluster's median frequency and
+  where it could have been seen, so persistence = detections / exposure
+  and "not seen" is distinguished from "not covered" and "masked". A
+  carrier's level is the median over its detections of background plus
+  excess; a covering visit without a detection is `masked` when that
+  level stands less than 8 dB (the threshold) plus a 2 dB margin over
+  the visit's local background at the carrier, i.e. when a floor rise
+  would have hidden it. Masked visits are reported but excluded from
+  exposure. Hourly detection and exposure histograms are in
   JSON. The class is temporal only: `stationary` (seen in >= 90% of at
   least 6 covering visits, frequency spread within two tolerances),
   `recurring` (>= 25%), `occasional`, or `insufficient_exposure`.
@@ -138,7 +147,10 @@ Across visits:
   carrier near threshold does not flicker into many episodes). Each
   timeline's on intervals are its episodes extended halfway to the
   bounding quiet observations; its edges are the observed onsets and
-  ends. Two features join when, over the span both observed, the phi
+  ends. A carrier's masked visits, and any pause over three revisit
+  intervals, are unobserved: they end an episode without an edge and
+  are left out of agreement. Two features join when, over the time both
+  observed (common span minus either's unobserved intervals), the phi
   coefficient of their on/off signals is at least 0.7 (chance-corrected,
   unlike overlap: two sources each on 80% of the time overlap mostly by
   chance) and at least 3 edges match one-to-one within the mean of their
@@ -151,11 +163,14 @@ Across visits:
   A group is a hypothesis that one switched source or one propagation
   change drives its members, not an identification.
 
-  Caveat: a raised floor masks carriers, so a carrier can appear to
-  switch off exactly when wideband noise switches on. That correlation
-  is negative and does not join a group, but it adds spurious edges to
-  the carrier's timeline and onsets to groups anchored on carriers.
-  Data gaps count as off for both features.
+  Before version 3 a masked carrier counted as off, so a steady carrier
+  appeared to switch off exactly when wideband noise switched on. That
+  added spurious edges, and carriers masked by the same source grouped
+  with each other on the floor's ends. Masking is judged from the
+  carrier's median level, so a carrier much weaker during the masked
+  time than usual is still assumed present-but-hidden, not absent.
+  Floor timelines still treat a recording pause shorter than three
+  revisits as quiet.
 
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
@@ -197,11 +212,15 @@ compressor is one candidate) fits, unconfirmed. Separately, a 40 m
 9.995 kHz-spaced family was present ~03:30-08:55 UTC with sharp edges.
 `analyze groups` joins the four floors, both combs and three 30 m
 carriers 15.96 kHz apart into one group (anchored on the 40 m floor:
-onsets 05:35, 05:54, 06:12, 06:27, 06:53). It places the 40 m comb with
-three 30 m carriers in a second group; its lines lie near multiples of
-20 kHz (7000.05 ... 7280.08 and 10100.11-10140.09 kHz), so the 9.995 kHz
-fit is a sub-multiple. That comb also drops out while the cycling source
-raises the floor (masking, above).
+onsets 05:35, 05:54, 06:12, 06:27, 06:53); version 3 adds two more
+31.93 kHz comb lines (33 members). The 40 m 9.995 kHz comb's lines lie
+near multiples of 20 kHz (7000.05 ... 7280.08 and 10100.11-10140.09
+kHz), so the 9.995 kHz fit is a sub-multiple. That comb is masked while
+the cycling source raises the floor. Version 2 put it with three 30 m
+carriers in an 18-member second group whose "onsets" were the cycling
+floor's ends; version 3 dissolves that group into a 3-member one (30 m
+10100.11 and 10120.08 kHz, 40 m 7180.05 kHz) with irregular onsets,
+03:30-08:26 UTC, unrelated to the cycle.
 
 Caveats specific to v1: thresholds are the exploratory defaults above
 and are not yet exposed as options; a chain of nearby CW or FT8

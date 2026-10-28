@@ -185,8 +185,8 @@ function tables() {
     A.families.map((f) => [f.band_id, f.antenna_id, (f.spacing_hz / 1e3).toFixed(3), f.members.length, f.grid_positions, (f.fill * 100).toFixed(0) + "%",
       `${mhz(f.first_hz)}–${mhz(f.last_hz)}`, f.residual_rms_hz.toFixed(0), f.false_alarm.toExponential(1)]));
   const cs = [...A.carriers].sort((a, b) => b.persistence - a.persistence || b.median_excess_db - a.median_excess_db);
-  table("carriers", [["band", 1], ["antenna", 1], ["kHz"], ["class", 1], ["seen/covered"], ["persistence"], ["steady"], ["excess dB"], ["width Hz"], ["first", 1], ["last", 1]],
-    cs.map((c) => [c.band_id, c.antenna_id, (c.hz / 1e3).toFixed(3), c.class, `${c.detections}/${c.exposure}`, (c.persistence * 100).toFixed(0) + "%",
+  table("carriers", [["band", 1], ["antenna", 1], ["kHz"], ["class", 1], ["seen/covered"], ["masked"], ["persistence"], ["steady"], ["excess dB"], ["width Hz"], ["first", 1], ["last", 1]],
+    cs.map((c) => [c.band_id, c.antenna_id, (c.hz / 1e3).toFixed(3), c.class, `${c.detections}/${c.exposure}`, c.masked, (c.persistence * 100).toFixed(0) + "%",
       (c.steady_fraction * 100).toFixed(0) + "%", c.median_excess_db.toFixed(1), c.median_width_hz.toFixed(0), fmtTime(c.first_utc_ns), fmtTime(c.last_utc_ns)]));
   table("hours", [["band", 1], ["antenna", 1], ["segment", 1], ["hour", 1], ["visits"], ["floor dB"], ["p10"], ["p90"], ["occupancy"], ["variability dB"], ["settings", 1]],
     A.band_hours.map((r) => [r.band_id, r.antenna_id, shortSeg(r.segment_id), fmtTime(r.hour_start_utc_ns), r.visits, r.floor_db.toFixed(1),

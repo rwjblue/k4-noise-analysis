@@ -30,7 +30,7 @@ pub use timing::{Feature, TimingGroup};
 
 /// Bumped whenever an algorithm or default changes its output.
 /// 2: comparability segments are split by delivered frame rate.
-pub const ALGORITHM_VERSION: &str = "k4na-analysis/2";
+pub const ALGORITHM_VERSION: &str = "k4na-analysis/3";
 
 /// The comparability segment analysis uses for a visit: the stored
 /// segment plus the delivered frame rate, as `<segment_id>@<n>fps` (or
@@ -103,6 +103,11 @@ pub struct Params {
     pub timing_min_matched_edges: u64,
     /// Carrier timelines bridge this many consecutive missed detections.
     pub timing_max_missed: u64,
+    /// A covering visit without a detection counts as "carrier absent"
+    /// only if the carrier, at its median detected level, would have
+    /// cleared `peak_threshold` by this much over that visit's local
+    /// background (native tenths); otherwise it was masked.
+    pub carrier_mask_margin: i16,
 }
 
 impl Default for Params {
@@ -130,6 +135,7 @@ impl Default for Params {
             timing_min_phi: 0.7,
             timing_min_matched_edges: 3,
             timing_max_missed: 1,
+            carrier_mask_margin: 20,
         }
     }
 }
@@ -276,7 +282,7 @@ pub fn run(
         };
         let (m, bg) = analyze_visit(&s, params);
         hours.add(&s, &m);
-        carriers.add(&s, &m.peaks, params);
+        carriers.add(&s, &m.peaks, &bg, params);
         floors.add(&s, &m);
         observe(&s, &m, &bg);
         analyzed += 1;
@@ -482,12 +488,12 @@ pub fn timing_groups_csv(rows: &[TimingGroup]) -> String {
 /// Carrier rows as CSV, one header line.
 pub fn carriers_csv(rows: &[Carrier]) -> String {
     let mut s = String::from(
-        "band_id,antenna_id,hz,min_hz,max_hz,class,detections,exposure,persistence,steady_fraction,median_excess_db,max_excess_db,median_width_hz,segments,first_utc,last_utc\n",
+        "band_id,antenna_id,hz,min_hz,max_hz,class,detections,exposure,masked,persistence,steady_fraction,median_level_db,median_excess_db,max_excess_db,median_width_hz,segments,first_utc,last_utc\n",
     );
     for c in rows {
         let _ = writeln!(
             s,
-            "{},{},{:.0},{:.0},{:.0},{},{},{},{:.3},{:.3},{:.1},{:.1},{:.0},{},{},{}",
+            "{},{},{:.0},{:.0},{:.0},{},{},{},{},{:.3},{:.3},{:.1},{:.1},{:.1},{:.0},{},{},{}",
             csv_field(&c.band_id),
             csv_field(&c.antenna_id),
             c.hz,
@@ -496,8 +502,10 @@ pub fn carriers_csv(rows: &[Carrier]) -> String {
             c.class,
             c.detections,
             c.exposure,
+            c.masked,
             c.persistence,
             c.steady_fraction,
+            c.median_level_db,
             c.median_excess_db,
             c.max_excess_db,
             c.median_width_hz,

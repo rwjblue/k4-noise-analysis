@@ -442,16 +442,17 @@ fn carriers_text(a: &Analysis, limit: usize) -> String {
             .then(y.median_excess_db.total_cmp(&x.median_excess_db))
     });
     s += &format!("{} carrier(s); strongest persistence first\n", rows.len());
-    s += "band  antenna     freq (kHz)    class                  seen/covered  pers%  steady%  excess  width\n";
+    s += "band  antenna     freq (kHz)    class                  seen/covered  masked  pers%  steady%  excess  width\n";
     for c in rows.iter().take(limit) {
         s += &format!(
-            "{:<5} {:<11} {:>12.3}  {:<21}  {:>5}/{:<6}  {:>5.1}  {:>6.1}  {:>5.1}  {:>4.0}\n",
+            "{:<5} {:<11} {:>12.3}  {:<21}  {:>5}/{:<6}  {:>6}  {:>5.1}  {:>6.1}  {:>5.1}  {:>4.0}\n",
             c.band_id,
             c.antenna_id,
             c.hz / 1000.0,
             c.class,
             c.detections,
             c.exposure,
+            c.masked,
             c.persistence * 100.0,
             c.steady_fraction * 100.0,
             c.median_excess_db,
@@ -465,6 +466,7 @@ fn carriers_text(a: &Analysis, limit: usize) -> String {
         );
     }
     s += "\nclass describes timing only; a stationary carrier is a candidate birdie, NOT a confirmed\nlocal source (broadcast, beacons and other stations can be stationary too).\n";
+    s += "covered excludes masked visits: the background had risen too far to tell whether it was there\n";
     s += &format!("excess = median dB above local background; levels: {LEVEL_UNITS}\n");
     s
 }
