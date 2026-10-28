@@ -74,6 +74,12 @@ pub enum AnalyzeCmd {
         #[command(flatten)]
         select: Select,
     },
+    /// Intervals when a band's noise floor rose over its quiet baseline,
+    /// with duty cycle and repetition per band.
+    Episodes {
+        #[command(flatten)]
+        select: Select,
+    },
 }
 
 fn parse_time(s: &str) -> Result<i64> {
@@ -150,6 +156,20 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
                 Format::Json => json_of(&a.provenance, "families", serde_json::to_value(&a.families)?)?,
                 Format::Csv => families_csv(&a.families),
                 Format::Text => families_text(&a),
+            };
+            select.emit(&out)?;
+        }
+        AnalyzeCmd::Episodes { select } => {
+            let a = select.analyze()?;
+            let out = match format(&select) {
+                Format::Json => {
+                    let mut v = serde_json::json!({ "provenance": a.provenance });
+                    v["floor_activity"] = serde_json::to_value(&a.floor_activity)?;
+                    v["floor_episodes"] = serde_json::to_value(&a.floor_episodes)?;
+                    serde_json::to_string_pretty(&v)? + "\n"
+                }
+                Format::Csv => k4na_analysis::floor_episodes_csv(&a.floor_episodes),
+                Format::Text => episodes_text(&a),
             };
             select.emit(&out)?;
         }
@@ -249,6 +269,63 @@ fn bands_text(a: &Analysis) -> String {
     s += &format!(
         "\nfloor = median local background; occ = bins >= 8 dB above it; var = median p90-p10.\nlevels: {LEVEL_UNITS}\n"
     );
+    s
+}
+
+fn minutes(s: Option<f64>) -> String {
+    s.map_or_else(|| "-".into(), |s| format!("{:.1}", s / 60.0))
+}
+
+/// `HH:MM:SS` of a UTC time.
+fn hms(ns: i64) -> String {
+    utc(ns)[11..19].to_owned()
+}
+
+fn episodes_text(a: &Analysis) -> String {
+    let mut s = header(a);
+    s += "floor activity (medians; minutes)\n";
+    s +=
+        "band  antenna     segment         tiles visits revisit noise  thresh episodes elevated%  on    off   period\n";
+    for r in &a.floor_activity {
+        s += &format!(
+            "{:<5} {:<11} {:<15} {:>5} {:>6} {:>7} {:>5.2} {:>6.1} {:>8} {:>9.1}  {:<5} {:<5} {}\n",
+            r.band_id,
+            r.antenna_id,
+            short(&r.segment_id),
+            r.tiles,
+            r.visits,
+            minutes(Some(r.revisit_s)),
+            r.noise_db,
+            r.threshold_db,
+            r.episodes,
+            r.elevated_fraction * 100.0,
+            minutes(r.median_duration_s),
+            minutes(r.median_gap_s),
+            minutes(r.median_period_s),
+        );
+    }
+    s += &format!("\n{} episode(s), in time order (UTC)\n", a.floor_episodes.len());
+    s += "band  antenna     segment         after     start     end       before    visits tiles  rise   max\n";
+    for e in &a.floor_episodes {
+        let opt = |t: Option<i64>| t.map_or_else(|| "?".into(), hms);
+        s += &format!(
+            "{:<5} {:<11} {:<15} {:<9} {:<9} {:<9} {:<9} {:>6} {:>2}/{:<2} {:>5.1} {:>5.1}\n",
+            e.band_id,
+            e.antenna_id,
+            short(&e.segment_id),
+            opt(e.start_after_utc_ns),
+            hms(e.start_utc_ns),
+            hms(e.end_utc_ns),
+            opt(e.end_before_utc_ns),
+            e.visits,
+            e.tiles,
+            e.tiles_analyzed,
+            e.median_rise_db,
+            e.max_rise_db,
+        );
+    }
+    s += "\nAn episode is a floor raised over that tile's quiet baseline: the onset lies between `after` and `start`,\nthe end between `end` and `before` (? = edge of the data or a gap). It does not say why the floor rose.\n";
+    s += &format!("rise = median dB over baseline; levels: {LEVEL_UNITS}\n");
     s
 }
 

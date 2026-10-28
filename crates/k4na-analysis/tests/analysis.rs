@@ -224,6 +224,25 @@ fn finds_floors_by_hour_and_classifies_carriers() {
     assert_eq!(sometimes.class, "recurring");
     assert_eq!(sometimes.steady_fraction, 0.0);
 
+    // Hour 3's +5 dB is one floor episode bounded by the quiet visits on
+    // either side; the 5-minute cadence is the revisit interval.
+    assert_eq!(a.floor_activity.len(), 1);
+    let act = &a.floor_activity[0];
+    assert_eq!((act.tiles, act.visits, act.episodes), (1, n, 1));
+    assert_eq!(act.revisit_s, 300.0);
+    assert!((act.elevated_fraction - 12.0 / n as f64).abs() < 1e-9);
+    assert_eq!(a.floor_episodes.len(), 1, "{:#?}", a.floor_episodes);
+    let e = &a.floor_episodes[0];
+    let visit_at = |i: i64| T0 + i * 300 * NS_PER_SEC + NS_PER_SEC;
+    assert_eq!(e.start_utc_ns, visit_at(36));
+    assert_eq!(e.start_after_utc_ns, Some(visit_at(35) + 6 * NS_PER_SEC));
+    assert_eq!(e.end_utc_ns, visit_at(47) + 6 * NS_PER_SEC);
+    assert_eq!(e.end_before_utc_ns, Some(visit_at(48)));
+    assert_eq!((e.visits, e.tiles, e.tiles_analyzed), (12, 1, 1));
+    assert!((e.median_rise_db - 5.0).abs() <= 1.0, "{}", e.median_rise_db);
+    assert_eq!(k4na_analysis::floor_episodes_csv(&a.floor_episodes).lines().count(), 2);
+    assert_eq!(k4na_analysis::floor_activity_csv(&a.floor_activity).lines().count(), 2);
+
     // Exports carry one header plus a row per result.
     assert_eq!(band_hours_csv(&a.band_hours).lines().count(), 7);
     let csv = carriers_csv(&a.carriers);

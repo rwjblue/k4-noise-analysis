@@ -112,6 +112,26 @@ Across visits:
   0.01. Each carrier joins at most one family. A family is a pattern
   (harmonics of one switching or clock source are a common cause), not
   a source identification.
+- `analyze episodes` finds intervals when a band's floor rose over its
+  quiet baseline. Each tile within a band, antenna and segment is one
+  series of per-visit floors (tiles of one band can rise by different
+  amounts). Its baseline is the 20th percentile of its floors, so a
+  source on up to ~80% of the time leaves the quiet state visible. Its
+  noise is `1.4826 * median|successive difference| / sqrt(2)`, which a
+  source switching on and off barely moves (an interquartile spread
+  would absorb the steps). A tile turns on at `max(3 dB, 5 * noise)`
+  over baseline and off below half that; a pause longer than three
+  revisit intervals ends an episode with an unobserved end. Tiles need
+  8 visits. Tile episodes within one revisit interval of each other
+  merge into a band episode, which reports the first and last elevated
+  visit and the quiet visits bounding them (the onset lies between
+  `start_after` and `start`), elevated visits, tiles involved, and the
+  median and maximum rise. Per band, `floor_activity` gives the median
+  revisit, noise and threshold, the elevated fraction of visits, and
+  median on time, off time between episodes, and onset-to-onset period.
+  Timing resolution is the revisit interval; an episode says the floor
+  rose, not why (a switched device, propagation and a nearby wideband
+  signal all qualify).
 
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
@@ -138,6 +158,18 @@ First observation (2026-10-27 data, 10 m, RX ANT IN1 at `PRE1`): 34
 carriers on 34 consecutive grid lines spaced 35.087 kHz, 28.526-29.684
 MHz, RMS 13 Hz from the grid, seen in every covering visit (only five
 visits each). The source is unknown.
+
+First night (2026-10-28 03:01-09:59 UTC, RX ANT IN1, 113 passes, 3.7 min
+revisit): `analyze episodes` finds the same five episodes on 40, 30 and
+20 m and four on 17 m (its first rise was 2.5 dB), 05:37-06:59 UTC,
+each band's onsets within 40 s of the others: on ~8 min, off ~11 min,
+period 18.5 min. Rises: 30 m ~19 dB, 40 m ~10 dB, 20 m ~6-8 dB, 17 m
+~5 dB; none on 80, 15, 12 or 10 m. Over the same passes a comb near
+15.97 kHz harmonics appears (the 20 m 31.93 kHz and 40 m 15.96 kHz
+families; a 40 m line at 7.0098 MHz is harmonic 439, a 20 m line at
+14.0196 MHz harmonic 878). A cycling switched load (an inverter
+compressor is one candidate) fits, unconfirmed. Separately, a 40 m
+9.995 kHz-spaced family was present ~03:30-08:55 UTC with sharp edges.
 
 Caveats specific to v1: thresholds are the exploratory defaults above
 and are not yet exposed as options; a chain of nearby CW or FT8

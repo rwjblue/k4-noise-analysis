@@ -8,6 +8,7 @@
 pub mod background;
 pub mod bands;
 pub mod carriers;
+pub mod episodes;
 pub mod families;
 pub mod spectrum;
 
@@ -21,6 +22,7 @@ use serde::Serialize;
 pub use background::{Peak, VisitMetrics, analyze_visit, local_background};
 pub use bands::BandHour;
 pub use carriers::Carrier;
+pub use episodes::{FloorActivity, FloorEpisode};
 pub use families::{Family, find_families};
 pub use spectrum::VisitSpectrum;
 
@@ -80,6 +82,18 @@ pub struct Params {
     /// Largest accepted expected count of chance families (see
     /// `Family::false_alarm`).
     pub family_max_false_alarm: f64,
+    /// Floor episodes: a tile's quiet baseline is this quantile of its
+    /// floors; it turns on at `max(min_rise, noise_multiple * noise)`
+    /// over it and off below half that. Tiles with fewer visits are not
+    /// analyzed; a pause over `gap_revisits` revisit intervals ends an
+    /// episode unobserved; tile episodes within `merge_revisits` revisit
+    /// intervals of each other form one band episode.
+    pub episode_baseline_quantile: f64,
+    pub episode_noise_multiple: f64,
+    pub episode_min_rise: i16,
+    pub episode_min_tile_visits: u64,
+    pub episode_gap_revisits: f64,
+    pub episode_merge_revisits: f64,
 }
 
 impl Default for Params {
@@ -98,6 +112,12 @@ impl Default for Params {
             family_min_members: 4,
             family_min_fill: 0.5,
             family_max_false_alarm: 0.01,
+            episode_baseline_quantile: 0.2,
+            episode_noise_multiple: 5.0,
+            episode_min_rise: 30,
+            episode_min_tile_visits: 8,
+            episode_gap_revisits: 3.0,
+            episode_merge_revisits: 1.0,
         }
     }
 }
@@ -154,6 +174,9 @@ pub struct Analysis {
     pub carriers: Vec<Carrier>,
     /// Carriers on a common frequency grid, per band and antenna.
     pub families: Vec<Family>,
+    /// Floor on/off behaviour and episodes per band, antenna and segment.
+    pub floor_activity: Vec<FloorActivity>,
+    pub floor_episodes: Vec<FloorEpisode>,
 }
 
 /// Native tenths to (uncalibrated) dB.
@@ -179,6 +202,7 @@ pub fn run(
 ) -> Result<Analysis, StoreError> {
     let mut hours = bands::BandHours::default();
     let mut carriers = carriers::Carriers::default();
+    let mut floors = episodes::Floors::default();
     let (mut analyzed, mut skipped) = (0u64, 0u64);
     let (mut first, mut last) = (None::<i64>, None::<i64>);
     let mut session_ids = BTreeSet::new();
@@ -193,6 +217,7 @@ pub fn run(
         let (m, bg) = analyze_visit(&s, params);
         hours.add(&s, &m);
         carriers.add(&s, &m.peaks, params);
+        floors.add(&s, &m);
         observe(&s, &m, &bg);
         analyzed += 1;
         session_ids.insert(v.session_id.clone());
@@ -206,6 +231,9 @@ pub fn run(
         .filter(|s| session_ids.contains(&s.session_id))
         .collect();
     let mut carriers = carriers.finish(params);
+    let (floor_activity, mut floor_episodes) = floors.finish(params);
+    floor_episodes
+        .sort_by(|a, b| (a.start_utc_ns, &a.band_id, &a.antenna_id).cmp(&(b.start_utc_ns, &b.band_id, &b.antenna_id)));
     carriers.sort_by(|a, b| {
         (&a.band_id, &a.antenna_id)
             .cmp(&(&b.band_id, &b.antenna_id))
@@ -243,6 +271,8 @@ pub fn run(
         band_hours: hours.finish(),
         families: find_families(&carriers, params),
         carriers,
+        floor_activity,
+        floor_episodes,
     })
 }
 
@@ -286,6 +316,70 @@ pub fn band_hours_csv(rows: &[BandHour]) -> String {
             r.occupancy,
             r.variability_db,
             csv_field(r.measurement.as_deref().unwrap_or("")),
+        );
+    }
+    s
+}
+
+fn opt_utc(ns: Option<i64>) -> String {
+    ns.map(utc).unwrap_or_default()
+}
+
+fn opt_f64(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.0}")).unwrap_or_default()
+}
+
+/// Floor episodes as CSV, one header line. Empty bounds are unobserved.
+pub fn floor_episodes_csv(rows: &[FloorEpisode]) -> String {
+    let mut s = String::from(
+        "band_id,antenna_id,segment_id,start_after_utc,start_utc,end_utc,end_before_utc,visits,tiles,tiles_analyzed,median_rise_db,max_rise_db\n",
+    );
+    for e in rows {
+        let _ = writeln!(
+            s,
+            "{},{},{},{},{},{},{},{},{},{},{:.1},{:.1}",
+            csv_field(&e.band_id),
+            csv_field(&e.antenna_id),
+            e.segment_id,
+            opt_utc(e.start_after_utc_ns),
+            utc(e.start_utc_ns),
+            utc(e.end_utc_ns),
+            opt_utc(e.end_before_utc_ns),
+            e.visits,
+            e.tiles,
+            e.tiles_analyzed,
+            e.median_rise_db,
+            e.max_rise_db,
+        );
+    }
+    s
+}
+
+/// Floor activity per band, antenna and segment as CSV.
+pub fn floor_activity_csv(rows: &[FloorActivity]) -> String {
+    let mut s = String::from(
+        "band_id,antenna_id,segment_id,tiles,tiles_skipped,visits,first_utc,last_utc,revisit_s,noise_db,threshold_db,episodes,elevated_fraction,median_duration_s,median_gap_s,median_period_s\n",
+    );
+    for a in rows {
+        let _ = writeln!(
+            s,
+            "{},{},{},{},{},{},{},{},{:.0},{:.2},{:.1},{},{:.3},{},{},{}",
+            csv_field(&a.band_id),
+            csv_field(&a.antenna_id),
+            a.segment_id,
+            a.tiles,
+            a.tiles_skipped,
+            a.visits,
+            utc(a.first_utc_ns),
+            utc(a.last_utc_ns),
+            a.revisit_s,
+            a.noise_db,
+            a.threshold_db,
+            a.episodes,
+            a.elevated_fraction,
+            opt_f64(a.median_duration_s),
+            opt_f64(a.median_gap_s),
+            opt_f64(a.median_period_s),
         );
     }
     s
