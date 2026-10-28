@@ -62,7 +62,7 @@ fn stats(n: u64, hour: i64) -> VisitStats {
     let mut p10: Vec<i16> = p50.iter().map(|v| v - 15).collect();
     p50[bin(STEADY_HZ)] = floor + 200;
     p10[bin(STEADY_HZ)] = floor + 190;
-    if n % 4 == 0 {
+    if n.is_multiple_of(4) {
         p50[bin(SOMETIMES_HZ)] = floor + 120;
     }
     if n == 5 {
