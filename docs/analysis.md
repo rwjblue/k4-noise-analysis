@@ -190,6 +190,25 @@ Across visits:
   Floor timelines still treat a recording pause shorter than three
   revisits as quiet.
 
+Operator marks are notes about what happened at the station: "furnace
+started", "dehumidifier unplugged 02:10-02:40". `k4na mark --data DIR
+[--at TIME | --ago 10m] [--until TIME | --for 30m] TEXT` appends one
+to `DIR/annotations.jsonl` (see [storage.md](storage.md)); `k4na marks
+--data DIR` lists them. Times need an explicit zone (`Z` or an offset
+such as `-04:00`): a local wall-clock time read as UTC would place a
+mark hours off. Without `--at` or `--ago` the mark is now. Marks are
+written only by this command, never by the collector, so marking is safe
+while a survey runs and needs no radio. Analysis output carries the
+marks overlapping the analyzed span (`annotations`, with
+`provenance.annotations_skipped` counting unreadable lines); `analyze
+episodes` and `analyze groups` list them after their tables, and the
+report draws them on every heatmap and floor plot and lists them in a
+table. Nothing is inferred from a mark: it does not change any metric,
+and a mark that coincides with an onset is evidence for the operator to
+weigh, limited by the revisit cadence and by how well the mark's time
+is known. A note written later with `--at` records when it was written
+(`created_utc_ns`) as well.
+
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network
 resources, data embedded as JSON with the analysis provenance. Per band
@@ -205,8 +224,11 @@ and antenna, in frequency order:
   marks an outage longer than twice the typical pass interval;
 - the median visit floor per pass, and a warning when the grid mixes
   receiver-settings segments;
-- tables of timing groups, floor episodes, harmonic series, families,
-  carriers (by persistence) and band/hour floors.
+- operator marks drawn across the heatmap (a dashed line for a moment,
+  a shaded band for an interval) and the floor plot, with the note in
+  the hover tip;
+- tables of operator marks, timing groups, floor episodes, harmonic
+  series, families, carriers (by persistence) and band/hour floors.
 
 Rows are passes, not uniform time, so the Y axis is labelled with the
 first and last pass times; hover shows each cell's time and values. UTC

@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use k4na_store::StoreError;
+pub use k4na_store::annotations::Annotation;
 use k4na_store::reader::DataSet;
 use serde::Serialize;
 
@@ -185,6 +186,8 @@ pub struct Provenance {
     pub visits_skipped: u64,
     pub first_utc_ns: Option<i64>,
     pub last_utc_ns: Option<i64>,
+    /// Unreadable lines skipped in the annotations file.
+    pub annotations_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +205,9 @@ pub struct Analysis {
     pub floor_episodes: Vec<FloorEpisode>,
     /// Floors and carriers that switch on and off together.
     pub timing_groups: Vec<TimingGroup>,
+    /// Operator notes (`k4na mark`) touching the analyzed span. Operator
+    /// input, not measurements; nothing is inferred from them.
+    pub annotations: Vec<Annotation>,
 }
 
 /// Timing features: each band floor with its episodes, and each carrier
@@ -312,6 +318,8 @@ pub fn run(
     });
     let families = find_families(&carriers, params);
     let harmonic_series = find_series(&families, &carriers, params);
+    let (mut annotations, annotations_skipped) = ds.annotations()?;
+    annotations.retain(|a| first.zip(last).is_some_and(|(lo, hi)| a.overlaps(lo, hi)));
     let name = |p: &std::path::Path| {
         p.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -340,7 +348,9 @@ pub fn run(
             visits_skipped: skipped,
             first_utc_ns: first,
             last_utc_ns: last,
+            annotations_skipped,
         },
+        annotations,
         band_hours: hours.finish(),
         timing_groups: timing::group(
             timing_features(&floor_activity, &floor_episodes, &carriers, &families),

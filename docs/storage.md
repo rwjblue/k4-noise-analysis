@@ -39,7 +39,19 @@ data/
     summary-20261027T19Z.sqlite
     raw-20261027T19Z.sqlite
     ...
+  annotations.jsonl
 ~~~
+
+`annotations.jsonl` holds operator marks from `k4na mark`, one JSON
+object per line (`start_utc_ns`, optional `end_utc_ns`, `text` up to
+500 characters, `created_utc_ns`), each appended with one write and
+fsynced. It is operator input, not measurement: the collector never
+writes it, retention never prunes it (it is bytes per note), and its size
+counts in the root's usage. `k4na mark` writes only into an existing
+k4na data root. Readers skip lines they cannot parse (a torn last line
+after a crash) and report the count. Notes are free text, so keep
+people's names and addresses out of them like any other data-root
+content.
 
 - One writer owns shards; readers open completed shards read-only.
 - Hourly UTC rotation, by shard timestamp, not estimated size. At rotation

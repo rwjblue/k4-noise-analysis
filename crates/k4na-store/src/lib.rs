@@ -2,6 +2,7 @@
 //! rotation, recovery and byte budgets, plus an independent read-only
 //! reader for inspection, replay and later analysis.
 
+pub mod annotations;
 pub mod codec;
 pub mod estimate;
 pub mod reader;

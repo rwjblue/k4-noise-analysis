@@ -175,6 +175,53 @@ fn survey_requires_cli_consent_before_touching_the_network() {
 }
 
 #[test]
+fn mark_refuses_zoneless_times_and_foreign_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    k4na()
+        .args(["mark", "--data"])
+        .arg(dir.path())
+        .arg("note")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not a k4na data root"));
+    std::fs::write(dir.path().join("K4NA-DATA-ROOT"), "").unwrap();
+    k4na()
+        .args(["mark", "--at", "2026-10-29T02:15", "--data"])
+        .arg(dir.path())
+        .arg("note")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no time zone"));
+    k4na()
+        .args([
+            "mark",
+            "--at",
+            "2026-10-29T02:15-04:00",
+            "--until",
+            "2026-10-29T02:00-04:00",
+            "--data",
+        ])
+        .arg(dir.path())
+        .arg("note")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("end before it starts"));
+    k4na()
+        .args(["--json", "mark", "--at", "2026-10-29T02:15-04:00", "--data"])
+        .arg(dir.path())
+        .args(["dehumidifier", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"start_utc_ns\": 1793254500000000000"));
+    k4na()
+        .args(["marks", "--data"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout("2026-10-29T06:15:00.000Z  dehumidifier off\n");
+}
+
+#[test]
 fn replay_decodes_the_r39_fixture() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -316,6 +363,31 @@ fn end_to_end_against_tcp_simulator() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with("band_id,antenna_id,spacing_hz,"));
+    // Operator marks: one spans the run, one is long before it.
+    k4na()
+        .args(["mark", "--ago", "1h", "--for", "2h", "--data"])
+        .arg(dir.path().join("data"))
+        .args(["spans", "the run"])
+        .assert()
+        .success();
+    k4na()
+        .args(["mark", "--at", "2000-01-01T00:00Z", "--data"])
+        .arg(dir.path().join("data"))
+        .arg("long before")
+        .assert()
+        .success();
+    k4na()
+        .args(["analyze", "episodes", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("spans the run").and(predicate::str::contains("long before").not()));
+    k4na()
+        .args(["marks", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2000-01-01T00:00:00.000Z  long before"));
     k4na()
         .args(["analyze", "series", "--format", "csv", "--data"])
         .arg(dir.path().join("data"))

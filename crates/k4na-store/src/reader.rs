@@ -213,6 +213,12 @@ impl DataSet {
         Ok(out)
     }
 
+    /// Operator annotations (see [`crate::annotations`]) and the count of
+    /// unreadable lines skipped.
+    pub fn annotations(&self) -> Result<(Vec<crate::annotations::Annotation>, u64), StoreError> {
+        crate::annotations::read(&self.root)
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionRow>, StoreError> {
         let mut by_id: BTreeMap<String, SessionRow> = BTreeMap::new();
         for rows in self.each_conn(ShardKind::Summary, |c| {

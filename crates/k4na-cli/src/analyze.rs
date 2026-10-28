@@ -93,10 +93,52 @@ pub enum AnalyzeCmd {
     },
 }
 
-fn parse_time(s: &str) -> Result<i64> {
-    let t = humantime::parse_rfc3339_weak(s).with_context(|| format!("not an RFC 3339 time: {s}"))?;
+/// Splits a trailing `Z` or `+HH:MM` / `-HH:MM` / `+HHMM` zone off an
+/// RFC 3339-style time; returns the rest and the offset east of UTC in
+/// seconds, or `None` for a time without a zone.
+fn split_zone(s: &str) -> Result<(&str, Option<i64>)> {
+    if let Some(rest) = s.strip_suffix(['Z', 'z']) {
+        return Ok((rest, Some(0)));
+    }
+    // A sign after the date's own dashes (past `YYYY-MM-DDTHH`).
+    let Some(i) = s.rfind(['+', '-']).filter(|&i| i >= 13) else {
+        return Ok((s, None));
+    };
+    let digits: String = s[i + 1..].chars().filter(|c| *c != ':').collect();
+    let (h, m) = match digits.len() {
+        2 => (&digits[..2], "0"),
+        4 => (&digits[..2], &digits[2..]),
+        _ => anyhow::bail!("bad UTC offset in {s}; use Z, +HH:MM or -HH:MM"),
+    };
+    let (h, m): (i64, i64) = (h.parse()?, m.parse()?);
+    anyhow::ensure!(h <= 23 && m <= 59, "bad UTC offset in {s}");
+    let sign = if s.as_bytes()[i] == b'-' { -1 } else { 1 };
+    Ok((&s[..i], Some(sign * (h * 3600 + m * 60))))
+}
+
+/// Parses `YYYY-MM-DDTHH:MM[:SS[.frac]]` with an optional zone; a time
+/// without one is UTC unless `require_zone`.
+pub fn parse_time_zoned(s: &str, require_zone: bool) -> Result<i64> {
+    let s = s.trim();
+    let (naive, offset) = split_zone(s)?;
+    if require_zone && offset.is_none() {
+        anyhow::bail!("{s} has no time zone; add Z for UTC or an offset such as -04:00 (EDT) or -05:00 (EST)");
+    }
+    let naive = naive.replacen(' ', "T", 1);
+    // humantime needs seconds.
+    let naive = if naive.len() == 16 {
+        format!("{naive}:00")
+    } else {
+        naive
+    };
+    let t = humantime::parse_rfc3339_weak(&naive).with_context(|| format!("not an RFC 3339 time: {s}"))?;
     let d = t.duration_since(std::time::UNIX_EPOCH).context("time before 1970")?;
-    i64::try_from(d.as_nanos()).context("time out of range")
+    let utc = i64::try_from(d.as_nanos()).context("time out of range")?;
+    Ok(utc - offset.unwrap_or(0) * 1_000_000_000)
+}
+
+fn parse_time(s: &str) -> Result<i64> {
+    parse_time_zoned(s, false)
 }
 
 impl FilterArgs {
@@ -357,6 +399,7 @@ fn episodes_text(a: &Analysis) -> String {
             e.max_rise_db,
         );
     }
+    s += &marks_text(a);
     s += "\nAn episode is a floor raised over that tile's quiet baseline: the onset lies between `after` and `start`,\nthe end between `end` and `before` (? = edge of the data or a gap). It does not say why the floor rose.\n";
     s += &format!("rise = median dB over baseline; levels: {LEVEL_UNITS}\n");
     s
@@ -396,7 +439,30 @@ fn groups_text(a: &Analysis) -> String {
             );
         }
     }
+    s += &marks_text(a);
     s += "\nA timing group is a hypothesis that one switched source or one propagation change drives its\nmembers (their on/off signals correlate and several onsets/ends coincide), not a source identification.\n";
+    s
+}
+
+/// Operator notes in the analyzed span, for comparing with onsets.
+fn marks_text(a: &Analysis) -> String {
+    let mut s = String::new();
+    if !a.annotations.is_empty() {
+        s += &format!("\n{} operator mark(s) (`k4na mark`):\n", a.annotations.len());
+        for m in &a.annotations {
+            let when = match m.end_utc_ns {
+                Some(e) => format!("{} .. {}", utc(m.start_utc_ns), utc(e)),
+                None => utc(m.start_utc_ns),
+            };
+            s += &format!("  {when}  {}\n", m.text.replace('\n', " "));
+        }
+    }
+    if a.provenance.annotations_skipped > 0 {
+        s += &format!(
+            "  ({} unreadable annotation line(s) skipped)\n",
+            a.provenance.annotations_skipped
+        );
+    }
     s
 }
 
@@ -541,4 +607,32 @@ fn carriers_text(a: &Analysis, limit: usize) -> String {
     s += "covered excludes masked visits: the background had risen too far to tell whether it was there\n";
     s += &format!("excess = median dB above local background; levels: {LEVEL_UNITS}\n");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_time_zoned;
+
+    #[test]
+    fn times_with_zones_and_without() {
+        let utc = parse_time_zoned("2026-10-29T06:15:00Z", true).unwrap();
+        assert_eq!(utc, 1_793_254_500_000_000_000);
+        for s in [
+            "2026-10-29T02:15-04:00",
+            "2026-10-29T02:15:00-04:00",
+            "2026-10-29 02:15:00-0400",
+            "2026-10-29T01:15-05",
+            "2026-10-29T11:45+05:30",
+            "2026-10-29T06:15z",
+        ] {
+            assert_eq!(parse_time_zoned(s, true).unwrap(), utc, "{s}");
+        }
+        // Filters keep treating a time without a zone as UTC; marks refuse it.
+        assert_eq!(parse_time_zoned("2026-10-29T06:15:00", false).unwrap(), utc);
+        let err = parse_time_zoned("2026-10-29T02:15", true).unwrap_err().to_string();
+        assert!(err.contains("no time zone"), "{err}");
+        assert!(parse_time_zoned("2026-10-29T02:15-4:0", true).is_err());
+        assert!(parse_time_zoned("2026-10-29T02:15+25:00", true).is_err());
+        assert!(parse_time_zoned("yesterday", false).is_err());
+    }
 }

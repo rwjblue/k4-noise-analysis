@@ -187,6 +187,34 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Note a moment or interval for analysis, such as "dehumidifier off".
+    /// Appends to <data>/annotations.jsonl; never touches measurements or
+    /// the radio, so it is safe while a survey runs.
+    Mark {
+        #[arg(long)]
+        data: PathBuf,
+        /// When it happened, with a zone: 2026-10-29T02:15-04:00 or
+        /// 2026-10-29T06:15Z. Default: now.
+        #[arg(long, conflicts_with = "ago")]
+        at: Option<String>,
+        /// When it happened, as a time before now (for example 10m).
+        #[arg(long, value_parser = humantime::parse_duration)]
+        ago: Option<Duration>,
+        /// End of an interval, with a zone.
+        #[arg(long, conflicts_with = "for_")]
+        until: Option<String>,
+        /// Length of an interval (for example 45m).
+        #[arg(long = "for", value_parser = humantime::parse_duration)]
+        for_: Option<Duration>,
+        /// The note.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
+    /// List the notes in a data root.
+    Marks {
+        #[arg(long)]
+        data: PathBuf,
+    },
     /// Decode a raw :9201 byte capture offline.
     Replay {
         #[arg(long)]
@@ -294,6 +322,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Analyze { what } => analyze::run(what, json),
         Cmd::Report { filter, out } => analyze::report(&filter, &out, json),
         Cmd::Replay { input } => replay(&input, json),
+        Cmd::Mark {
+            data,
+            at,
+            ago,
+            until,
+            for_,
+            text,
+        } => mark(&data, at.as_deref(), ago, until.as_deref(), for_, &text.join(" "), json),
+        Cmd::Marks { data } => marks(&data, json),
         Cmd::Simulate {
             host,
             cat_port,
@@ -919,6 +956,79 @@ fn refuse_if_unresolved(cfg: &Config) -> Result<()> {
         dir.display(),
         blocking.join(", ")
     )))
+}
+
+fn mark(
+    data: &Path,
+    at: Option<&str>,
+    ago: Option<Duration>,
+    until: Option<&str>,
+    for_: Option<Duration>,
+    text: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    let now = k4na_core::time::system_utc_ns();
+    let ns = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+    let start = match (at, ago) {
+        (Some(t), _) => analyze::parse_time_zoned(t, true).map_err(|e| refuse(e.to_string()))?,
+        (None, Some(d)) => now.saturating_sub(ns(d)),
+        (None, None) => now,
+    };
+    let end = match (until, for_) {
+        (Some(t), _) => Some(analyze::parse_time_zoned(t, true).map_err(|e| refuse(e.to_string()))?),
+        (None, Some(d)) => Some(start.saturating_add(ns(d))),
+        (None, None) => None,
+    };
+    let a = k4na_store::annotations::Annotation {
+        start_utc_ns: start,
+        end_utc_ns: end,
+        text: text.to_owned(),
+        created_utc_ns: now,
+    };
+    k4na_store::annotations::append(data, &a).map_err(|e| refuse(e.to_string()))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&a)?);
+    } else {
+        println!("{}", mark_line(&a));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn mark_line(a: &k4na_store::annotations::Annotation) -> String {
+    let when = match a.end_utc_ns {
+        Some(e) => format!(
+            "{} .. {}",
+            k4na_core::time::format_utc(a.start_utc_ns),
+            k4na_core::time::format_utc(e)
+        ),
+        None => k4na_core::time::format_utc(a.start_utc_ns),
+    };
+    format!("{when}  {}", a.text)
+}
+
+fn marks(data: &Path, json: bool) -> Result<ExitCode> {
+    let (notes, bad) =
+        k4na_store::annotations::read(data).with_context(|| format!("read annotations in {}", data.display()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "annotations": notes, "skipped_lines": bad }))?
+        );
+    } else {
+        for a in &notes {
+            println!("{}", mark_line(a));
+        }
+        if notes.is_empty() {
+            println!("no annotations in {}", data.display());
+        }
+        if bad > 0 {
+            eprintln!(
+                "{bad} unreadable line(s) skipped in {}",
+                k4na_store::annotations::path(data).display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn inspect(data: &Path, json: bool) -> Result<ExitCode> {

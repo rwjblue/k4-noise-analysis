@@ -34,6 +34,8 @@ k4na analyze families --data ./data              # combs: carriers on a common g
 k4na analyze episodes --data ./data              # when each band's floor rose, duty, period
 k4na analyze groups   --data ./data              # floors and carriers that switch together
 k4na analyze series   --data ./data              # combs on harmonics of one fundamental
+k4na mark --data ./data --ago 5m "furnace started"   # operator note for analysis
+k4na mark --data ./data --at 2026-10-29T02:10-04:00 --for 30m "dehumidifier unplugged"
 k4na report  --data ./data --out report.html     # heatmaps + tables, one offline file
 k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
 ~~~

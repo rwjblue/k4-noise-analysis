@@ -718,6 +718,9 @@ impl Store {
             .unwrap_or(0)
             + std::fs::metadata(self.opts.root.join(ROOT_MARKER))
                 .map(|m| m.len())
+                .unwrap_or(0)
+            + std::fs::metadata(crate::annotations::path(&self.opts.root))
+                .map(|m| m.len())
                 .unwrap_or(0);
         let usage = summary + raw + other;
         let free = self.probe.available_bytes(&self.opts.root)?;
@@ -814,7 +817,9 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
             return Err(StoreError::BadRoot(format!("{} is not a directory", root.display())));
         }
         // A survey recovery journal directory may predate the marker.
-        let foreign = std::fs::read_dir(root)?.any(|e| e.is_ok_and(|e| e.file_name() != RECOVERY_DIR));
+        let foreign = std::fs::read_dir(root)?.any(|e| {
+            e.is_ok_and(|e| e.file_name() != RECOVERY_DIR && e.file_name() != crate::annotations::ANNOTATIONS_FILE)
+        });
         if !marker.exists() && foreign {
             return Err(StoreError::BadRoot(format!(
                 "{} is not empty and has no {ROOT_MARKER} marker; choose an empty or k4na-created directory",
@@ -826,7 +831,7 @@ fn prepare_root(root: &Path) -> Result<(), StoreError> {
     if !marker.exists() {
         std::fs::write(
             &marker,
-            "This directory is a k4na measurement data root.\nk4na only creates, finalizes and prunes YYYY/MM/DD/{summary,raw}-*.sqlite shards here.\nrecovery/ holds survey recovery journals: never pruned, not counted against quotas.\n",
+            "This directory is a k4na measurement data root.\nk4na only creates, finalizes and prunes YYYY/MM/DD/{summary,raw}-*.sqlite shards here.\nrecovery/ holds survey recovery journals: never pruned, not counted against quotas.\nannotations.jsonl holds operator notes from `k4na mark`: never pruned.\n",
         )?;
     }
     Ok(())
