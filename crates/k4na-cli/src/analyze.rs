@@ -63,6 +63,11 @@ pub enum AnalyzeCmd {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
+    /// Carriers on a common frequency grid (comb patterns).
+    Families {
+        #[command(flatten)]
+        select: Select,
+    },
 }
 
 fn parse_time(s: &str) -> Result<i64> {
@@ -124,6 +129,15 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
                 Format::Json => json_of(&a.provenance, "carriers", serde_json::to_value(&a.carriers)?)?,
                 Format::Csv => carriers_csv(&a.carriers),
                 Format::Text => carriers_text(&a, limit),
+            };
+            select.emit(&out)?;
+        }
+        AnalyzeCmd::Families { select } => {
+            let a = select.analyze()?;
+            let out = match format(&select) {
+                Format::Json => json_of(&a.provenance, "families", serde_json::to_value(&a.families)?)?,
+                Format::Csv => families_csv(&a.families),
+                Format::Text => families_text(&a),
             };
             select.emit(&out)?;
         }
@@ -205,6 +219,57 @@ fn bands_text(a: &Analysis) -> String {
     s += &format!(
         "\nfloor = median local background; occ = bins >= 8 dB above it; var = median p90-p10.\nlevels: {LEVEL_UNITS}\n"
     );
+    s
+}
+
+fn families_csv(rows: &[k4na_analysis::Family]) -> String {
+    let mut s = String::from(
+        "band_id,antenna_id,spacing_hz,offset_hz,first_hz,last_hz,members,grid_positions,fill,residual_rms_hz,false_alarm,median_member_persistence\n",
+    );
+    for f in rows {
+        s += &format!(
+            "{},{},{:.1},{:.1},{:.0},{:.0},{},{},{:.3},{:.1},{:.2e},{:.3}\n",
+            f.band_id,
+            f.antenna_id,
+            f.spacing_hz,
+            f.offset_hz,
+            f.first_hz,
+            f.last_hz,
+            f.members.len(),
+            f.grid_positions,
+            f.fill,
+            f.residual_rms_hz,
+            f.false_alarm,
+            f.median_member_persistence,
+        );
+    }
+    s
+}
+
+fn families_text(a: &Analysis) -> String {
+    let mut s = header(a);
+    s += &format!(
+        "{} famil(ies) among {} carrier(s)\n",
+        a.families.len(),
+        a.carriers.len()
+    );
+    for f in &a.families {
+        s += &format!(
+            "{} {}: spacing {:.3} kHz, {} members on {} grid lines ({:.0}% filled), {:.3}-{:.3} MHz, rms {:.0} Hz, chance {:.1e}, median persistence {:.0}%\n",
+            f.band_id,
+            f.antenna_id,
+            f.spacing_hz / 1000.0,
+            f.members.len(),
+            f.grid_positions,
+            f.fill * 100.0,
+            f.first_hz / 1e6,
+            f.last_hz / 1e6,
+            f.residual_rms_hz,
+            f.false_alarm,
+            f.median_member_persistence * 100.0,
+        );
+    }
+    s += "\nA family is a frequency pattern (harmonics of one switching or clock source are a common cause),\nnot a source identification. chance = expected families this strong from unrelated carriers.\n";
     s
 }
 

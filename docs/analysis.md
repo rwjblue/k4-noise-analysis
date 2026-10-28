@@ -93,6 +93,23 @@ Across visits:
   JSON. The class is temporal only: `stationary` (seen in >= 90% of at
   least 6 covering visits, frequency spread within two tolerances),
   `recurring` (>= 25%), `occasional`, or `insufficient_exposure`.
+- `analyze families` looks for carriers on one band and antenna lying on
+  a common grid `offset + k * spacing` (2-250 kHz), within the carrier
+  tolerance. Candidate spacings come from carrier differences divided by
+  1-4; each grid is refined by least squares. A family needs at least
+  4 members, distinct grid lines, at least half the lines between its
+  first and last member occupied, and a small chance of arising from
+  unrelated carriers: two members define a grid, so the binomial tail
+  of the remaining members landing on it, times the number of spacings
+  tried (a Bonferroni bound reported as `false_alarm`), must be at most
+  0.01. Each carrier joins at most one family. A family is a pattern
+  (harmonics of one switching or clock source are a common cause), not
+  a source identification.
+
+First observation (2026-10-27 data, 10 m, RX ANT IN1 at `PRE1`): 34
+carriers on 34 consecutive grid lines spaced 35.087 kHz, 28.526-29.684
+MHz, RMS 13 Hz from the grid, seen in every covering visit (only five
+visits each). The source is unknown.
 
 Caveats specific to v1: thresholds are the exploratory defaults above
 and are not yet exposed as options; a chain of nearby CW or FT8

@@ -8,6 +8,7 @@
 pub mod background;
 pub mod bands;
 pub mod carriers;
+pub mod families;
 pub mod spectrum;
 
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ use serde::Serialize;
 pub use background::{Peak, VisitMetrics, analyze_visit, local_background};
 pub use bands::BandHour;
 pub use carriers::Carrier;
+pub use families::{Family, find_families};
 pub use spectrum::VisitSpectrum;
 
 /// Bumped whenever an algorithm or default changes its output.
@@ -45,6 +47,15 @@ pub struct Params {
     pub min_carrier_detections: u64,
     /// Below this many covering visits a carrier is not classified.
     pub min_carrier_exposure: u64,
+    /// Comb search: grid spacing bounds, minimum members, the minimum
+    /// fraction of grid positions occupied, within `carrier_tolerance_hz`.
+    pub family_min_spacing_hz: f64,
+    pub family_max_spacing_hz: f64,
+    pub family_min_members: u64,
+    pub family_min_fill: f64,
+    /// Largest accepted expected count of chance families (see
+    /// `Family::false_alarm`).
+    pub family_max_false_alarm: f64,
 }
 
 impl Default for Params {
@@ -58,6 +69,11 @@ impl Default for Params {
             carrier_tolerance_hz: 100.0,
             min_carrier_detections: 3,
             min_carrier_exposure: 6,
+            family_min_spacing_hz: 2_000.0,
+            family_max_spacing_hz: 250_000.0,
+            family_min_members: 4,
+            family_min_fill: 0.5,
+            family_max_false_alarm: 0.01,
         }
     }
 }
@@ -112,6 +128,8 @@ pub struct Analysis {
     pub provenance: Provenance,
     pub band_hours: Vec<BandHour>,
     pub carriers: Vec<Carrier>,
+    /// Carriers on a common frequency grid, per band and antenna.
+    pub families: Vec<Family>,
 }
 
 /// Native tenths to (uncalibrated) dB.
@@ -199,6 +217,7 @@ pub fn run(
             last_utc_ns: last,
         },
         band_hours: hours.finish(),
+        families: find_families(&carriers, params),
         carriers,
     })
 }
