@@ -296,6 +296,18 @@ async fn lost_cat_is_unknown_state_and_never_restored() {
     .await;
     assert_eq!(run.report.halt, "cat_lost", "{:?}", run.report);
     assert!(run.report.restore.starts_with("not restoring"));
+    // The changes are journaled and block new surveys; once CAT is back,
+    // an explicit recovery restores them.
+    assert_eq!(run.journal_status, JournalStatus::Pending);
+    assert_eq!(run.report.restore_outcome, "not_restored");
+    assert!(!run.report.manual.is_empty());
+    let info = recovery::list(&run.cfg.storage.recovery_dir()).unwrap().remove(0);
+    let mut cat = control(&run.radio).await;
+    let mut txn = recovery::Transaction::resume(&info.path, clock()).unwrap();
+    let report = recovery::restore(&mut txn, &mut cat).await;
+    assert_eq!(report.outcome, recovery::Outcome::Complete, "{report:?}");
+    let m = run.radio.model();
+    assert_eq!((m.bn, m.fa), (5, RadioModel::default().fa));
 }
 
 #[tokio::test(start_paused = true)]
@@ -394,6 +406,10 @@ async fn low_disk_mid_survey_stops_and_restores() {
     assert!(run.report.summary.end_reason.contains("storage"));
     assert!(run.report.restore.starts_with("restored"), "{}", run.report.restore);
     assert_eq!(run.radio.model().fa, RadioModel::default().fa);
+    // Journals are outside the quota: storage pressure never prevents
+    // journaling the restoration.
+    assert_eq!(run.journal_status, JournalStatus::Resolved);
+    assert!(run.journal.dirty().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -743,19 +759,34 @@ high_hz = 10150000
     assert_eq!(run.radio.model().fa, 10_120_000);
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
+/// A two-band, two-antenna radio with per-band-and-input receiver
+/// memories, 30 m-style surprises left out.
+fn recovery_radio() -> SimRadio {
     let radio = SimRadio::new(15);
     radio.update(|m| {
         m.rx_scope = k4na_sim::RxScope::BandInput;
         m.rx = operator_rx();
     });
-    let before = radio.model();
+    radio
+}
+
+struct Interrupted {
+    cfg: Config,
+    clock: Arc<dyn Clock>,
+    /// `None` when the survey was killed (its future dropped).
+    report: Option<SurveyReport>,
+    _dir: tempfile::TempDir,
+}
+
+/// Runs a two-antenna survey that is killed after `kill_after` (the
+/// future is dropped: no restoration code runs, as with SIGKILL), or
+/// cancelled through its stop handle after `cancel_after`.
+async fn interrupted_survey(radio: &SimRadio, kill_after: Duration, cancel_after: Option<Duration>) -> Interrupted {
     let dir = tempfile::tempdir().unwrap();
     let profile = two_band_profile(r#""log-near-house", "dxc""#, "");
     let cfg = config_with(&dir.path().join("data"), "allow_rx_antenna_switch = true", &profile);
     let clock: Arc<dyn Clock> = clock();
-    let mut cat = control(&radio).await;
+    let mut cat = control(radio).await;
     let pre = preflight(&mut cat, &cfg).await.unwrap();
     let sid = "0190bbbb-0000-7000-8000-00000000000a";
     let store = open_store(&cfg, sid, Mode::Survey, &clock);
@@ -767,11 +798,17 @@ async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
         SpectrumOptions::from_config(&cfg.radio),
         clock.clone(),
     );
-    let (_h, stop) = stop_pair();
+    let (handle, stop) = stop_pair();
+    if let Some(after) = cancel_after {
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            handle.stop("signal");
+        });
+    } else {
+        std::mem::forget(handle);
+    }
     let mut txn = begin_journal(&cfg, sid, &pre, clock.clone()).unwrap();
-    // "Kill" the process once the survey has moved to the second antenna:
-    // the future is dropped, so no restoration code runs.
-    let killed = tokio::time::timeout(Duration::from_secs(60), async {
+    let report = tokio::time::timeout(kill_after, async {
         run_survey(
             ctx(&cfg, &store, &clock, sid, stop),
             &mut spec,
@@ -781,19 +818,74 @@ async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
             Duration::from_secs(600),
         )
         .await
+        .unwrap()
     })
-    .await;
-    assert!(killed.is_err(), "the survey was still running");
-    drop(txn);
-    drop(cat);
+    .await
+    .ok();
+    Interrupted {
+        cfg,
+        clock,
+        report,
+        _dir: dir,
+    }
+}
+
+/// The only journal in the run's recovery directory.
+fn journal_info(cfg: &Config) -> recovery::JournalInfo {
+    let mut all = recovery::list(&cfg.storage.recovery_dir()).unwrap();
+    assert_eq!(all.len(), 1, "{all:?}");
+    all.remove(0)
+}
+
+/// `k4na recovery restore`, in-process, on a fresh CAT connection.
+async fn recover(run: &Interrupted, radio: &SimRadio) -> recovery::RestoreReport {
+    let info = journal_info(&run.cfg);
+    let mut cat = control(radio).await;
+    let mut txn = recovery::Transaction::resume(&info.path, run.clock.clone()).unwrap();
+    recovery::restore(&mut txn, &mut cat).await
+}
+
+/// Every memory the survey could touch is as the operator left it.
+fn assert_as_found(radio: &SimRadio, before: &RadioModel) {
+    let m = radio.model();
+    assert_eq!(
+        (m.bn, m.fa, m.span, m.fixed, m.rx_input, m.tx_antenna, m.rx),
+        (
+            before.bn,
+            before.fa,
+            before.span,
+            before.fixed,
+            before.rx_input,
+            before.tx_antenna,
+            before.rx
+        )
+    );
+    for band in [3, 5] {
+        for input in [4, 6] {
+            assert_eq!(m.rx_settings(band, input), before.rx, "band {band} input {input}");
+        }
+        assert_eq!(m.band_rx_input.get(&band).copied().unwrap_or(4), 4, "band {band} input");
+        if let Some(span) = before.band_span.get(&band) {
+            assert_eq!(m.band_span.get(&band), Some(span), "band {band} span");
+        }
+    }
+    assert!(radio.forbidden_commands().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
+    let radio = recovery_radio();
+    let before = radio.model();
+    // Killed once the survey has moved to the second antenna.
+    let run = interrupted_survey(&radio, Duration::from_secs(60), None).await;
+    assert!(run.report.is_none(), "the survey was still running");
     let changed = radio.model();
     assert!(
         (changed.bn, changed.fa, changed.rx) != (before.bn, before.fa, before.rx) || changed.rx_input != 4,
         "the kill happened mid-survey"
     );
 
-    let dir = cfg.storage.recovery_dir();
-    let info = recovery::list(&dir).unwrap().remove(0);
+    let info = journal_info(&run.cfg);
     assert_eq!(info.status, JournalStatus::Pending);
     assert!(info.dirty > 0);
     // The dry run is GET-only.
@@ -805,30 +897,74 @@ async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
     assert!(plan.dry_run && !plan.fields.is_empty(), "{plan:?}");
     assert_eq!(radio.setters_received().len(), setters, "dry run sent a setter");
 
-    let mut txn = recovery::Transaction::resume(&info.path, clock.clone()).unwrap();
-    let report = recovery::restore(&mut txn, &mut cat).await;
+    let report = recover(&run, &radio).await;
     assert_eq!(report.outcome, recovery::Outcome::Complete, "{report:?}");
-    drop(txn);
-    let m = radio.model();
-    assert_eq!(
-        (m.bn, m.fa, m.span, m.rx_input, m.rx),
-        (before.bn, before.fa, before.span, 4, operator_rx())
-    );
-    for band in [3, 5] {
-        for input in [4, 6] {
-            assert_eq!(m.rx_settings(band, input), operator_rx(), "band {band} input {input}");
-        }
-        assert_eq!(m.band_rx_input.get(&band).copied().unwrap_or(4), 4);
+    assert_as_found(&radio, &before);
+    assert_eq!(journal_info(&run.cfg).status, JournalStatus::Resolved);
+    // Restoring again changes nothing: the engine is idempotent.
+    let setters = radio.setters_received().len();
+    assert_eq!(recover(&run, &radio).await.outcome, recovery::Outcome::Complete);
+    assert_eq!(radio.setters_received().len(), setters);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_kill_at_any_point_is_recoverable() {
+    // From before the first change, through band, antenna and settings
+    // changes, to the second cycle. Each kill leaves a journal from which
+    // the radio is fully restored.
+    for secs in [1, 2, 3, 5, 8, 11, 15, 19, 24, 30, 37, 45, 54, 66, 80, 100] {
+        let radio = recovery_radio();
+        let before = radio.model();
+        let run = interrupted_survey(&radio, Duration::from_millis(secs * 1000 + 137), None).await;
+        assert!(run.report.is_none(), "{secs} s: still running");
+        let info = journal_info(&run.cfg);
+        assert_eq!(info.status, JournalStatus::Pending, "{secs} s");
+        let report = recover(&run, &radio).await;
+        assert_eq!(report.outcome, recovery::Outcome::Complete, "{secs} s: {report:?}");
+        assert_as_found(&radio, &before);
+        assert_eq!(journal_info(&run.cfg).status, JournalStatus::Resolved, "{secs} s");
     }
-    assert_eq!(recovery::list(&dir).unwrap()[0].status, JournalStatus::Resolved);
-    // A second restore is refused as already resolved by the CLI; the
-    // engine itself is idempotent.
-    let mut txn = recovery::Transaction::resume(&info.path, clock).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_restores_everything_and_resolves_the_journal() {
+    let radio = recovery_radio();
+    let before = radio.model();
+    let run = interrupted_survey(&radio, Duration::from_secs(600), Some(Duration::from_secs(45))).await;
+    let r = run.report.as_ref().expect("cancelled, not killed");
     assert_eq!(
-        recovery::restore(&mut txn, &mut cat).await.outcome,
-        recovery::Outcome::Complete
+        (r.halt.as_str(), r.restore_outcome.as_str()),
+        ("stop", "complete"),
+        "{r:?}"
     );
-    assert!(radio.forbidden_commands().is_empty());
+    assert_eq!(r.summary.end_reason, "signal");
+    assert_as_found(&radio, &before);
+    let info = journal_info(&run.cfg);
+    assert_eq!((info.status, info.dirty), (JournalStatus::Resolved, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partial_restore_is_reported_and_a_retry_completes_it() {
+    let radio = recovery_radio();
+    let before = radio.model();
+    let run = interrupted_survey(&radio, Duration::from_secs(20), None).await;
+    assert!(run.report.is_none());
+    // The radio ignores RF gain setters during the first attempt (the
+    // kill at 20 s leaves 40 m's RF gain changed on ANT2).
+    radio.faults(|f| f.ignore_setters = vec!["RG".into()]);
+    let first = recover(&run, &radio).await;
+    assert_eq!(first.outcome, recovery::Outcome::Partial, "{first:?}");
+    assert!(
+        first.fields.iter().any(|f| f.field == "RG" && f.result == "failed"),
+        "{first:?}"
+    );
+    assert!(first.manual.iter().any(|m| m.contains("RF gain")), "{:?}", first.manual);
+    assert_eq!(journal_info(&run.cfg).status, JournalStatus::Pending);
+    radio.faults(|f| f.ignore_setters.clear());
+    let retry = recover(&run, &radio).await;
+    assert_eq!(retry.outcome, recovery::Outcome::Complete, "{retry:?}");
+    assert_as_found(&radio, &before);
+    assert_eq!(journal_info(&run.cfg).status, JournalStatus::Resolved);
 }
 
 /// Two short bands; `extra` is appended (antennas, `[measurement]`).
@@ -910,6 +1046,19 @@ async fn measurement_settings_are_applied_recorded_and_put_back() {
         assert_eq!(s["preamp"], "off", "{s:?}");
         assert_eq!(s["rf_gain_db"], "0", "{s:?}");
         assert_eq!(s["cat_meta_mode"], "basic", "{s:?}");
+        // The effective values, as verified by readback.
+        assert_eq!(s["verified.PA"], "0", "{s:?}");
+        assert_eq!(s["verified.RG"], "-00", "{s:?}");
+        assert_eq!(s["verified.NB"], "0", "{s:?}");
+    }
+    // One deterministic segment per band across cycles.
+    for band in ["40m", "20m"] {
+        let segs: std::collections::BTreeSet<_> = complete
+            .iter()
+            .filter(|v| v.band_id.as_deref() == Some(band))
+            .map(|v| &v.segment_id)
+            .collect();
+        assert_eq!(segs.len(), 1, "{band}: {segs:?}");
     }
     let insp = ds.inspect().unwrap();
     assert!(insp.events_by_kind.get("measurement_applied").copied().unwrap_or(0) >= 2);
