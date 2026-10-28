@@ -365,6 +365,10 @@ ANT2 with `AR` switching; about 500 visits) observed:
 - Median levels differed by antenna by 3-20 native units per band. These
   are uncalibrated readings that include each input's gain (a LoG has
   low output), so they do not rank antennas by signal-to-noise.
+- 2026-10-28, sub receiver: pan B carried the sub receiver, routed by
+  `AR$` independently of `AR`, at the same frame rate as pan A. Sharing
+  an input moved either receiver's level by up to 2.8 dB. See
+  [paired.md](paired.md#observed-on-a-k4d-r39-2026-10-28).
 
 ### Unverified on hardware
 

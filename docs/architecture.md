@@ -98,11 +98,12 @@ survey selects each main-RX input with `AR` (verified by readback) and
 measures each band on each antenna in turn. The TX antenna is never set.
 Every visit records its antenna id, revision and observed port.
 
-A later **paired** mode records simultaneously observed A/B sweeps from
+A **paired** mode records simultaneously observed A/B sweeps from
 separately configured antennas, keyed by exact frequency coverage and
 timestamps, without assuming their nominal scales are calibrated or
-their feedlines and transformers identical. The physical K4D can already
-emit A and B packets on the local LAN; no 9204 dependency is required.
+their feedlines and transformers identical. The physical K4D emits A and
+B packets on the local LAN; no 9204 dependency is required. See
+[paired.md](paired.md) for the hardware check and design.
 
 ## Rust module boundaries (workspace)
 

@@ -92,7 +92,7 @@ Capture, surveys, analysis, and reports work today, with short live
 checks on a K4D running R39. Read the
 [remaining hardware checks](docs/collection.md#unverified-on-hardware)
 before trusting unattended runs. Simultaneous main/sub antenna comparison
-is still planned.
+is in progress; see the [hardware check and design](docs/paired.md).
 
 ## Technical details
 
