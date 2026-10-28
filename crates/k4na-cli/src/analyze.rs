@@ -1,6 +1,7 @@
 //! `k4na analyze`: derived, read-only views of a data root.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -88,6 +89,13 @@ pub enum AnalyzeCmd {
     /// Floors and carriers that switch on and off together (candidate
     /// common sources).
     Groups {
+        #[command(flatten)]
+        select: Select,
+    },
+    /// Paired main/sub visits: two antennas over the same dwell, with the
+    /// antenna difference separated from the receivers' by swapping.
+    /// CSV output lists every pair.
+    Pairs {
         #[command(flatten)]
         select: Select,
     },
@@ -236,6 +244,19 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
                 }
                 Format::Csv => k4na_analysis::floor_episodes_csv(&a.floor_episodes),
                 Format::Text => episodes_text(&a),
+            };
+            select.emit(&out)?;
+        }
+        AnalyzeCmd::Pairs { select } => {
+            let a = select.analyze()?;
+            let out = match format(&select) {
+                Format::Json => json_of(
+                    &a.provenance,
+                    "pairs",
+                    serde_json::json!({ "summaries": a.pair_summaries, "pairs": a.pairs }),
+                )?,
+                Format::Csv => k4na_analysis::pairs_csv(&a.pairs),
+                Format::Text => pairs_text(&a),
             };
             select.emit(&out)?;
         }
@@ -514,6 +535,53 @@ fn families_text(a: &Analysis) -> String {
         );
     }
     s += "\nA family is a frequency pattern (harmonics of one switching or clock source are a common cause),\nnot a source identification. chance = expected families this strong from unrelated carriers.\n";
+    s
+}
+
+fn pairs_text(a: &Analysis) -> String {
+    let mut s = header(a);
+    let _ = writeln!(
+        s,
+        "{} paired visit(s) in {} band/antenna group(s)",
+        a.pairs.len(),
+        a.pair_summaries.len()
+    );
+    let opt = |v: Option<f64>| v.map_or_else(|| "-".to_owned(), |v| format!("{v:+.1}"));
+    for p in &a.pair_summaries {
+        let _ = writeln!(
+            s,
+            "\n{}: {} vs {} ({} + {} pairs, {} .. {})",
+            p.band_id,
+            p.second_antenna,
+            p.first_antenna,
+            p.pairs[0],
+            p.pairs[1],
+            utc(p.first_utc_ns),
+            utc(p.last_utc_ns)
+        );
+        let _ = writeln!(
+            s,
+            "  signal over background: antenna {} dB, sub receiver {} dB (sub-main {} / {} over {} / {} pairs)",
+            opt(p.snr_antenna_db),
+            opt(p.snr_receiver_db),
+            opt(p.snr_d_db[0]),
+            opt(p.snr_d_db[1]),
+            p.snr_pairs[0],
+            p.snr_pairs[1]
+        );
+        let _ = writeln!(
+            s,
+            "  floor (context, not a ranking): antenna {} dB, sub receiver {} dB",
+            opt(p.floor_antenna_db),
+            opt(p.floor_receiver_db)
+        );
+        if !p.flags.is_empty() {
+            let _ = writeln!(s, "  flags: {}", p.flags.join(", "));
+        }
+    }
+    s += "\nantenna = second minus first antenna; positive favors the second. Measured at the same time on\n\
+          the main and sub receivers; swapping cancels the receivers' difference. Levels are uncalibrated\n\
+          (not dBm), and a few carriers in one session are not a general antenna ranking.\n";
     s
 }
 

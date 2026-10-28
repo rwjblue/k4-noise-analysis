@@ -91,8 +91,11 @@ visits, and a persistent carrier isn't proof of local RFI.
 Capture, surveys, analysis, and reports work today, with short live
 checks on a K4D running R39. Read the
 [remaining hardware checks](docs/collection.md#unverified-on-hardware)
-before trusting unattended runs. Simultaneous main/sub antenna comparison
-is in progress; see the [hardware check and design](docs/paired.md).
+before trusting unattended runs. Paired surveys compare two antennas at
+the same time on the main and sub receivers, and `k4na analyze pairs`
+separates the antenna difference from the receivers'. They're tested
+against the simulator but haven't run on a radio yet; see the
+[hardware check and design](docs/paired.md).
 
 ## Technical details
 

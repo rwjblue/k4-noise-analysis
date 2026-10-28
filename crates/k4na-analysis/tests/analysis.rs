@@ -8,7 +8,7 @@ use std::path::Path;
 use k4na_analysis::{Filter, Params, band_hours_csv, carriers_csv, run};
 use k4na_core::aggregate::VisitStats;
 use k4na_core::config::{AntennaConfig, K4Port, Mode};
-use k4na_core::model::{SessionInfo, TileRef, VisitAntenna, VisitRecord, VisitStatus};
+use k4na_core::model::{SessionInfo, TileRef, VisitAntenna, VisitPair, VisitRecord, VisitStatus};
 use k4na_core::time::{NS_PER_HOUR, NS_PER_SEC, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::PanId;
@@ -131,6 +131,24 @@ fn write_root(root: &Path) -> u64 {
 /// As `write_root`, with `frames(hour)` accepted frames per visit over
 /// the same 4 s (75 frames = 19 fps).
 fn write_root_with(root: &Path, frames: impl Fn(i64) -> u32) -> u64 {
+    let mut store = open_store(root, vec![antenna()]);
+    let n = 6 * 12;
+    for i in 0..n {
+        let at = i as i64 * 300 * NS_PER_SEC + NS_PER_SEC;
+        let mut v = visit(i, at, VisitStatus::Complete);
+        if let Some(s) = v.stats.as_mut() {
+            s.frame_count = frames(at / NS_PER_HOUR);
+        }
+        store.write_visit(&v, &[]).unwrap();
+    }
+    store
+        .write_visit(&visit(999, 1000 * NS_PER_SEC, VisitStatus::Partial), &[])
+        .unwrap();
+    store.close(ts(6 * NS_PER_HOUR), "end").unwrap();
+    n
+}
+
+fn open_store(root: &Path, antennas: Vec<AntennaConfig>) -> Store {
     let opts = StoreOptions {
         root: root.to_owned(),
         max_total_bytes: 1 << 30,
@@ -154,26 +172,126 @@ fn write_root_with(root: &Path, frames: impl Fn(i64) -> u32) -> u64 {
         config_digest: "digest".into(),
         config_toml: String::new(),
         profile_id: Some("test".into()),
-        antennas: vec![antenna()],
+        antennas,
         receiver: "main".into(),
         firmware: vec![],
         snapshot: Default::default(),
     };
-    let (mut store, _) = Store::open(opts, Box::new(BigDisk), session, ts(0)).unwrap();
-    let n = 6 * 12;
-    for i in 0..n {
-        let at = i as i64 * 300 * NS_PER_SEC + NS_PER_SEC;
-        let mut v = visit(i, at, VisitStatus::Complete);
-        if let Some(s) = v.stats.as_mut() {
-            s.frame_count = frames(at / NS_PER_HOUR);
-        }
-        store.write_visit(&v, &[]).unwrap();
+    Store::open(opts, Box::new(BigDisk), session, ts(0)).unwrap().0
+}
+
+fn dxc() -> AntennaConfig {
+    AntennaConfig {
+        id: "dxc".into(),
+        port: K4Port::Ant2,
+        ..antenna()
     }
-    store
-        .write_visit(&visit(999, 1000 * NS_PER_SEC, VisitStatus::Partial), &[])
-        .unwrap();
+}
+
+/// One half of a paired visit. Truth: dxc has 4 dB less signal over
+/// background than rx1 and a 20 dB higher floor; the sub receiver reads
+/// 1 dB more signal over background and a 3 dB higher floor.
+fn half(n: u64, at: i64, a: &AntennaConfig, pan: PanId, peer: &AntennaConfig, orientation: u8) -> VisitRecord {
+    let sub = pan == PanId::B;
+    let floor = if a.id == "dxc" { -1100 } else { -1300 } + if sub { 30 } else { 0 };
+    let excess = if a.id == "dxc" { 160 } else { 200 } + if sub { 10 } else { 0 };
+    let mut v = visit(n, at, VisitStatus::Complete);
+    let s = v.stats.as_mut().unwrap();
+    for arr in &mut s.stats {
+        for x in arr.iter_mut() {
+            *x += floor + 1300;
+        }
+    }
+    for k in 0..6 {
+        let b = bin(14_020_000.0 + 10_000.0 * f64::from(k));
+        let level = floor + excess;
+        for (i, arr) in s.stats.iter_mut().enumerate() {
+            arr[b] = level + 5 * (i as i16 - 2);
+        }
+    }
+    let me = if sub { "B" } else { "A" };
+    let other = if sub { "A" } else { "B" };
+    v.visit_id = format!("visit-{n}-{me}");
+    v.pan = pan;
+    v.antenna = VisitAntenna::configured(a, Some(a.port));
+    v.measurement = [("verified.RG".to_string(), "RG-00".to_string())].into();
+    if sub {
+        v.measurement.insert("receiver".into(), "sub".into());
+    }
+    v.pair = Some(VisitPair {
+        pair_id: format!("pair-{n}"),
+        orientation,
+        peer_visit_id: format!("visit-{n}-{other}"),
+        peer_pan: if sub { PanId::A } else { PanId::B },
+        peer_antenna: VisitAntenna::configured(peer, Some(peer.port)),
+    });
+    v
+}
+
+fn write_paired(root: &Path, orientations: &[u8]) {
+    let (rx, dxc) = (antenna(), dxc());
+    let mut store = open_store(root, vec![rx.clone(), dxc.clone()]);
+    for (i, &o) in orientations.iter().enumerate() {
+        let at = i as i64 * 300 * NS_PER_SEC + NS_PER_SEC;
+        let (main, sub) = if o == 0 { (&rx, &dxc) } else { (&dxc, &rx) };
+        for (a, pan, peer) in [(main, PanId::A, sub), (sub, PanId::B, main)] {
+            store.write_visit(&half(i as u64, at, a, pan, peer, o), &[]).unwrap();
+        }
+    }
     store.close(ts(6 * NS_PER_HOUR), "end").unwrap();
-    n
+}
+
+#[test]
+fn swapped_pairs_separate_the_antenna_from_the_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    write_paired(&root, &[0, 1, 0, 1, 0, 1, 0, 1]);
+    let ds = DataSet::open(&root).unwrap();
+    let a = run(&ds, &Filter::default(), &Params::default(), |_, _, _| {}).unwrap();
+    assert_eq!(a.provenance.algorithm, "k4na-analysis/4");
+    assert_eq!(a.pairs.len(), 8);
+    assert!(
+        a.pairs
+            .iter()
+            .all(|p| p.carriers_matched == 6 && p.settings_differ.is_empty())
+    );
+    let [s] = a.pair_summaries.as_slice() else {
+        panic!("{:?}", a.pair_summaries)
+    };
+    assert_eq!(
+        (s.band_id.as_str(), s.first_antenna.as_str(), s.second_antenna.as_str()),
+        ("20m", "rx1", "dxc")
+    );
+    assert_eq!((s.pairs, s.snr_pairs), ([4, 4], [4, 4]));
+    assert_eq!((s.snr_antenna_db, s.snr_receiver_db), (Some(-4.0), Some(1.0)));
+    assert_eq!((s.floor_antenna_db, s.floor_receiver_db), (Some(20.0), Some(3.0)));
+    assert!(s.flags.is_empty(), "{:?}", s.flags);
+    let csv = k4na_analysis::pairs_csv(&a.pairs);
+    assert_eq!(csv.lines().count(), 9);
+    assert!(csv.lines().nth(1).unwrap().contains(",0,rx1,dxc,6,0,0,-3.0,"), "{csv}");
+
+    // An antenna filter keeps whole pairs, while other views see only
+    // that antenna's visits.
+    let f = Filter {
+        antenna: Some("dxc".into()),
+        ..Default::default()
+    };
+    let b = run(&ds, &f, &Params::default(), |_, _, _| {}).unwrap();
+    assert_eq!((b.pairs.len(), b.provenance.visits_analyzed), (8, 8));
+    assert!(b.carriers.iter().all(|c| c.antenna_id == "dxc"));
+}
+
+#[test]
+fn unswapped_pairs_are_flagged_and_not_decomposed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    write_paired(&root, &[0, 0, 0]);
+    let ds = DataSet::open(&root).unwrap();
+    let a = run(&ds, &Filter::default(), &Params::default(), |_, _, _| {}).unwrap();
+    let [s] = a.pair_summaries.as_slice() else { panic!() };
+    assert_eq!(s.snr_d_db, [Some(-3.0), None]);
+    assert_eq!((s.snr_antenna_db, s.floor_antenna_db), (None, None));
+    assert_eq!(s.flags, ["one_orientation"]);
 }
 
 #[test]

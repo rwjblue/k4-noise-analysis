@@ -491,7 +491,18 @@ fn end_to_end_against_tcp_simulator() {
     let bands: serde_json::Value = serde_json::from_slice(&out).unwrap();
     let prov = &bands["provenance"];
     assert!(prov["visits_analyzed"].as_u64().unwrap() >= 1, "{prov}");
-    assert_eq!(prov["algorithm"], "k4na-analysis/3");
+    assert_eq!(prov["algorithm"], "k4na-analysis/4");
+    // Single-receiver data has no pairs; the view says so instead of failing.
+    let out = k4na()
+        .args(["analyze", "pairs", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("0 paired visit(s)"), "{text}");
     assert!(prov["level_units"].as_str().unwrap().contains("not dBm"));
     assert!(!bands["band_hours"].as_array().unwrap().is_empty(), "{bands}");
     k4na()

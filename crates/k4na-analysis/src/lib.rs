@@ -10,6 +10,7 @@ pub mod bands;
 pub mod carriers;
 pub mod episodes;
 pub mod families;
+pub mod pairs;
 pub mod series;
 pub mod spectrum;
 pub mod timing;
@@ -27,13 +28,15 @@ pub use bands::BandHour;
 pub use carriers::Carrier;
 pub use episodes::{FloorActivity, FloorEpisode};
 pub use families::{Family, find_families};
+pub use pairs::{PairRow, PairSummary};
 pub use series::{HarmonicSeries, find_series};
 pub use spectrum::VisitSpectrum;
 pub use timing::{Feature, TimingGroup};
 
 /// Bumped whenever an algorithm or default changes its output.
 /// 2: comparability segments are split by delivered frame rate.
-pub const ALGORITHM_VERSION: &str = "k4na-analysis/3";
+/// 4: paired main/sub comparisons.
+pub const ALGORITHM_VERSION: &str = "k4na-analysis/4";
 
 /// The comparability segment analysis uses for a visit: the stored
 /// segment plus the delivered frame rate, as `<segment_id>@<n>fps` (or
@@ -111,6 +114,12 @@ pub struct Params {
     /// cleared `peak_threshold` by this much over that visit's local
     /// background (native tenths); otherwise it was masked.
     pub carrier_mask_margin: i16,
+    /// Paired visits: carriers matched on both pans needed for a pair's
+    /// signal-over-background difference, and the sub-minus-main receiver
+    /// difference (native tenths) above which receivers are flagged as not
+    /// comparable.
+    pub pair_min_carriers: usize,
+    pub pair_receiver_tolerance: i16,
 }
 
 impl Default for Params {
@@ -139,6 +148,8 @@ impl Default for Params {
             timing_min_matched_edges: 3,
             timing_max_missed: 1,
             carrier_mask_margin: 20,
+            pair_min_carriers: 3,
+            pair_receiver_tolerance: 30,
         }
     }
 }
@@ -164,6 +175,21 @@ impl Filter {
                 .is_none_or(|s| v.session_id.starts_with(s.as_str()))
             && self.since_utc_ns.is_none_or(|t| v.started_utc_ns >= t)
             && self.until_utc_ns.is_none_or(|t| v.started_utc_ns < t)
+    }
+
+    /// Like [`Self::accepts`], but an antenna filter selects a paired visit
+    /// when either pan measured it, so pairs are never split.
+    pub fn accepts_pair_half(&self, v: &k4na_store::reader::VisitRow) -> bool {
+        let Some(pair) = v.pair() else { return false };
+        let either = Filter {
+            antenna: None,
+            ..self.clone()
+        };
+        either.accepts(v)
+            && self
+                .antenna
+                .as_ref()
+                .is_none_or(|a| &v.antenna_id == a || &pair.peer_antenna.id == a)
     }
 }
 
@@ -208,6 +234,9 @@ pub struct Analysis {
     /// Operator notes (`k4na mark`) touching the analyzed span. Operator
     /// input, not measurements; nothing is inferred from them.
     pub annotations: Vec<Annotation>,
+    /// Paired main/sub visits, and their per-band antenna comparison.
+    pub pairs: Vec<PairRow>,
+    pub pair_summaries: Vec<PairSummary>,
 }
 
 /// Timing features: each band floor with its episodes, and each carrier
@@ -280,18 +309,25 @@ pub fn run(
     let mut hours = bands::BandHours::default();
     let mut carriers = carriers::Carriers::default();
     let mut floors = episodes::Floors::default();
+    let mut pairs = pairs::Pairs::default();
     let (mut analyzed, mut skipped) = (0u64, 0u64);
     let (mut first, mut last) = (None::<i64>, None::<i64>);
     let mut session_ids = BTreeSet::new();
     ds.for_each_summary(|v, stats| {
-        if !filter.accepts(v) {
+        let accepted = filter.accepts(v);
+        if !accepted && !filter.accepts_pair_half(v) {
             return Ok(());
         }
         let Some(s) = VisitSpectrum::new(v, stats) else {
-            skipped += 1;
+            skipped += u64::from(accepted);
             return Ok(());
         };
         let (m, bg) = analyze_visit(&s, params);
+        pairs.add(&s, &m, params);
+        if !accepted {
+            // The other antenna's half of a selected pair.
+            return Ok(());
+        }
         hours.add(&s, &m);
         carriers.add(&s, &m.peaks, &bg, params);
         floors.add(&s, &m);
@@ -318,6 +354,7 @@ pub fn run(
     });
     let families = find_families(&carriers, params);
     let harmonic_series = find_series(&families, &carriers, params);
+    let (pairs, pair_summaries) = pairs.finish(params);
     let (mut annotations, annotations_skipped) = ds.annotations()?;
     annotations.retain(|a| first.zip(last).is_some_and(|(lo, hi)| a.overlaps(lo, hi)));
     let name = |p: &std::path::Path| {
@@ -361,6 +398,8 @@ pub fn run(
         carriers,
         floor_activity,
         floor_episodes,
+        pairs,
+        pair_summaries,
     })
 }
 
@@ -529,6 +568,33 @@ pub fn harmonic_series_csv(rows: &[HarmonicSeries]) -> String {
                 f.chance,
             );
         }
+    }
+    s
+}
+
+pub fn pairs_csv(rows: &[PairRow]) -> String {
+    let mut s = String::from(
+        "pair_id,started_utc,band_id,orientation,main_antenna,sub_antenna,carriers_matched,carriers_main_only,carriers_sub_only,snr_sub_minus_main_db,floor_main_db,floor_sub_db,settings_differ\n",
+    );
+    let opt = |v: Option<f64>| v.map_or_else(String::new, |v| format!("{v:.1}"));
+    for r in rows {
+        let _ = writeln!(
+            s,
+            "{},{},{},{},{},{},{},{},{},{},{:.1},{:.1},{}",
+            csv_field(&r.pair_id),
+            utc(r.started_utc_ns),
+            csv_field(&r.band_id),
+            r.orientation,
+            csv_field(&r.main_antenna),
+            csv_field(&r.sub_antenna),
+            r.carriers_matched,
+            r.carriers_main_only,
+            r.carriers_sub_only,
+            opt(r.snr_sub_minus_main_db),
+            r.floor_main_db,
+            r.floor_sub_db,
+            csv_field(&r.settings_differ.join(";")),
+        );
     }
     s
 }

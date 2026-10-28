@@ -49,9 +49,10 @@ what the initial data must enable, NOT algorithms required in the v1 writer.
   signal level above background, not raw background reduction alone.
   Never subtract spectra as if both bins were independent calibrated dBm.
 
-## Implemented: `k4na-analysis/3`
+## Implemented: `k4na-analysis/4`
 
-Version 3 stops counting a masked carrier as absent: a covering visit
+Version 4 adds paired main/sub comparisons (`analyze pairs`, below); other
+outputs are unchanged from version 3. Version 3 stops counting a masked carrier as absent: a covering visit
 where a raised local background would have hidden the carrier is
 unobserved, so it leaves exposure, persistence and timing edges alone
 (see `analyze carriers` and `analyze groups`). Version 2 splits comparability segments by delivered frame rate:
@@ -301,6 +302,40 @@ signals can merge into one wide-spread cluster (check `min_hz`/`max_hz`);
 a sub-dwell burst shorter than half the dwell does not produce a p50
 peak; and levels are on the uncalibrated K4 scale (native tenths / 10),
 not dBm.
+
+### Paired visits
+
+`analyze pairs` compares two antennas measured over the same dwell on the
+main and sub receivers ([paired.md](paired.md)). For each pair whose two
+visits are complete, narrow peaks (at most `max_carrier_width_hz`) on the
+two pans are matched one to one within `carrier_tolerance_hz` (or 1.5
+bins). The pair's `d` is the median over matched carriers of sub minus
+main excess over local background; it needs at least
+`pair_min_carriers` (3) matches. Floors are compared the same way.
+
+Per band and antenna pair, `d0` and `d1` are the median `d` with the
+profile's first antenna on the main receiver and with the antennas
+swapped. The antenna difference (second minus first; positive favors the
+second) is `(d0 - d1) / 2` and the receiver difference (sub minus main)
+is `(d0 + d1) / 2`. Flags:
+
+- `one_orientation`: no swap, so antenna and receiver are confounded and
+  no antenna difference is given (the per-orientation `d` still is).
+- `receiver_difference`: the receivers differ by more than
+  `pair_receiver_tolerance` (3 dB) in signal over background, so one may
+  be limited by its own noise or set differently.
+- `settings_differ`: some pair had unequal verified receiver settings
+  (listed per pair in the CSV).
+- `few_carriers`: no pair had enough matched carriers.
+
+Carriers seen on only one pan are counted (`carriers_main_only`,
+`carriers_sub_only`) but not compared: an antenna that hears more
+carriers is better in a way the matched median does not show. The floor
+decomposition is context, not a ranking: a quieter floor can come from
+less gain as easily as from less noise. An `--antenna` filter keeps whole
+pairs here, while other views still see only that antenna's visits.
+Other views include pan B visits under their own antenna and segment;
+carriers from both receivers on one antenna share a carrier row.
 
 ## Why the capture design preserves five percentiles
 
