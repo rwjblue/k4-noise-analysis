@@ -2,7 +2,10 @@
 //!
 //! Exit codes: 0 success; 1 runtime failure (storage, CAT loss, no
 //! spectrum); 2 refused before collection (config, consent, preflight,
-//! admission); 3 stopped for operator activity (transmit or external change).
+//! admission, unresolved recovery journal); 3 stopped for operator activity
+//! (transmit or external change) or a restore conflict.
+
+mod recovery;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +20,7 @@ use k4na_collector::passive::{CatStateCache, RunSummary, poll_cat_state, run_pas
 use k4na_collector::runtime::{RunContext, StopHandle, TokioClock, stop_pair};
 use k4na_collector::spectrum::{SpectrumEvent, SpectrumOptions, SpectrumSource, StreamSpectrum};
 use k4na_collector::store_task::StoreHandle;
-use k4na_collector::survey::{SurveyReport, preflight, run_survey};
+use k4na_collector::survey::{SurveyReport, begin_journal, preflight, run_survey};
 use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::plan::SurveyPlan;
@@ -100,6 +103,12 @@ enum Cmd {
     Probe {
         #[command(flatten)]
         config: ConfigArgs,
+    },
+    /// Inspect and settle survey recovery journals: what an interrupted
+    /// survey changed and how to put it back.
+    Recovery {
+        #[command(subcommand)]
+        action: recovery::RecoveryCmd,
     },
     /// Summarize a data root without the radio (read-only).
     Inspect {
@@ -202,6 +211,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 survey(&cfg, duration, allow_retune, json).await
             }
         }
+        Cmd::Recovery { action } => recovery::run(action, json).await,
         Cmd::Inspect { data } => inspect(&data, json),
         Cmd::Replay { input } => replay(&input, json),
         Cmd::Simulate {
@@ -590,10 +600,19 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
             cfg.collection.usable_fraction,
         )
     });
+    let blocked = refuse_if_unresolved(cfg).err().map(|e| e.to_string());
+    let measurement = pre
+        .as_ref()
+        .ok()
+        .map(|p| measurement_preview(cfg, p))
+        .unwrap_or_default();
     if json {
         println!(
             "{}",
             serde_json::json!({
+                "recovery_blocked": blocked,
+                "cat_meta_mode": pre.as_ref().ok().map(|p| p.meta.as_str()),
+                "measurement": measurement,
                 "preflight": pre.as_ref().map(|p| &p.snapshot).map_err(|e| e.clone()),
                 "observed_center_hz": observed.as_ref().map(|h| h.center_hz),
                 "observed_sample_rate_hz": observed.as_ref().map(|h| h.sample_rate_hz),
@@ -604,8 +623,18 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
     } else {
         println!("dry run: GET-only; no setters were sent");
         match &pre {
-            Ok(p) => println!("preflight: OK (firmware {})", p.firmware.join(" ")),
+            Ok(p) => println!(
+                "preflight: OK (firmware {}; CAT meta-mode {})",
+                p.firmware.join(" "),
+                p.meta
+            ),
             Err(e) => println!("preflight: {e}"),
+        }
+        if let Some(b) = &blocked {
+            println!("recovery: {b}");
+        }
+        for (antenna, line) in &measurement {
+            println!("measurement on the current band, antenna {antenna}: {line}");
         }
         match &observed {
             Some(h) => println!(
@@ -649,7 +678,7 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
             }
         }
     }
-    Ok(if pre.is_ok() && observed.is_some() {
+    Ok(if pre.is_ok() && observed.is_some() && blocked.is_none() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(2)
@@ -661,6 +690,7 @@ async fn survey(cfg: &Config, duration: Duration, allow_retune: bool, json: bool
         bail!(refuse("config collection.mode is not \"survey\""));
     }
     let consent = RetuneConsent::new(cfg.collection.allow_retune, allow_retune).map_err(refuse)?;
+    refuse_if_unresolved(cfg)?;
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::real());
     let session_id = k4na_collector::visit::new_id();
     let (cat_conn, pan_conn) = connectors(cfg);
@@ -679,12 +709,23 @@ async fn survey(cfg: &Config, duration: Duration, allow_retune: bool, json: bool
         pre.snapshot.clone(),
         duration,
     )?;
+    // Durable before any change; refuses if another journal appeared.
+    let mut txn = match begin_journal(cfg, &session_id, &pre, clock.clone()) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = store.close(clock.now(), "recovery journal refused").await;
+            let _ = writer.join();
+            bail!(refuse(e.to_string()));
+        }
+    };
     let (stop_handle, stop) = stop_pair();
     install_signals(stop_handle);
     let mut spectrum = StreamSpectrum::new(pan_conn, SpectrumOptions::from_config(&cfg.radio), clock.clone());
     eprintln!(
-        "AUTHORIZED SURVEY {session_id} for {}: retunes VFO A; stops on transmit or any operator change",
-        humantime::format_duration(duration)
+        "AUTHORIZED SURVEY {session_id} for {}: retunes VFO A and applies measurement settings; stops on \
+         transmit or any operator change; journal {}",
+        humantime::format_duration(duration),
+        txn.path().map_or("?".to_owned(), |p| p.display().to_string())
     );
     let ctx = RunContext {
         cfg,
@@ -693,7 +734,8 @@ async fn survey(cfg: &Config, duration: Duration, allow_retune: bool, json: bool
         session_id,
         stop,
     };
-    let report = run_survey(ctx, &mut spectrum, &mut cat, pre, duration).await?;
+    let report = run_survey(ctx, &mut spectrum, &mut cat, pre, &mut txn, duration).await?;
+    drop(txn);
     let status = store.close(clock.now(), &report.summary.end_reason).await;
     let _ = writer.join();
     print_summary(&report.summary, Some(&report), json);
@@ -734,8 +776,66 @@ fn print_summary(s: &RunSummary, survey: Option<&SurveyReport>, json: bool) {
         if let Some(s) = r.last_cycle_s {
             println!("cadence: last cycle {s:.0} s; {:.0} s idle between cycles", r.idle_s);
         }
+        if r.measurement_skips > 0 {
+            println!(
+                "measurement: {} tile(s) skipped (settings could not be applied)",
+                r.measurement_skips
+            );
+        }
         println!("radio: {}", r.restore);
+        if !r.manual.is_empty() {
+            println!(
+                "RADIO NOT FULLY RESTORED ({}); journal {}",
+                r.restore_outcome,
+                r.journal.as_deref().unwrap_or("?")
+            );
+            for m in &r.manual {
+                println!("  manual: {m}");
+            }
+            println!("  see `k4na recovery show/restore/acknowledge`");
+        }
     }
+}
+
+/// What each survey antenna's measurement settings would change on the
+/// current band, judged from the GET-only preflight readback.
+fn measurement_preview(cfg: &Config, pre: &k4na_collector::survey::Preflight) -> Vec<(String, String)> {
+    let Some(profile) = cfg.profile.as_ref() else {
+        return Vec::new();
+    };
+    let band = pre.readback.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
+    profile
+        .antennas
+        .iter()
+        .map(|a| {
+            let settings = profile.measurement.resolve(band, a);
+            let line = match k4na_collector::measure::plan(pre.meta, &settings, band, &pre.readback) {
+                Ok(c) if c.is_empty() => format!("no changes ({settings})"),
+                Ok(c) => c.iter().map(|c| c.setter.wire()).collect::<Vec<_>>().join(" "),
+                Err(why) => format!("tiles would be skipped: {why}"),
+            };
+            (a.clone(), line)
+        })
+        .collect()
+}
+
+/// New surveys wait until earlier changes are resolved or acknowledged.
+fn refuse_if_unresolved(cfg: &Config) -> Result<()> {
+    let dir = cfg.storage.recovery_dir();
+    let blocking: Vec<String> = k4na_collector::recovery::list(&dir)?
+        .into_iter()
+        .filter(|j| j.status.blocks_surveys())
+        .map(|j| format!("{} ({})", j.session_id, j.status.as_str()))
+        .collect();
+    if blocking.is_empty() {
+        return Ok(());
+    }
+    bail!(refuse(format!(
+        "unresolved survey recovery journal(s) in {}: {}. Run `k4na recovery show <session>`, then `recovery \
+         restore` or `recovery acknowledge`",
+        dir.display(),
+        blocking.join(", ")
+    )))
 }
 
 fn inspect(data: &Path, json: bool) -> Result<ExitCode> {

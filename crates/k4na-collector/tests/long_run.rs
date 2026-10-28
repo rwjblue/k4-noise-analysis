@@ -14,7 +14,7 @@ use k4na_collector::cat::{ControlCat, RetuneConsent};
 use k4na_collector::net::Connector;
 use k4na_collector::runtime::stop_pair;
 use k4na_collector::spectrum::{SpectrumOptions, StreamSpectrum};
-use k4na_collector::survey::{preflight, run_survey};
+use k4na_collector::survey::{begin_journal, preflight, run_survey};
 use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::time::{Clock, NS_PER_SEC};
@@ -107,6 +107,8 @@ async fn twenty_four_hour_survey_stays_under_the_cap() {
     let pre = preflight(&mut cat, &cfg).await.unwrap();
     let sid = "0190cccc-0000-7000-8000-000000000001";
     let store = open_store(&cfg, sid, Mode::Survey, &clock);
+    let mut txn = begin_journal(&cfg, sid, &pre, clock.clone()).unwrap();
+    let journal = txn.path().unwrap().to_owned();
 
     // Faults: drop the spectrum stream every 3 h; sample disk usage.
     let peak = Arc::new(AtomicU64::new(0));
@@ -141,10 +143,19 @@ async fn twenty_four_hour_survey_stays_under_the_cap() {
         &mut spec,
         &mut cat,
         pre,
+        &mut txn,
         Duration::from_secs(hours * 3600),
     )
     .await
     .unwrap();
+    drop(txn);
+    let journal_bytes = std::fs::metadata(&journal).unwrap().len();
+    eprintln!("recovery journal: {journal_bytes} bytes");
+    // Outside the quotas, so it must stay bounded by compaction.
+    assert!(
+        journal_bytes <= k4na_collector::recovery::COMPACT_BYTES + 64 * 1024,
+        "journal grew to {journal_bytes} bytes"
+    );
     let end = clock.now();
     let status = store.close(end, &report.summary.end_reason).await.unwrap();
 

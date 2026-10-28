@@ -236,4 +236,111 @@ fn end_to_end_against_tcp_simulator() {
     let insp: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(insp["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(insp["dirty_shards"], 0);
+
+    let out = k4na()
+        .args(["--json", "recovery", "list", "--config"])
+        .arg(&survey)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let list: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(list[0]["status"], "resolved", "{list}");
+}
+
+/// A survey process killed mid-run (SIGKILL: no cleanup) blocks new
+/// surveys until `recovery restore` puts the radio back.
+#[test]
+fn a_killed_survey_is_recovered_with_the_cli() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let radio = k4na_sim::SimRadio::new(20);
+    let sim = rt
+        .block_on(k4na_sim::TcpSim::start(radio.clone(), "127.0.0.1", 0, 0))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(dir.path(), "survey", sim.cat_addr.port(), sim.pan_addr.port());
+    let before = radio.model();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("k4na"))
+        .args(["survey", "--allow-retune", "--duration", "10m", "--config"])
+        .arg(&cfg)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while radio.model().fa == before.fa {
+        assert!(std::time::Instant::now() < deadline, "the survey never retuned");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_ne!(radio.model().fa, before.fa, "left retuned by the kill");
+
+    // New surveys are refused, before any network use.
+    k4na()
+        .args(["survey", "--allow-retune", "--duration", "1m", "--config"])
+        .arg(&cfg)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unresolved survey recovery journal"));
+    k4na()
+        .args(["survey", "--dry-run", "--duration", "1m", "--config"])
+        .arg(&cfg)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("recovery: unresolved"));
+
+    let out = k4na()
+        .args(["--json", "recovery", "list", "--config"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let list: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(list[0]["status"], "pending", "{list}");
+    let sid = list[0]["session_id"].as_str().unwrap().to_owned();
+    k4na()
+        .args(["recovery", "show", &sid[..13], "--config"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pending: ").and(predicate::str::contains("manual: ")));
+
+    let setters = radio.setters_received().len();
+    k4na()
+        .args(["recovery", "restore", &sid, "--dry-run", "--config"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would_restore"));
+    assert_eq!(radio.setters_received().len(), setters, "the dry run is GET-only");
+    k4na()
+        .args(["recovery", "restore", &sid, "--config"])
+        .arg(&cfg)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--allow-retune"));
+    assert_eq!(radio.setters_received().len(), setters);
+
+    k4na()
+        .args(["recovery", "restore", &sid, "--allow-retune", "--config"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("restore complete"));
+    let m = radio.model();
+    assert_eq!(
+        (m.bn, m.fa, m.span, m.fixed),
+        (before.bn, before.fa, before.span, before.fixed)
+    );
+    assert!(radio.forbidden_commands().is_empty());
+    k4na()
+        .args(["recovery", "list", "--config"])
+        .arg(&cfg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resolved").and(predicate::str::contains("BLOCKS").not()));
 }

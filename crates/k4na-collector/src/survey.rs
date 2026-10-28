@@ -1,11 +1,19 @@
 //! Opt-in survey: retunes VFO A across configured bands and dwells on
 //! tiles whose coverage is verified from spectrum frame headers.
 //!
-//! Safety contract (docs/collection.md):
+//! Safety contract (docs/collection.md, docs/recovery.md):
 //! * Requires a [`ControlCat`](crate::cat::ControlCat), which only exists
-//!   with both config and CLI consent. Only `BN`, `FA`, `#SPN`, `#FXT` and
-//!   (with `collection.allow_rx_antenna_switch`) `AR` can be sent. The TX
-//!   antenna is never changed.
+//!   with both config and CLI consent. Only `BN`, `FA`, `#SPN`, `#FXT`,
+//!   (with `collection.allow_rx_antenna_switch`) `AR`, and the receiver
+//!   measurement settings of docs/measurement.md can be sent. The TX
+//!   antenna and the CAT meta-mode are never changed.
+//! * Every change is a journaled transaction step: the scope's state as
+//!   found and the intended change are durable before a setter is sent;
+//!   the verified readback follows. A setting whose found value the
+//!   collector could not put back is never changed.
+//! * Profile measurement settings are applied and verified per band and
+//!   antenna before a visit; a context that cannot be set as configured is
+//!   skipped unchanged.
 //! * Every visit is attributed to a profile antenna whose port matches the
 //!   `AR`/`AN` readback. The input is re-read after every band change
 //!   (the K4 may recall a per-band antenna); a band on the wrong input is
@@ -18,9 +26,10 @@
 //!   becomes the baseline. Any later difference, any transmit, or an
 //!   unreadable transmit state is operator activity: the survey stops and
 //!   sends no further setters. Resuming requires a new run.
-//! * Lost CAT is treated as unknown radio state: no retune, no restore.
-//! * On a clean end the original state is restored only if the radio still
-//!   matches what the collector last set.
+//! * Lost CAT is treated as unknown radio state: no retune, no restore;
+//!   the journal stays pending for `k4na recovery`.
+//! * On a clean end the shared restore engine puts every changed field
+//!   back if it still holds the collector's value, and leaves others.
 //! * Cycles start at most every `min_cycle_ms`; between cycles the survey
 //!   holds the last tile without retuning and keeps polling the interlock.
 
@@ -31,6 +40,7 @@ use k4na_core::Config;
 use k4na_core::aggregate::PushOutcome;
 use k4na_core::band::k4_band_number;
 use k4na_core::config::{AntennaConfig, K4Port, SurveyProfile};
+use k4na_core::measure::{MeasurementSettings, band_label};
 use k4na_core::model::{Event, EventKind, RadioState, TileRef, VisitAntenna, VisitStatus};
 use k4na_core::plan::{SurveyPlan, Tile};
 use k4na_core::time::{Clock, Timestamp};
@@ -38,15 +48,27 @@ use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::{BIN_COUNT, DecoderDiagnostics, PanId};
 
 use crate::cat::{CatControl, CatError, CatQuery, Query, Readback, RxInput, Setter};
+use crate::measure::{self, MetaMode, expected_readback, setter_for};
 use crate::passive::{RunError, RunSummary};
+use crate::recovery::{self, Change, Decision, Entry, JournalError, Outcome, Purpose, Scope, Transaction};
 use crate::runtime::{RunContext, Stop};
 use crate::spectrum::{ReceivedFrame, SpectrumEvent, SpectrumSource};
 use crate::store_task::StoreHandle;
 use crate::visit::{RawSampler, VisitBuilder};
 
 /// State fields that must not change except through the collector's own
-/// setters.
-pub const WATCH: [Query; 15] = [
+/// setters, including the receiver measurement settings and the CAT
+/// meta-mode (whose change would alter readback formats).
+pub const WATCH: [Query; 24] = [
+    Query::Identify,
+    Query::Preamp,
+    Query::Attenuator,
+    Query::RfGain,
+    Query::Agc,
+    Query::NoiseBlanker,
+    Query::NoiseReduction,
+    Query::PanNoiseBlanker,
+    Query::Averaging,
     Query::VfoA,
     Query::VfoB,
     Query::Band,
@@ -98,6 +120,7 @@ pub struct Preflight {
     pub readback: Readback,
     pub snapshot: RadioState,
     pub firmware: Vec<String>,
+    pub meta: MetaMode,
 }
 
 /// Reads state with GET queries only and decides whether a survey may
@@ -145,6 +168,13 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
     if cfg.radio.require_firmware_readback && rb.revisions.is_empty() {
         problems.push("firmware revisions (RV) were not read back".to_owned());
     }
+    let meta = MetaMode::from_readback(&rb);
+    if meta.is_none() {
+        problems.push(format!(
+            "the CAT meta-mode (K4) reads {:?}, so readback formats are unknown",
+            rb.raw(Query::Identify)
+        ));
+    }
     if !problems.is_empty() {
         return Err(format!("survey refused before any change: {}", problems.join("; ")));
     }
@@ -152,7 +182,29 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
         snapshot: rb.to_state(&queries),
         firmware: rb.revisions.clone(),
         readback: rb,
+        meta: meta.unwrap_or(MetaMode::Basic),
     })
+}
+
+/// Starts the survey's recovery journal with the preflight readback as the
+/// original state. Refuses while an earlier journal is unresolved.
+pub fn begin_journal(
+    cfg: &Config,
+    session_id: &str,
+    preflight: &Preflight,
+    clock: Arc<dyn Clock>,
+) -> Result<Transaction, JournalError> {
+    Transaction::begin(
+        &cfg.storage.recovery_dir(),
+        Entry::Begin {
+            session_id: session_id.to_owned(),
+            profile: cfg.profile.as_ref().map(|p| p.id.clone()),
+            program_version: env!("CARGO_PKG_VERSION").to_owned(),
+            meta_mode: preflight.meta,
+            original: preflight.readback.to_map(),
+        },
+        clock,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,12 +219,20 @@ enum Halt {
     Storage(String),
     /// Spectrum unusable for verification: restore if safe.
     NoSpectrum(String),
+    /// The recovery journal could not be written: no further change may be
+    /// made, so no restore either.
+    Journal(String),
 }
 
 impl Halt {
     fn reason(&self) -> &str {
         match self {
-            Halt::Stop(r) | Halt::Conflict(r) | Halt::CatLost(r) | Halt::Storage(r) | Halt::NoSpectrum(r) => r,
+            Halt::Stop(r)
+            | Halt::Conflict(r)
+            | Halt::CatLost(r)
+            | Halt::Storage(r)
+            | Halt::NoSpectrum(r)
+            | Halt::Journal(r) => r,
         }
     }
 
@@ -189,6 +249,12 @@ impl From<CatError> for Halt {
             CatError::Unsafe(_) => Halt::Conflict(format!("collector {e}; nothing was sent")),
             _ => Halt::CatLost(format!("CAT failed ({e}); radio state is unknown")),
         }
+    }
+}
+
+impl From<JournalError> for Halt {
+    fn from(e: JournalError) -> Self {
+        Halt::Journal(format!("{e}; no further change was sent"))
     }
 }
 
@@ -221,6 +287,13 @@ pub struct SurveyReport {
     pub idle_s: f64,
     /// Tiles skipped because the RX input was not the wanted antenna.
     pub antenna_skips: u64,
+    /// Tiles skipped because measurement settings could not be applied.
+    pub measurement_skips: u64,
+    /// `complete`, `partial`, `unsupported`, `conflict` or `not_restored`.
+    pub restore_outcome: String,
+    /// Manual steps when restoration was not complete.
+    pub manual: Vec<String>,
+    pub journal: Option<String>,
 }
 
 struct Survey<'a, S, C> {
@@ -228,9 +301,9 @@ struct Survey<'a, S, C> {
     profile: &'a SurveyProfile,
     /// Profile antennas in survey order.
     antennas: Vec<AntennaConfig>,
-    /// The current band's own settings, as found when the survey arrived
-    /// on it; put back before leaving so per-band memories are unchanged.
-    band_found: Option<BandMemory>,
+    /// The recovery journal: what was found and changed, per scope.
+    txn: &'a mut Transaction,
+    meta: MetaMode,
     /// (antenna index, tile index) in visiting order.
     schedule: Vec<(usize, usize)>,
     cycle_started: tokio::time::Instant,
@@ -242,7 +315,6 @@ struct Survey<'a, S, C> {
     spectrum: &'a mut S,
     cat: &'a mut C,
     pan: PanId,
-    original: Readback,
     baseline: Readback,
     offset_hz: i64,
     plan: Option<SurveyPlan>,
@@ -252,66 +324,6 @@ struct Survey<'a, S, C> {
     spectrum_down_since: Option<Timestamp>,
     last_tick: tokio::time::Instant,
     report: SurveyReport,
-}
-
-/// Per-band settings the K4 recalls on `BN` and the survey may change.
-/// The K4D was observed recalling `#SPN` (and the pan's packet rate) per
-/// band; `FA` follows the band stack and `AR` may be per band.
-#[derive(Debug, Clone)]
-struct BandMemory {
-    fa: Option<u64>,
-    span: Option<u32>,
-    fixed: Option<bool>,
-    rx_input: Option<String>,
-}
-
-impl BandMemory {
-    fn of(rb: &Readback) -> Self {
-        Self {
-            fa: rb.u64(Query::VfoA),
-            span: rb.u64(Query::Span).and_then(|s| u32::try_from(s).ok()),
-            fixed: rb.flag(Query::FixedTune),
-            rx_input: rb.raw(Query::RxAntenna).map(str::to_owned),
-        }
-    }
-
-    /// Setters that put this memory back, given the current readback, and
-    /// the values that cannot be sent (left as the survey set them).
-    fn put_back(&self, now: &Readback) -> (Vec<Setter>, Vec<String>) {
-        let (wanted, mut unsettable) = self.wanted(now);
-        let (setters, unsendable): (Vec<Setter>, Vec<Setter>) = wanted.into_iter().partition(|s| s.is_sendable());
-        unsettable.extend(unsendable.into_iter().map(|s| s.wire()));
-        (setters, unsettable)
-    }
-
-    fn wanted(&self, now: &Readback) -> (Vec<Setter>, Vec<String>) {
-        let mut setters = Vec::new();
-        let mut unsettable = Vec::new();
-        if let Some(fa) = self.fa
-            && now.u64(Query::VfoA) != Some(fa)
-        {
-            setters.push(Setter::VfoA(fa));
-        }
-        if let Some(span) = self.span
-            && now.u64(Query::Span) != Some(u64::from(span))
-        {
-            setters.push(Setter::Span(span));
-        }
-        if let Some(fixed) = self.fixed
-            && now.flag(Query::FixedTune) != Some(fixed)
-        {
-            setters.push(Setter::FixedTune(fixed));
-        }
-        if let Some(found) = &self.rx_input
-            && now.raw(Query::RxAntenna) != Some(found.as_str())
-        {
-            match RxInput::from_readback(found) {
-                Some(i) => setters.push(Setter::RxInput(i)),
-                None => unsettable.push(format!("AR{found}")),
-            }
-        }
-        (setters, unsettable)
-    }
 }
 
 /// Outcome of settling on a tuned frequency.
@@ -368,10 +380,83 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         Ok(rb)
     }
 
-    /// Checks the interlock, sends setters, reads back and verifies them,
-    /// and adopts the readback as the new baseline.
-    async fn apply(&mut self, setters: &[Setter]) -> Step<()> {
+    fn band_now(&self) -> Step<u8> {
+        self.baseline
+            .u64(Query::Band)
+            .and_then(|b| u8::try_from(b).ok())
+            .ok_or_else(|| Halt::Conflict("band (BN) unreadable".into()))
+    }
+
+    /// The scope a setter changes, from the current baseline.
+    fn scope_of(&self, s: Setter) -> Step<Scope> {
+        Ok(match s {
+            Setter::Band(_) => Scope::Session,
+            Setter::VfoA(_) | Setter::Span(_) | Setter::FixedTune(_) | Setter::RxInput(_) => {
+                Scope::Band(self.band_now()?)
+            }
+            Setter::Receiver(_) => Scope::Context(self.band_now()?, self.input_now()?),
+        })
+    }
+
+    fn input_now(&self) -> Step<String> {
+        self.baseline
+            .raw(Query::RxAntenna)
+            .map(str::to_owned)
+            .ok_or_else(|| Halt::Conflict("main RX input (AR) unreadable".into()))
+    }
+
+    fn dirty(&self, scope: &Scope, field: &str) -> bool {
+        self.txn
+            .ledger()
+            .obligation(scope, field)
+            .is_some_and(recovery::Obligation::dirty)
+    }
+
+    /// Makes durable, before anything is sent: each touched scope's state
+    /// as found (on the first change of a field there) and the intended
+    /// changes. Refuses a change whose found value could not be put back.
+    fn journal_intent(&mut self, purpose: Purpose, setters: &[Setter]) -> Step<()> {
+        let mut changes = Vec::new();
+        for s in setters {
+            let scope = self.scope_of(*s)?;
+            let q = s.query();
+            let field = q.prefix();
+            if !self.dirty(&scope, field) {
+                if purpose == Purpose::Survey
+                    && let Some(found) = self.baseline.raw(q)
+                    && setter_for(q, self.meta, found).is_none()
+                {
+                    return Err(Halt::Conflict(format!(
+                        "refusing {}: the found {field}{found} could not be put back; nothing was sent",
+                        s.wire()
+                    )));
+                }
+                let values = recovery::fields(&scope)
+                    .into_iter()
+                    .filter_map(|f| self.baseline.raw(f).map(|v| (f.prefix().to_owned(), v.to_owned())))
+                    .collect();
+                self.txn.record(Entry::Capture {
+                    scope: scope.clone(),
+                    values,
+                })?;
+            }
+            changes.push(Change {
+                scope,
+                field: field.to_owned(),
+                from: self.baseline.raw(q).map(str::to_owned),
+                to: expected_readback(*s),
+                wire: s.wire(),
+            });
+        }
+        self.txn.record(Entry::Intent { purpose, changes })?;
+        Ok(())
+    }
+
+    /// Checks the interlock, journals, sends setters, reads back and
+    /// verifies them, and adopts the readback as the new baseline.
+    async fn apply(&mut self, setters: &[Setter], purpose: Purpose) -> Step<()> {
         self.check().await?;
+        self.journal_intent(purpose, setters)?;
         for s in setters {
             self.cat.set(*s).await?;
         }
@@ -390,7 +475,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             let ok = match *s {
                 Setter::Band(n) => {
                     // A band change recalls that band's memory: mode,
-                    // antennas and pan span/track mode (observed on a K4D).
+                    // antennas and pan span/track mode (observed on a K4D)
+                    // and possibly receiver settings (unverified).
                     may_change.extend([
                         Query::Band,
                         Query::Mode,
@@ -400,10 +486,13 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                         Query::Span,
                         Query::FixedTune,
                     ]);
+                    may_change.extend(measure::KEYS);
                     rb.u64(Query::Band) == Some(u64::from(n))
                 }
                 Setter::RxInput(i) => {
+                    // Receiver settings may be stored per RX input.
                     may_change.push(Query::RxAntenna);
+                    may_change.extend(measure::KEYS);
                     rb.u64(Query::RxAntenna) == Some(u64::from(i.value()))
                 }
                 Setter::VfoA(hz) => rb.u64(Query::VfoA) == Some(hz),
@@ -418,8 +507,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 Setter::Receiver(_) => {
                     let q = s.query();
                     may_change.push(q);
-                    rb.raw(q).map(|r| crate::measure::norm(q, r))
-                        == Some(crate::measure::norm(q, &crate::measure::expected_readback(*s)))
+                    rb.raw(q).map(|r| measure::norm(q, r)) == Some(measure::norm(q, &expected_readback(*s)))
                 }
             };
             if !ok {
@@ -430,11 +518,66 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         problems.extend(diff(&self.baseline, &rb, &others));
         if !problems.is_empty() {
             let msg = format!("readback disagrees after retune: {}", problems.join(", "));
+            // The intent stays in flight, so recovery accepts either value.
+            let _ = self.txn.record(Entry::Note {
+                message: format!("{msg}; readback {:?}", rb.to_map()),
+            });
             self.record(self.event(EventKind::ReadbackMismatch, &msg)).await?;
             return Err(Halt::Conflict(msg));
         }
+        self.txn.record(Entry::Verified { state: rb.to_map() })?;
         self.baseline = rb;
         Ok(())
+    }
+
+    /// Puts `scope`'s changed fields back to what was found, verified.
+    /// Fields that cannot be put back are reported and stay pending in the
+    /// journal (the survey's end restore and `k4na recovery` see them).
+    async fn put_back(&mut self, scope: &Scope) -> Step<String> {
+        let decisions = recovery::decide(self.txn.ledger(), scope, &self.baseline, false);
+        let mut back = Vec::new();
+        let mut setters = Vec::new();
+        for d in decisions {
+            match d {
+                Decision::Clean { field } => back.push(field),
+                Decision::Restore { field, setter } => {
+                    back.push(field);
+                    setters.push(setter);
+                }
+                Decision::Unsupported { field } => {
+                    let msg = format!(
+                        "{}'s found {field} cannot be sent by the collector; left as the survey set it",
+                        scope.describe()
+                    );
+                    let _ = self.record(self.event(EventKind::Warning, msg)).await;
+                }
+                Decision::Conflict { field, current } => {
+                    let msg = format!(
+                        "{}'s {field} reads {current}, which the collector did not set; not put back",
+                        scope.describe()
+                    );
+                    let _ = self.record(self.event(EventKind::Warning, msg)).await;
+                }
+                Decision::Unreadable { field } => {
+                    let msg = format!("{}'s {field} is unreadable; not put back", scope.describe());
+                    let _ = self.record(self.event(EventKind::Warning, msg)).await;
+                }
+            }
+        }
+        let wire: String = setters.iter().map(|s| s.wire()).collect();
+        if !setters.is_empty() {
+            self.apply(&setters, Purpose::PutBack).await?;
+            let msg = format!("put back {}'s own settings: {wire}", scope.describe());
+            // Best effort: a storage stop must not prevent restoring.
+            let _ = self.record(self.event(EventKind::StateChanged, msg)).await;
+        }
+        if !back.is_empty() {
+            self.txn.record(Entry::Restored {
+                scope: scope.clone(),
+                fields: back,
+            })?;
+        }
+        Ok(wire)
     }
 
     /// Track mode and the profile's span for the current band, from the
@@ -456,10 +599,21 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         if let Some(span) = self.profile.requested_pan_span_hz
             && self.baseline.u64(Query::Span).is_some()
             && self.baseline.u64(Query::Span) != Some(u64::from(span))
+            && self.span_restorable()?
         {
             setup.push(Setter::Span(span));
         }
         Ok(setup)
+    }
+
+    /// Whether the band's span may be changed: it already was (and so was
+    /// found restorable), or the found span has a whitelisted setter.
+    fn span_restorable(&self) -> Step<bool> {
+        Ok(self.dirty(&Scope::Band(self.band_now()?), "#SPN")
+            || self
+                .baseline
+                .raw(Query::Span)
+                .is_some_and(|f| setter_for(Query::Span, self.meta, f).is_some()))
     }
 
     /// Tunes so the pan is expected to center on `center_hz`. A band
@@ -471,12 +625,19 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             && self.baseline.u64(Query::Band) != Some(u64::from(n))
         {
             self.leave_band().await?;
-            self.apply(&[Setter::Band(n)]).await?;
-            self.band_found = Some(BandMemory::of(&self.baseline));
+            self.apply(&[Setter::Band(n)], Purpose::Survey).await?;
+            if self.profile.requested_pan_span_hz.is_some() && !self.span_restorable()? {
+                let msg = format!(
+                    "band {} recalled #SPN{}, which the collector cannot put back; surveying at that span",
+                    self.baseline.raw(Query::Band).unwrap_or("?"),
+                    self.baseline.raw(Query::Span).unwrap_or("?")
+                );
+                self.record(self.event(EventKind::Warning, msg)).await?;
+            }
         }
         let mut setters = self.pan_setup()?;
         setters.push(Setter::VfoA(fa));
-        self.apply(&setters).await?;
+        self.apply(&setters, Purpose::Survey).await?;
         Ok(fa)
     }
 
@@ -751,8 +912,25 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 .await?;
             return Ok(false);
         }
+        // The band's found input must be one the collector can put back.
+        let band_scope = Scope::Band(self.band_now()?);
+        let current = self.input_now()?;
+        if !self.dirty(&band_scope, "AR") && setter_for(Query::RxAntenna, self.meta, &current).is_none() {
+            let msg = format!(
+                "main RX input is AR{current}, which the collector cannot select again afterwards; antenna {} \
+                 tile skipped",
+                a.id
+            );
+            self.report.antenna_skips += 1;
+            self.record(self.event(EventKind::AntennaMismatch, msg).band(band, tile))
+                .await?;
+            return Ok(false);
+        }
+        // Receiver settings may be stored per input: put this input's back
+        // before leaving it.
+        self.put_back(&Scope::Context(self.band_now()?, current)).await?;
         let setter = Setter::RxInput(RxInput::for_port(a.port));
-        self.apply(&[setter]).await?;
+        self.apply(&[setter], Purpose::Survey).await?;
         if self.observed_port() != Some(a.port) {
             let msg = format!("{} did not select port {}", setter.wire(), a.port);
             self.record(self.event(EventKind::ReadbackMismatch, &msg)).await?;
@@ -769,27 +947,59 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         Ok(true)
     }
 
-    /// Puts back the current band's own `FA`/`#SPN`/`#FXT`/`AR` as found,
-    /// so the radio's per-band memory is unchanged. Called before leaving a
-    /// band, before idling and before restoring. Returns the setters sent.
+    /// Puts back the current RX input's receiver settings, then the band's
+    /// own `FA`/`#SPN`/`#FXT`/`AR` as found, so the radio's memories are
+    /// unchanged. Called before leaving a band and before idling.
     async fn leave_band(&mut self) -> Step<String> {
-        let Some(found) = self.band_found.clone() else {
-            return Ok(String::new());
-        };
-        let (setters, unsettable) = found.put_back(&self.baseline);
-        let band = self.baseline.raw(Query::Band).unwrap_or("?").to_owned();
-        let wire: String = setters.iter().map(|s| s.wire()).collect();
-        if !setters.is_empty() {
-            self.apply(&setters).await?;
-            let msg = format!("put back band {band}'s own settings: {wire}");
-            // Best effort: a storage stop must not prevent restoring.
-            let _ = self.record(self.event(EventKind::StateChanged, msg)).await;
-        }
-        for s in unsettable {
-            let msg = format!("band {band}'s own {s} cannot be sent by the collector; left as the survey set it");
-            let _ = self.record(self.event(EventKind::Warning, msg)).await;
-        }
+        let band = self.band_now()?;
+        let mut wire = self.put_back(&Scope::Context(band, self.input_now()?)).await?;
+        wire.push_str(&self.put_back(&Scope::Band(band)).await?);
         Ok(wire)
+    }
+
+    /// Applies and verifies the profile's measurement settings for antenna
+    /// `a` on the current band. `None` (nothing changed) when this context
+    /// cannot be measured as configured.
+    async fn apply_measurement(
+        &mut self,
+        a: &AntennaConfig,
+        band: Option<&str>,
+        tile: Option<&str>,
+    ) -> Step<Option<MeasurementSettings>> {
+        let k4_band = self.baseline.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
+        let settings = self.profile.measurement.resolve(k4_band, &a.id);
+        match measure::plan(self.meta, &settings, k4_band, &self.baseline) {
+            Ok(changes) if changes.is_empty() => Ok(Some(settings)),
+            Ok(changes) => {
+                let setters: Vec<Setter> = changes.iter().map(|c| c.setter).collect();
+                self.apply(&setters, Purpose::Survey).await?;
+                let msg = format!(
+                    "measurement settings for {} on {}: {}",
+                    a.id,
+                    band_label(k4_band),
+                    changes
+                        .iter()
+                        .map(|c| format!("{}{} -> {}", c.query.prefix(), c.found, c.target))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                self.record(self.event(EventKind::MeasurementApplied, msg).band(band, tile))
+                    .await?;
+                Ok(Some(settings))
+            }
+            Err(why) => {
+                self.report.measurement_skips += 1;
+                let msg = format!(
+                    "antenna {} on {} cannot be measured as configured ({settings}): {why}; tile skipped, nothing \
+                     changed",
+                    a.id,
+                    band_label(k4_band)
+                );
+                self.record(self.event(EventKind::MeasurementSkipped, msg).band(band, tile))
+                    .await?;
+                Ok(None)
+            }
+        }
     }
 
     /// Tunes for a center, selects the antenna and settles; up to
@@ -802,13 +1012,11 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         antenna: Option<&AntennaConfig>,
         band: Option<&str>,
         tile: Option<&str>,
-    ) -> Step<Option<(u64, Settled)>> {
+    ) -> Step<Option<(u64, Settled, MeasurementSettings)>> {
         let mut fa = self.tune(center_hz).await?;
-        if let Some(a) = antenna
-            && !self.select_antenna(a, band, tile).await?
-        {
+        let Some(settings) = self.prepare_context(antenna, band, tile).await? else {
             return Ok(None);
-        }
+        };
         let mut settled = self.settle().await?;
         let mut corrections = 0;
         while let Some(g) = settled.geometry {
@@ -827,9 +1035,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             self.record(self.event(EventKind::RetuneCorrection, msg).band(band, tile))
                 .await?;
             fa = self.tune(center_hz).await?;
-            if let Some(a) = antenna
-                && !self.select_antenna(a, band, tile).await?
-            {
+            if self.prepare_context(antenna, band, tile).await?.is_none() {
                 return Ok(None);
             }
             let again = self.settle().await?;
@@ -838,7 +1044,25 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 discarded: settled.discarded + again.discarded,
             };
         }
-        Ok(Some((fa, settled)))
+        Ok(Some((fa, settled, settings)))
+    }
+
+    /// Selects the antenna and applies its measurement settings. `None`
+    /// when the tile must be skipped. Without an antenna (the geometry
+    /// probe, which is not stored) the radio is left as found.
+    async fn prepare_context(
+        &mut self,
+        antenna: Option<&AntennaConfig>,
+        band: Option<&str>,
+        tile: Option<&str>,
+    ) -> Step<Option<MeasurementSettings>> {
+        let Some(a) = antenna else {
+            return Ok(Some(MeasurementSettings::as_found()));
+        };
+        if !self.select_antenna(a, band, tile).await? {
+            return Ok(None);
+        }
+        self.apply_measurement(a, band, tile).await
     }
 
     /// Holds the current tile without retuning until `until`, still
@@ -988,7 +1212,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     async fn visit_tile(&mut self, tile: &Tile, antenna: &AntennaConfig) -> Step<()> {
         let tile_id = tile.id();
         let started = self.now();
-        let Some((fa, settled)) = self
+        let Some((fa, settled, settings)) = self
             .tune_and_settle(
                 tile.center_hz,
                 Some(&tile.target),
@@ -1043,6 +1267,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         v.requested_span_hz = self.baseline.u64(Query::Span).and_then(|s| u32::try_from(s).ok());
         v.settle_ms = self.profile.settle_ms;
         v.settle_discarded = settled.discarded;
+        v.measurement = measure::visit_settings(&settings, self.meta);
         let visit_antenna = VisitAntenna::configured(antenna, self.observed_port());
         let (v, halt) = self.dwell(v).await;
         // Confirm state at the end of the dwell before calling it complete.
@@ -1058,9 +1283,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     }
 
     async fn run(&mut self) -> Step<()> {
-        // The starting band's own settings, put back when leaving it.
+        // Each scope's found state is journaled on its first change.
         // Preflight refused a fixed pan unless set_pan_track_mode allows it.
-        self.band_found = Some(BandMemory::of(&self.original));
         // Probe the observed packet geometry at the first band's center.
         let first = self
             .cfg
@@ -1073,7 +1297,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         let settled = self
             .tune_and_settle(center, None, None, Some(&first.id), None)
             .await?
-            .map(|(_, s)| s);
+            .map(|(_, s, _)| s);
         let Some(g) = settled.and_then(|s| s.geometry) else {
             return Err(Halt::NoSpectrum(
                 "no spectrum frames after tuning; coverage cannot be verified".into(),
@@ -1111,116 +1335,47 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         }
     }
 
-    /// Restores the original BN/FA/#SPN/#FXT if the radio still matches the
-    /// collector's last state. Returns a human-readable result.
+    /// Ends the transaction: restores through the shared engine when the
+    /// halt allows it, else journals why not and what is left to do.
     async fn restore(&mut self, halt: &Halt) -> String {
         if !halt.may_restore() {
-            let msg = format!("not restoring: {}", halt.reason());
+            let ledger = self.txn.ledger();
+            let (outcome, msg) = if ledger.is_dirty() {
+                (Outcome::NotRestored, format!("not restoring: {}", halt.reason()))
+            } else {
+                (
+                    Outcome::Complete,
+                    format!(
+                        "not restoring: {}; nothing the collector changed remains",
+                        halt.reason()
+                    ),
+                )
+            };
+            let manual = recovery::manual_steps(ledger);
+            let _ = self.txn.record(Entry::End {
+                outcome,
+                message: msg.clone(),
+                manual: manual.clone(),
+            });
+            self.report.restore_outcome = outcome.as_str().to_owned();
+            self.report.manual = manual;
             let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
             return msg;
         }
-        let put_back = match self.leave_band().await {
-            Ok(w) => w,
-            Err(h) => {
-                let msg = format!("not restoring: {}", h.reason());
-                let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
-                return msg;
-            }
+        let r = recovery::restore(self.txn, self.cat).await;
+        self.report.restore_outcome = r.outcome.as_str().to_owned();
+        self.report.manual = r.manual.clone();
+        let msg = match r.outcome {
+            Outcome::Complete => r.message,
+            o => format!("restore {}: {}", o.as_str(), r.message),
         };
-        let mut msg = self.restore_tuning().await;
-        if msg.starts_with("not restoring") {
-            return msg;
-        }
-        if !put_back.is_empty() {
-            msg = match msg.strip_prefix("restored: ") {
-                Some(rest) => format!("restored: {put_back}{rest}"),
-                None => format!("restored: {put_back}"),
-            };
-        }
-        // The original band may recall another input; put the original back.
-        if let Some(orig) = self.original.raw(Query::RxAntenna).map(str::to_owned)
-            && self.baseline.raw(Query::RxAntenna) != Some(orig.as_str())
-        {
-            let note = match RxInput::from_readback(&orig) {
-                Some(i) => match self.apply(&[Setter::RxInput(i)]).await {
-                    Ok(()) => format!("; restored {}", Setter::RxInput(i).wire()),
-                    Err(h) => format!("; RX input not restored: {}", h.reason()),
-                },
-                None => format!("; original RX input AR{orig} cannot be selected by the collector"),
-            };
-            msg.push_str(&note);
-            let _ = self.record(self.event(EventKind::RestoreDone, &msg)).await;
-        }
-        msg
-    }
-
-    async fn restore_tuning(&mut self) -> String {
-        let mut sent = Vec::new();
-        let orig_band = self.original.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
-        // Select the original band alone first: it recalls that band's own
-        // memory, which may already be the original FA/#SPN/#FXT.
-        if let Some(b) = orig_band
-            && self.baseline.u64(Query::Band) != Some(u64::from(b))
-        {
-            if let Err(h) = self.apply(&[Setter::Band(b)]).await {
-                let msg = format!("not restoring: {}", h.reason());
-                let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
-                return msg;
-            }
-            sent.push(Setter::Band(b));
-        }
-        let mut setters = Vec::new();
-        if let Some(fa) = self.original.u64(Query::VfoA)
-            && self.baseline.u64(Query::VfoA) != Some(fa)
-        {
-            setters.push(Setter::VfoA(fa));
-        }
-        if let Some(span) = self.original.u64(Query::Span).and_then(|s| u32::try_from(s).ok())
-            && self.baseline.u64(Query::Span) != Some(u64::from(span))
-        {
-            setters.push(Setter::Span(span));
-        }
-        if let Some(fixed) = self.original.flag(Query::FixedTune)
-            && self.baseline.flag(Query::FixedTune) != Some(fixed)
-        {
-            setters.push(Setter::FixedTune(fixed));
-        }
-        let (setters, unsendable): (Vec<Setter>, Vec<Setter>) = setters.into_iter().partition(|s| s.is_sendable());
-        let skipped: String = unsendable.iter().map(|s| s.wire()).collect();
-        if !skipped.is_empty() {
-            let msg = format!("original {skipped} cannot be sent by the collector; not restored");
-            let _ = self.record(self.event(EventKind::Warning, &msg)).await;
-        }
-        if setters.is_empty() && sent.is_empty() {
-            let msg = "radio already in its original state".to_owned();
-            let _ = self.record(self.event(EventKind::RestoreDone, &msg)).await;
-            return msg;
-        }
-        let applied = if setters.is_empty() {
-            Ok(())
+        let kind = if r.outcome == Outcome::Complete {
+            EventKind::RestoreDone
         } else {
-            self.apply(&setters).await
+            EventKind::RestoreSkipped
         };
-        sent.extend(setters);
-        match applied {
-            Ok(()) => {
-                let mut msg = format!("restored: {}", sent.iter().map(|s| s.wire()).collect::<String>());
-                if self.baseline.raw(Query::Mode) != self.original.raw(Query::Mode) {
-                    msg.push_str(&format!(
-                        "; mode is {:?} (was {:?}) and the collector cannot set mode",
-                        self.baseline.raw(Query::Mode),
-                        self.original.raw(Query::Mode)
-                    ));
-                }
-                let _ = self.record(self.event(EventKind::RestoreDone, &msg)).await;
-                msg
-            }
-            Err(h) => {
-                let msg = format!("not restoring: {}", h.reason());
-                let _ = self.record(self.event(EventKind::RestoreSkipped, &msg)).await;
-                msg
-            }
-        }
+        let _ = self.record(self.event(kind, &msg)).await;
+        msg
     }
 }
 
@@ -1259,12 +1414,14 @@ fn round_to_step(hz: i64) -> u64 {
 }
 
 /// Runs an authorized survey after a successful [`preflight`]. The caller
-/// must hold a [`ControlCat`](crate::cat::ControlCat), which proves consent.
+/// must hold a [`ControlCat`](crate::cat::ControlCat), which proves consent,
+/// and the journal from [`begin_journal`] for this session.
 pub async fn run_survey<S: SpectrumSource, C: CatControl>(
     ctx: RunContext<'_>,
     spectrum: &mut S,
     cat: &mut C,
     preflight: Preflight,
+    txn: &mut Transaction,
     duration: Duration,
 ) -> Result<SurveyReport, RunError> {
     let RunContext {
@@ -1286,11 +1443,18 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
             "the survey profile lists no registered antenna".into(),
         ));
     }
+    if txn.ledger().session_id != session_id || txn.ledger().meta != Some(preflight.meta) {
+        return Err(RunError::Config(
+            "the recovery journal does not belong to this session's preflight".into(),
+        ));
+    }
+    let journal = txn.path().map(|p| p.display().to_string());
     let mut s = Survey {
         cfg,
         profile,
         antennas,
-        band_found: None,
+        txn,
+        meta: preflight.meta,
         schedule: Vec::new(),
         cycle_started: tokio::time::Instant::now(),
         store,
@@ -1301,8 +1465,7 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         spectrum,
         cat,
         pan: cfg.radio.receiver.pan(),
-        baseline: preflight.readback.clone(),
-        original: preflight.readback,
+        baseline: preflight.readback,
         offset_hz: 0,
         plan: None,
         sampler,
@@ -1320,13 +1483,18 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
             last_cycle_s: None,
             idle_s: 0.0,
             antenna_skips: 0,
+            measurement_skips: 0,
+            restore_outcome: String::new(),
+            manual: Vec::new(),
+            journal,
         },
     };
     store
         .event(s.event(
             EventKind::SessionStart,
             format!(
-                "authorized survey for {} s with profile {:?} on antenna(s) {}; setters limited to BN/FA/#SPN/#FXT{}",
+                "authorized survey for {} s with profile {:?} on antenna(s) {}; setters limited to \
+                 BN/FA/#SPN/#FXT{} and receiver measurement settings; CAT meta-mode {}; journal {}",
                 duration.as_secs(),
                 profile.id,
                 profile.antennas.join(", "),
@@ -1334,7 +1502,9 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
                     "/AR"
                 } else {
                     ""
-                }
+                },
+                preflight.meta,
+                s.report.journal.as_deref().unwrap_or("in memory")
             ),
         ))
         .await?;
@@ -1363,6 +1533,7 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         Halt::CatLost(_) => "cat_lost",
         Halt::Storage(_) => "storage",
         Halt::NoSpectrum(_) => "no_spectrum",
+        Halt::Journal(_) => "journal",
     }
     .to_owned();
     s.report.summary.failed = !matches!(halt, Halt::Stop(_));

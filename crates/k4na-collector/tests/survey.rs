@@ -10,9 +10,10 @@ use std::time::Duration;
 use common::*;
 use k4na_collector::cat::{ControlCat, RetuneConsent};
 use k4na_collector::net::Connector;
+use k4na_collector::recovery::{self, JournalStatus, Ledger};
 use k4na_collector::runtime::stop_pair;
 use k4na_collector::spectrum::{SpectrumOptions, StreamSpectrum};
-use k4na_collector::survey::{SurveyReport, preflight, run_survey};
+use k4na_collector::survey::{SurveyReport, begin_journal, preflight, run_survey};
 use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::time::Clock;
@@ -21,6 +22,8 @@ use k4na_store::SpaceProbe;
 use k4na_store::reader::DataSet;
 
 const ALLOWED_SETTERS: [&str; 4] = ["BN", "FA", "#SPN", "#FXT"];
+/// Receiver measurement setters, sent only when a profile asks for them.
+const MEASUREMENT_SETTERS: [&str; 8] = ["PA", "RA", "RG", "GT", "NB", "NR", "#NBL", "#AVG"];
 
 /// The example station and `profile` (with test cadence edits applied).
 fn config_with(root: &Path, station_edit: &str, profile: &str) -> Config {
@@ -38,6 +41,9 @@ struct Run {
     cfg: Config,
     radio: SimRadio,
     report: SurveyReport,
+    /// The session's recovery journal, re-read after the run.
+    journal: Ledger,
+    journal_status: JournalStatus,
     _dir: tempfile::TempDir,
 }
 
@@ -100,17 +106,28 @@ async fn survey_with(
         clock.clone(),
     );
     let (_h, stop) = stop_pair();
+    let mut txn = begin_journal(&cfg, sid, &pre, clock.clone()).unwrap();
+    let journal_path = txn.path().unwrap().to_owned();
     script(radio.clone());
     let report = run_survey(
         ctx(&cfg, &store, &clock, sid, stop),
         &mut spec,
         &mut cat,
         pre,
+        &mut txn,
         Duration::from_secs(secs),
     )
     .await
     .unwrap();
+    drop(txn);
     store.close(clock.now(), &report.summary.end_reason).await.unwrap();
+    let journal = recovery::load(&journal_path).unwrap();
+    let journal_status = recovery::list(&cfg.storage.recovery_dir())
+        .unwrap()
+        .into_iter()
+        .find(|j| j.session_id == sid)
+        .unwrap()
+        .status;
     assert!(
         radio.forbidden_commands().is_empty(),
         "forbidden: {:?}",
@@ -118,8 +135,9 @@ async fn survey_with(
     );
     for s in radio.setters_received() {
         let rx_input = s.starts_with("AR") && cfg.collection.allow_rx_antenna_switch;
+        let measuring = MEASUREMENT_SETTERS.iter().any(|p| s.starts_with(p));
         assert!(
-            rx_input || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
+            rx_input || measuring || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
             "unexpected setter {s}"
         );
         assert!(!s.starts_with("AN"), "the TX antenna must never be set: {s}");
@@ -128,6 +146,8 @@ async fn survey_with(
         cfg,
         radio,
         report,
+        journal,
+        journal_status,
         _dir: dir,
     }
 }
@@ -435,8 +455,13 @@ async fn a_recalled_span_outside_the_whitelist_is_reported_not_fatal() {
     assert!(!run.radio.setters_received().iter().any(|s| s == "#SPN5000;"));
     let m = run.radio.model();
     assert_eq!((m.bn, m.fa, m.span), (5, 14_074_000, 40_000));
-    assert_eq!(m.band_span.get(&4), Some(&40_000), "left as the survey set it");
+    // The span could not be put back, so it is never changed: the band is
+    // surveyed at its own span and its memory is left as found.
+    assert_eq!(m.band_span.get(&4), Some(&5_000), "30 m memory untouched");
+    assert!(run.journal.dirty().is_empty(), "{:?}", run.journal.dirty());
     let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let insp = ds.inspect().unwrap();
+    assert!(insp.events_by_kind.get("warning").copied().unwrap_or(0) >= 1);
     assert!(
         ds.visits()
             .unwrap()
@@ -716,4 +741,307 @@ high_hz = 10150000
     assert_eq!(run.report.halt, "conflict", "{:?}", run.report);
     assert_eq!(setters_after(&run.radio, &mark), Vec::<String>::new());
     assert_eq!(run.radio.model().fa, 10_120_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.rx_scope = k4na_sim::RxScope::BandInput;
+        m.rx = operator_rx();
+    });
+    let before = radio.model();
+    let dir = tempfile::tempdir().unwrap();
+    let profile = two_band_profile(r#""log-near-house", "dxc""#, "");
+    let cfg = config_with(&dir.path().join("data"), "allow_rx_antenna_switch = true", &profile);
+    let clock: Arc<dyn Clock> = clock();
+    let mut cat = control(&radio).await;
+    let pre = preflight(&mut cat, &cfg).await.unwrap();
+    let sid = "0190bbbb-0000-7000-8000-00000000000a";
+    let store = open_store(&cfg, sid, Mode::Survey, &clock);
+    let mut spec = StreamSpectrum::new(
+        SimConnector {
+            radio: radio.clone(),
+            port: Port::Pan,
+        },
+        SpectrumOptions::from_config(&cfg.radio),
+        clock.clone(),
+    );
+    let (_h, stop) = stop_pair();
+    let mut txn = begin_journal(&cfg, sid, &pre, clock.clone()).unwrap();
+    // "Kill" the process once the survey has moved to the second antenna:
+    // the future is dropped, so no restoration code runs.
+    let killed = tokio::time::timeout(Duration::from_secs(60), async {
+        run_survey(
+            ctx(&cfg, &store, &clock, sid, stop),
+            &mut spec,
+            &mut cat,
+            pre,
+            &mut txn,
+            Duration::from_secs(600),
+        )
+        .await
+    })
+    .await;
+    assert!(killed.is_err(), "the survey was still running");
+    drop(txn);
+    drop(cat);
+    let changed = radio.model();
+    assert!(
+        (changed.bn, changed.fa, changed.rx) != (before.bn, before.fa, before.rx) || changed.rx_input != 4,
+        "the kill happened mid-survey"
+    );
+
+    let dir = cfg.storage.recovery_dir();
+    let info = recovery::list(&dir).unwrap().remove(0);
+    assert_eq!(info.status, JournalStatus::Pending);
+    assert!(info.dirty > 0);
+    // The dry run is GET-only.
+    let mut cat = control(&radio).await;
+    let setters = radio.setters_received().len();
+    let plan = recovery::plan(&recovery::load(&info.path).unwrap(), &mut cat)
+        .await
+        .unwrap();
+    assert!(plan.dry_run && !plan.fields.is_empty(), "{plan:?}");
+    assert_eq!(radio.setters_received().len(), setters, "dry run sent a setter");
+
+    let mut txn = recovery::Transaction::resume(&info.path, clock.clone()).unwrap();
+    let report = recovery::restore(&mut txn, &mut cat).await;
+    assert_eq!(report.outcome, recovery::Outcome::Complete, "{report:?}");
+    drop(txn);
+    let m = radio.model();
+    assert_eq!(
+        (m.bn, m.fa, m.span, m.rx_input, m.rx),
+        (before.bn, before.fa, before.span, 4, operator_rx())
+    );
+    for band in [3, 5] {
+        for input in [4, 6] {
+            assert_eq!(m.rx_settings(band, input), operator_rx(), "band {band} input {input}");
+        }
+        assert_eq!(m.band_rx_input.get(&band).copied().unwrap_or(4), 4);
+    }
+    assert_eq!(recovery::list(&dir).unwrap()[0].status, JournalStatus::Resolved);
+    // A second restore is refused as already resolved by the CLI; the
+    // engine itself is idempotent.
+    let mut txn = recovery::Transaction::resume(&info.path, clock).unwrap();
+    assert_eq!(
+        recovery::restore(&mut txn, &mut cat).await.outcome,
+        recovery::Outcome::Complete
+    );
+    assert!(radio.forbidden_commands().is_empty());
+}
+
+/// Two short bands; `extra` is appended (antennas, `[measurement]`).
+fn two_band_profile(antennas: &str, extra: &str) -> String {
+    format!(
+        r#"
+id = "measure"
+antennas = [{antennas}]
+dwell_ms = 3000
+min_cycle_ms = 0
+[[ranges]]
+id = "40m"
+low_hz = 7000000
+high_hz = 7060000
+[[ranges]]
+id = "20m"
+low_hz = 14000000
+high_hz = 14060000
+{extra}
+"#
+    )
+}
+
+/// The operator's receiver state, unlike the built-in defaults (RG0, NB
+/// off): every survey must change it, then put it back.
+fn operator_rx() -> k4na_sim::RxSettings {
+    k4na_sim::RxSettings {
+        rf_gain_db: 10,
+        nb_on: true,
+        ..Default::default()
+    }
+}
+
+fn measurement_of(v: &k4na_store::reader::VisitRow) -> std::collections::BTreeMap<String, String> {
+    serde_json::from_str(v.measurement_json.as_deref().expect("survey visits record settings")).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn measurement_settings_are_applied_recorded_and_put_back() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| m.rx = operator_rx());
+    let profile = two_band_profile(r#""log-near-house""#, "[measurement]\npreamp = \"off\"\n");
+    let run = survey_with(
+        radio,
+        120,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = false", &profile),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!((r.halt.as_str(), r.measurement_skips), ("stop", 0), "{r:?}");
+    assert_eq!(r.restore_outcome, "complete", "{r:?}");
+    assert!(r.manual.is_empty());
+    let setters = run.radio.setters_received();
+    for s in ["PA0;", "RG-00;", "NB0;"] {
+        assert!(setters.contains(&s.to_owned()), "{s} not in {setters:?}");
+    }
+    // Every band's memory, and the current state, are as the operator left
+    // them.
+    let m = run.radio.model();
+    assert_eq!(m.rx, operator_rx());
+    for band in [3, 5] {
+        assert_eq!(m.rx_settings(band, 4), operator_rx(), "band {band}");
+    }
+    assert_eq!(run.journal_status, JournalStatus::Resolved);
+    assert!(run.journal.dirty().is_empty());
+
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let complete: Vec<_> = ds
+        .visits()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.status == "complete")
+        .collect();
+    assert!(!complete.is_empty());
+    for v in &complete {
+        let s = measurement_of(v);
+        assert_eq!(s["preamp"], "off", "{s:?}");
+        assert_eq!(s["rf_gain_db"], "0", "{s:?}");
+        assert_eq!(s["cat_meta_mode"], "basic", "{s:?}");
+    }
+    let insp = ds.inspect().unwrap();
+    assert!(insp.events_by_kind.get("measurement_applied").copied().unwrap_or(0) >= 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_input_receiver_memories_are_put_back_before_switching_antennas() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| {
+        m.rx_scope = k4na_sim::RxScope::BandInput;
+        m.rx = operator_rx();
+    });
+    let extra = "[[measurement.override]]\nantenna = \"dxc\"\npreamp = \"off\"\n";
+    let profile = two_band_profile(r#""log-near-house", "dxc""#, extra);
+    let run = survey_with(
+        radio,
+        240,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = true", &profile),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(
+        (r.halt.as_str(), r.restore_outcome.as_str()),
+        ("stop", "complete"),
+        "{r:?}"
+    );
+    let m = run.radio.model();
+    assert_eq!((m.rx_input, m.rx), (4, operator_rx()));
+    for band in [3, 5] {
+        for input in [4, 6] {
+            assert_eq!(m.rx_settings(band, input), operator_rx(), "band {band} input {input}");
+        }
+    }
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    for v in ds.visits().unwrap().iter().filter(|v| v.status == "complete") {
+        let want = if v.antenna_id == "dxc" { "off" } else { "as-found" };
+        assert_eq!(measurement_of(v)["preamp"], want, "{}", v.antenna_id);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_setting_the_cat_mode_cannot_express_skips_only_that_band() {
+    let radio = SimRadio::new(15);
+    // Basic CAT mode cannot set an attenuator level.
+    let extra = "[[measurement.override]]\nband = \"40m\"\nattenuator_db = 6\n";
+    let profile = two_band_profile(r#""log-near-house""#, extra);
+    let run = survey_with(
+        radio,
+        120,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = false", &profile),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.measurement_skips > 0, "{r:?}");
+    assert!(!run.radio.setters_received().iter().any(|s| s.starts_with("RA")));
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let visits = ds.visits().unwrap();
+    assert!(!visits.iter().any(|v| v.band_id.as_deref() == Some("40m")));
+    assert!(
+        visits
+            .iter()
+            .any(|v| v.band_id.as_deref() == Some("20m") && v.status == "complete")
+    );
+    assert_eq!(run.journal_status, JournalStatus::Resolved);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_change_is_left_alone_and_the_journal_blocks_until_settled() {
+    let radio = SimRadio::new(15);
+    radio.update(|m| m.rx = operator_rx());
+    // The operator turns RF gain down right after the survey set it.
+    let script = |r: SimRadio| {
+        tokio::spawn(async move {
+            while !r.setters_received().iter().any(|s| s == "RG-00;") {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            r.update(|m| m.rx.rf_gain_db = 20);
+        });
+    };
+    let profile = two_band_profile(r#""log-near-house""#, "");
+    let run = survey_with(
+        radio,
+        120,
+        None,
+        |root| config_with(root, "allow_rx_antenna_switch = false", &profile),
+        script,
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(
+        (r.halt.as_str(), r.restore_outcome.as_str()),
+        ("conflict", "not_restored"),
+        "{r:?}"
+    );
+    assert!(r.manual.iter().any(|m| m.contains("RF gain")), "{:?}", r.manual);
+    assert_eq!(run.journal_status, JournalStatus::Pending);
+    let dir = run.cfg.storage.recovery_dir();
+    let clock: Arc<dyn Clock> = clock();
+
+    // A new survey is refused while the journal is unresolved.
+    let mut cat = control(&run.radio).await;
+    let pre = preflight(&mut cat, &run.cfg).await.unwrap();
+    let next = "0190bbbb-0000-7000-8000-000000000002";
+    let err = begin_journal(&run.cfg, next, &pre, clock.clone()).unwrap_err();
+    assert!(err.to_string().contains("unresolved"), "{err}");
+
+    // Recovery restores what is still ours and leaves the operator's RF
+    // gain alone.
+    let info = recovery::list(&dir).unwrap().remove(0);
+    let mut txn = recovery::Transaction::resume(&info.path, clock.clone()).unwrap();
+    let report = recovery::restore(&mut txn, &mut cat).await;
+    assert_eq!(report.outcome, recovery::Outcome::Conflict, "{report:?}");
+    // The change was made on 40 m (K4 band 3), surveyed first; back on the
+    // original band the radio recalls that band's own settings.
+    let m = run.radio.model();
+    let forty = m.rx_settings(3, 4);
+    assert_eq!(forty.rf_gain_db, 20, "the operator's value is never overwritten");
+    assert!(forty.nb_on, "the collector's NB change was put back");
+    assert_eq!((m.bn, m.fa, m.rx), (5, 14_074_000, operator_rx()));
+    drop(txn);
+    assert_eq!(recovery::list(&dir).unwrap()[0].status, JournalStatus::Pending);
+
+    // The operator accepts the radio as it is; surveys may start again.
+    let mut txn = recovery::Transaction::resume(&info.path, clock.clone()).unwrap();
+    txn.record(recovery::Entry::Acknowledged { note: "test".into() })
+        .unwrap();
+    drop(txn);
+    assert_eq!(recovery::list(&dir).unwrap()[0].status, JournalStatus::Acknowledged);
+    begin_journal(&run.cfg, next, &pre, clock).unwrap();
 }
