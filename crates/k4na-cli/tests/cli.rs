@@ -69,6 +69,58 @@ fn check_shows_the_profile_and_profile_overrides_apply() {
 }
 
 #[test]
+fn full_rate_raw_capture_flags_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let station = write_config(dir.path(), "passive", 9, 9);
+    k4na()
+        .args([
+            "capture",
+            "--duration",
+            "3s",
+            "--raw-full-rate",
+            "1h",
+            "--raw-full-rate-max-bytes",
+            "1TiB",
+        ])
+        .arg("--config")
+        .arg(&station)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown byte unit"));
+    k4na()
+        .args([
+            "capture",
+            "--duration",
+            "3s",
+            "--raw-full-rate",
+            "1h",
+            "--raw-full-rate-max-bytes",
+            "1000GiB",
+        ])
+        .arg("--config")
+        .arg(&station)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("half of storage.max_total_bytes"));
+    k4na()
+        .args(["capture", "--duration", "3s", "--raw-full-rate", "25h"])
+        .arg("--config")
+        .arg(&station)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("at most 24 hours"));
+    // A byte cap alone is not a capture.
+    k4na()
+        .args(["capture", "--duration", "3s", "--raw-full-rate-max-bytes", "1GiB"])
+        .arg("--config")
+        .arg(&station)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--raw-full-rate"));
+    assert!(!dir.path().join("data").exists());
+}
+
+#[test]
 fn passive_capture_refuses_an_ambiguous_antenna() {
     let dir = tempfile::tempdir().unwrap();
     let station = write_config(dir.path(), "passive", 9, 9);

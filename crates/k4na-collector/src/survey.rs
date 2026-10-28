@@ -319,7 +319,6 @@ struct Survey<'a, S, C> {
     offset_hz: i64,
     plan: Option<SurveyPlan>,
     sampler: RawSampler,
-    policy: String,
     diag_at_last_visit: DecoderDiagnostics,
     spectrum_down_since: Option<Timestamp>,
     last_tick: tokio::time::Instant,
@@ -802,8 +801,11 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     }
                     match v.accept(&rf) {
                         PushOutcome::Accepted => {
-                            if self.sampler.due(rf.at) && !self.store.raw_paused() {
-                                self.store.offer_raw(v.raw_record(&rf, &self.policy));
+                            if !self.store.raw_paused() && self.sampler.due(rf.at, rf.frame.raw().len()) {
+                                self.store.offer_raw(v.raw_record(&rf, self.sampler.policy()));
+                            }
+                            if let Some(msg) = self.sampler.take_notice() {
+                                let _ = self.record(self.event(EventKind::RawCapture, msg)).await;
                             }
                         }
                         PushOutcome::Full => {
@@ -1432,8 +1434,7 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         session_id,
         stop,
     } = ctx;
-    let sampler = RawSampler::new(cfg.collection.raw_sample_interval_ms);
-    let policy = sampler.policy();
+    let sampler = RawSampler::with_capture(cfg.collection.raw_sample_interval_ms, cfg.collection.raw_capture);
     let profile = cfg
         .profile
         .as_ref()
@@ -1470,7 +1471,6 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         offset_hz: 0,
         plan: None,
         sampler,
-        policy,
         diag_at_last_visit: DecoderDiagnostics::default(),
         spectrum_down_since: Some(clock.now()),
         last_tick: tokio::time::Instant::now(),

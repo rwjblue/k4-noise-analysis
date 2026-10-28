@@ -112,7 +112,6 @@ struct Passive<'a> {
     window: Duration,
     cat: Option<SharedCatState>,
     sampler: RawSampler,
-    policy: String,
     visit: Option<VisitBuilder>,
     last_frame: Option<Timestamp>,
     disconnected_since: Option<Timestamp>,
@@ -338,11 +337,16 @@ impl Passive<'_> {
                 self.visit = Some(v);
             }
         }
-        if self.sampler.due(rf.at)
-            && !self.store.raw_paused()
+        if !self.store.raw_paused()
+            && self.sampler.due(rf.at, rf.frame.raw().len())
             && let Some(v) = &self.visit
         {
-            self.store.offer_raw(v.raw_record(&rf, &self.policy));
+            self.store.offer_raw(v.raw_record(&rf, self.sampler.policy()));
+        }
+        if let Some(msg) = self.sampler.take_notice() {
+            self.store
+                .event(Event::new(&self.session_id, rf.at, EventKind::RawCapture, msg))
+                .await?;
         }
         Ok(())
     }
@@ -364,8 +368,7 @@ pub async fn run_passive<S: SpectrumSource>(
         mut stop,
     } = ctx;
     let session_id = session_id.as_str();
-    let sampler = RawSampler::new(cfg.collection.raw_sample_interval_ms);
-    let policy = sampler.policy();
+    let sampler = RawSampler::with_capture(cfg.collection.raw_sample_interval_ms, cfg.collection.raw_capture);
     let mut p = Passive {
         cfg,
         store,
@@ -377,7 +380,6 @@ pub async fn run_passive<S: SpectrumSource>(
         window: Duration::from_millis(cfg.collection.passive_visit_ms),
         cat,
         sampler,
-        policy,
         visit: None,
         last_frame: None,
         disconnected_since: Some(clock.now()),

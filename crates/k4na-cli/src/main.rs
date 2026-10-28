@@ -26,7 +26,7 @@ use k4na_core::Config;
 use k4na_core::config::Mode;
 use k4na_core::plan::SurveyPlan;
 use k4na_core::time::Clock;
-use k4na_store::estimate::{Estimate, admission, estimate};
+use k4na_store::estimate::{Estimate, admission, admit_raw_capture, estimate};
 use k4na_store::reader::DataSet;
 use k4na_store::{FsSpaceProbe, SpaceProbe, Store, StoreOptions};
 
@@ -60,6 +60,58 @@ impl ConfigArgs {
     }
 }
 
+/// Temporary every-frame raw capture (never a config-file setting).
+#[derive(Debug, clap::Args)]
+struct RawCaptureArgs {
+    /// Keep every accepted frame for this long from the first frame, then
+    /// fall back to `collection.raw_sample_interval_ms`. About 125 kB/s of
+    /// packets at 30 fps (about 2.9 kB per frame on disk).
+    #[arg(long, value_parser = humantime::parse_duration)]
+    raw_full_rate: Option<Duration>,
+    /// End the full-rate capture early after this many original packet
+    /// bytes (e.g. 500MiB, 2GiB); at most half of `storage.max_total_bytes`.
+    #[arg(long, value_parser = parse_bytes, default_value = "1GiB", requires = "raw_full_rate")]
+    raw_full_rate_max_bytes: u64,
+}
+
+impl RawCaptureArgs {
+    fn apply(&self, cfg: &mut Config) -> Result<()> {
+        cfg.collection.raw_capture = self.raw_full_rate.map(|duration| k4na_core::config::RawCapture {
+            duration,
+            max_packet_bytes: self.raw_full_rate_max_bytes,
+        });
+        cfg.check_raw_capture().map_err(refuse)?;
+        if let Some(c) = cfg.collection.raw_capture {
+            eprintln!(
+                "raw full-rate capture: every accepted frame for {} or {} of packets, whichever comes first",
+                humantime::format_duration(c.duration),
+                mib(c.max_packet_bytes)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Parses a byte count with an optional KB/MB/GB (1000) or KiB/MiB/GiB
+/// (1024) suffix.
+fn parse_bytes(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: u64 = num.parse().map_err(|_| format!("not a byte count: {s}"))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        _ => return Err(format!("unknown byte unit in {s}; use B, KB, MB, GB, KiB, MiB or GiB")),
+    };
+    n.checked_mul(mult).ok_or_else(|| format!("byte count too large: {s}"))
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Validate a station config and survey profile and print the digest.
@@ -83,6 +135,8 @@ enum Cmd {
         config: ConfigArgs,
         #[arg(long, value_parser = humantime::parse_duration)]
         duration: Duration,
+        #[command(flatten)]
+        raw: RawCaptureArgs,
     },
     /// Authorized band survey (retunes VFO A). Requires --allow-retune AND
     /// `collection.allow_retune = true`; use --dry-run first.
@@ -98,6 +152,8 @@ enum Cmd {
         /// GET-only preflight and plan preview; sends no setters.
         #[arg(long, conflicts_with = "allow_retune")]
         dry_run: bool,
+        #[command(flatten)]
+        raw: RawCaptureArgs,
     },
     /// Read every known CAT state value with GET-only queries and print the
     /// raw responses. Sends no setters.
@@ -212,15 +268,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 ExitCode::from(2)
             })
         }
-        Cmd::Capture { config, duration } => capture(&config.load()?, duration, json).await,
+        Cmd::Capture { config, duration, raw } => {
+            let mut cfg = config.load()?;
+            raw.apply(&mut cfg)?;
+            capture(&cfg, duration, json).await
+        }
         Cmd::Probe { config } => probe(&config.load()?, json).await,
         Cmd::Survey {
             config,
             duration,
             allow_retune,
             dry_run,
+            raw,
         } => {
-            let cfg = config.load()?;
+            let mut cfg = config.load()?;
+            raw.apply(&mut cfg)?;
             if dry_run {
                 survey_dry_run(&cfg, json).await
             } else {
@@ -357,7 +419,10 @@ fn estimate_for(cfg: &Config, mode: Mode, _duration: Duration) -> Result<(Estima
     let free = FsSpaceProbe
         .available_bytes(&existing_ancestor(&cfg.storage.root))
         .context("free-space probe")?;
-    let admit = admission(&opts, &est, usage, free);
+    let admit = admission(&opts, &est, usage, free).and_then(|()| match c.raw_capture {
+        Some(cap) => admit_raw_capture(&opts, &est, usage, free, cap.max_packet_bytes),
+        None => Ok(()),
+    });
     Ok((est, admit))
 }
 
@@ -961,4 +1026,21 @@ fn replay(input: &Path, json: bool) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bytes;
+
+    #[test]
+    fn parses_byte_counts_with_units() {
+        assert_eq!(parse_bytes("1234"), Ok(1234));
+        assert_eq!(parse_bytes("500MB"), Ok(500_000_000));
+        assert_eq!(parse_bytes("2GiB"), Ok(2 << 30));
+        assert_eq!(parse_bytes("64 kib"), Ok(64 << 10));
+        assert!(parse_bytes("1.5GiB").is_err());
+        assert!(parse_bytes("GiB").is_err());
+        assert!(parse_bytes("5PB").is_err());
+        assert!(parse_bytes("99999999999GiB").is_err());
+    }
 }

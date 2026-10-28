@@ -57,13 +57,41 @@ pub fn estimate(opts: &StoreOptions, pans: u32, visit_ms: u64, accepting_ms: u64
 
 /// Refuses a run that cannot hold its protected summary window under both
 /// the configured cap and the volume's free space (after `min_free_bytes`).
-pub fn admission(opts: &StoreOptions, est: &Estimate, usage_bytes: u64, free_bytes: u64) -> Result<(), String> {
+fn usable_bytes(opts: &StoreOptions, usage_bytes: u64, free_bytes: u64) -> u64 {
     let budget = opts
         .max_total_bytes
         .min((usage_bytes + free_bytes).saturating_sub(opts.min_free_bytes));
     // Same basis as the writer's soft limit: a fraction of what may be used
     // before the hard ceiling (budget minus headroom).
-    let usable = (budget.saturating_sub(opts.headroom_bytes) as f64 * opts.soft_limit_fraction) as u64;
+    (budget.saturating_sub(opts.headroom_bytes) as f64 * opts.soft_limit_fraction) as u64
+}
+
+/// A full-rate raw capture is expendable like all raw data, so storage
+/// pressure would prune its own start rather than summaries. Refuse one
+/// that cannot fit beside the protected summary window. `packet_bytes`
+/// (uncompressed) bounds its disk use.
+pub fn admit_raw_capture(
+    opts: &StoreOptions,
+    est: &Estimate,
+    usage_bytes: u64,
+    free_bytes: u64,
+    packet_bytes: u64,
+) -> Result<(), String> {
+    let usable = usable_bytes(opts, usage_bytes, free_bytes);
+    let need = est.protected_summary_bytes + est.unprunable_shard_bytes + packet_bytes;
+    if need > usable {
+        return Err(format!(
+            "a full-rate raw capture of up to {packet_bytes} packet bytes does not fit beside the protected summary \
+             window ({} + one unprunable shard {}) in {usable} usable bytes; storage pressure would prune the capture. \
+             Lower --raw-full-rate-max-bytes, free disk space or raise max_total_bytes.",
+            est.protected_summary_bytes, est.unprunable_shard_bytes
+        ));
+    }
+    Ok(())
+}
+
+pub fn admission(opts: &StoreOptions, est: &Estimate, usage_bytes: u64, free_bytes: u64) -> Result<(), String> {
+    let usable = usable_bytes(opts, usage_bytes, free_bytes);
     let need = est.protected_summary_bytes + est.unprunable_shard_bytes;
     if need > usable {
         return Err(format!(
@@ -110,6 +138,20 @@ mod tests {
         assert!(e.summary_bytes_per_day < 600_000_000, "{e:?}");
         assert!(e.protected_summary_bytes < (o.max_total_bytes as f64 * 0.85) as u64);
         assert!(admission(&o, &e, 0, 100 * (1 << 30)).is_ok());
+    }
+
+    #[test]
+    fn a_raw_capture_must_fit_beside_the_protected_summaries() {
+        let o = opts();
+        let e = estimate(&o, 1, 4000, 3000, 1000);
+        let free = 100 * (1 << 30);
+        assert!(admit_raw_capture(&o, &e, 0, free, 1 << 30).is_ok());
+        // Half of a 4 GiB cap passes the config check but not beside a day
+        // of protected summaries.
+        let err = admit_raw_capture(&o, &e, 0, free, o.max_total_bytes / 2 + (1 << 30)).unwrap_err();
+        assert!(err.contains("would prune the capture"), "{err}");
+        // Little free disk refuses even a small capture.
+        assert!(admit_raw_capture(&o, &e, 0, o.min_free_bytes + (900 << 20), 1 << 30).is_err());
     }
 
     #[test]

@@ -187,6 +187,19 @@ impl Mode {
     }
 }
 
+/// Keep every accepted frame from the start of the run until `duration`
+/// has passed or `max_packet_bytes` of original packets are kept, then
+/// fall back to `raw_sample_interval_ms`. Packet bytes bound disk use:
+/// stored frames are compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCapture {
+    pub duration: std::time::Duration,
+    pub max_packet_bytes: u64,
+}
+
+/// Longest a single every-frame capture may run.
+pub const RAW_CAPTURE_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CollectionConfig {
@@ -217,6 +230,10 @@ pub struct CollectionConfig {
     /// At most one original packet per interval per pan; 0 disables raw sampling.
     #[serde(default = "default_raw_interval_ms")]
     pub raw_sample_interval_ms: u64,
+    /// Temporary every-frame raw capture. Command line only
+    /// (`--raw-full-rate`); a config file cannot set it.
+    #[serde(skip)]
+    pub raw_capture: Option<RawCapture>,
     /// Passive capture visit window (statistics are summarized per window).
     #[serde(default = "default_passive_visit_ms")]
     pub passive_visit_ms: u64,
@@ -458,6 +475,33 @@ impl SurveyProfile {
 }
 
 impl Config {
+    /// Checks [`CollectionConfig::raw_capture`], which the command line sets
+    /// after the file is validated. A capture must end within a day, before
+    /// raw retention could prune its start, and in at most half the store.
+    pub fn check_raw_capture(&self) -> Result<(), String> {
+        let Some(c) = self.collection.raw_capture else {
+            return Ok(());
+        };
+        if c.duration.is_zero() || c.duration > RAW_CAPTURE_MAX_DURATION {
+            return Err("a full-rate raw capture must last more than 0 and at most 24 hours".into());
+        }
+        if c.duration.as_secs() > self.storage.raw_retention_hours.saturating_mul(3600) {
+            return Err(format!(
+                "a {} s full-rate raw capture outlasts storage.raw_retention_hours = {}; retention would prune its start",
+                c.duration.as_secs(),
+                self.storage.raw_retention_hours
+            ));
+        }
+        let half = self.storage.max_total_bytes / 2;
+        if c.max_packet_bytes == 0 || c.max_packet_bytes > half {
+            return Err(format!(
+                "a full-rate raw capture may keep 1 to {half} packet bytes (half of storage.max_total_bytes), not {}",
+                c.max_packet_bytes
+            ));
+        }
+        Ok(())
+    }
+
     /// Parses a station file only; `collection.survey_profile` is NOT loaded
     /// (use [`Config::load`] or [`Config::from_parts`]).
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
@@ -795,6 +839,47 @@ mod tests {
         let ports: Vec<_> = both.survey_antennas().iter().map(|a| a.port).collect();
         assert_eq!(ports, [K4Port::RxAntIn1, K4Port::Ant2]);
         assert!(both.passive_antenna().is_err());
+    }
+
+    #[test]
+    fn raw_captures_are_bounded_by_a_day_retention_and_half_the_store() {
+        let mut c = example();
+        assert!(c.check_raw_capture().is_ok());
+        let hour = std::time::Duration::from_secs(3600);
+        let ok = RawCapture {
+            duration: 2 * hour,
+            max_packet_bytes: 1 << 30,
+        };
+        c.collection.raw_capture = Some(ok);
+        c.check_raw_capture().unwrap();
+        for bad in [
+            RawCapture {
+                duration: std::time::Duration::ZERO,
+                ..ok
+            },
+            RawCapture {
+                duration: 25 * hour,
+                ..ok
+            },
+            RawCapture {
+                max_packet_bytes: 0,
+                ..ok
+            },
+            RawCapture {
+                max_packet_bytes: c.storage.max_total_bytes / 2 + 1,
+                ..ok
+            },
+        ] {
+            c.collection.raw_capture = Some(bad);
+            assert!(c.check_raw_capture().is_err(), "{bad:?}");
+        }
+        c.collection.raw_capture = Some(ok);
+        c.storage.raw_retention_hours = 1;
+        assert!(c.check_raw_capture().unwrap_err().contains("raw_retention_hours"));
+        // A config file cannot ask for one.
+        let text = format!("{}\n", include_str!("../../../config/example.toml"))
+            .replace("[collection]\n", "[collection]\nraw_capture = true\n");
+        assert!(Config::from_toml(&text).is_err());
     }
 
     #[test]

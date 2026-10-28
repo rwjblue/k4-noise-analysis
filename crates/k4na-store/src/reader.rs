@@ -118,6 +118,9 @@ pub struct RawRow {
     pub received_utc_ns: i64,
     pub center_hz: i64,
     pub sample_rate_hz: i64,
+    /// The rule that kept this frame (interval sampling or a full-rate
+    /// capture); see docs/storage.md.
+    pub sampling_policy: String,
     pub bytes: Vec<u8>,
 }
 
@@ -369,7 +372,8 @@ impl DataSet {
         for info in self.readable(ShardKind::Raw) {
             let (conn, _) = open_read_only(&info.path)?;
             let mut st = conn.prepare(
-                "SELECT session_id, visit_id, pan, received_utc_ns, center_hz, sample_rate_hz, compression, byte_len, data
+                "SELECT session_id, visit_id, pan, received_utc_ns, center_hz, sample_rate_hz, compression, byte_len, data,
+                        sampling_policy
                  FROM raw_frames ORDER BY frame_id",
             )?;
             let mut rows = st.query([])?;
@@ -385,6 +389,7 @@ impl DataSet {
                     received_utc_ns: r.get(3)?,
                     center_hz: r.get(4)?,
                     sample_rate_hz: r.get(5)?,
+                    sampling_policy: r.get(9)?,
                     bytes,
                 })?;
                 n += 1;

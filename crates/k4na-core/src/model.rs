@@ -243,6 +243,8 @@ pub enum EventKind {
     /// A context could not be measured as configured; its tiles were
     /// skipped without changing anything.
     MeasurementSkipped,
+    /// A command-line full-rate raw capture started or ended.
+    RawCapture,
 }
 
 impl EventKind {
@@ -266,6 +268,7 @@ impl EventKind {
             Self::RawSamplingPaused => "raw_sampling_paused",
             Self::RawSamplingResumed => "raw_sampling_resumed",
             Self::RawFramesDropped => "raw_frames_dropped",
+            Self::RawCapture => "raw_capture",
             Self::Pruned => "pruned",
             Self::StorageSuspended => "storage_suspended",
             Self::TransmitDetected => "transmit_detected",

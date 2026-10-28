@@ -30,6 +30,54 @@ fn spectrum(radio: &SimRadio, clock: &Arc<dyn k4na_core::time::Clock>) -> Stream
 }
 
 #[tokio::test(start_paused = true)]
+async fn full_rate_raw_capture_keeps_every_frame_then_falls_back_to_sampling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(&dir.path().join("data"), "passive");
+    cfg.collection.raw_capture = Some(k4na_core::config::RawCapture {
+        duration: Duration::from_secs(20),
+        max_packet_bytes: 1 << 30,
+    });
+    cfg.check_raw_capture().unwrap();
+    let radio = SimRadio::new(15);
+    let clock = clock();
+    let store = open_store(&cfg, "0190aaaa-0000-7000-8000-0000000000fc", Mode::Passive, &clock);
+    let (_stop_handle, stop) = stop_pair();
+    let mut spec = spectrum(&radio, &clock);
+    let ctx = ctx(&cfg, &store, &clock, "0190aaaa-0000-7000-8000-0000000000fc", stop);
+    let summary = run_passive(ctx, &mut spec, None, Duration::from_secs(60))
+        .await
+        .unwrap();
+    store.close(clock.now(), &summary.end_reason).await.unwrap();
+
+    let ds = DataSet::open(&cfg.storage.root).unwrap();
+    let mut full = Vec::new();
+    let mut sampled = Vec::new();
+    ds.for_each_raw(|row| {
+        if row.sampling_policy.starts_with("every accepted frame") {
+            full.push(row.received_utc_ns);
+        } else {
+            sampled.push(row.received_utc_ns);
+        }
+        Ok(())
+    })
+    .unwrap();
+    // 20 s at 15 fps, then about one per second for the remaining 40 s.
+    assert!((295..=301).contains(&full.len()), "{}", full.len());
+    assert!((36..=41).contains(&sampled.len()), "{}", sampled.len());
+    assert!(full.iter().max() < sampled.iter().min());
+    let notes: Vec<_> = ds
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "raw_capture")
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].starts_with("raw full-rate capture started"));
+    assert!(notes[1].contains("duration reached"), "{}", notes[1]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn passive_capture_records_windows_and_never_sends_setters() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(&dir.path().join("data"), "passive");
