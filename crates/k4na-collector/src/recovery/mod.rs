@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use k4na_core::measure::band_label;
 use serde::{Deserialize, Serialize};
 
-pub use journal::{JournalError, JournalInfo, JournalSink, JournalStatus, Transaction, list, load};
+pub use journal::{COMPACT_BYTES, JournalError, JournalInfo, JournalSink, JournalStatus, Transaction, list, load};
 pub use restore::{Decision, FieldReport, RestoreReport, decide, manual_steps, plan, restore, state_queries};
 
 use crate::cat::Query;
@@ -182,13 +182,21 @@ impl Obligation {
     }
 }
 
+/// How many intended values per field the ledger remembers. The radio can
+/// only hold the last value set, or the one before it when a crash fell
+/// between journaling an intent and sending it; anything older found in
+/// the radio was set by someone else.
+pub const OURS_KEPT: usize = 2;
+
 /// Replayed journal state.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Ledger {
     pub session_id: String,
     pub profile: Option<String>,
     pub meta: Option<MetaMode>,
     pub original: BTreeMap<String, String>,
+    /// JSON object keys must be strings, so this is written as a list.
+    #[serde(serialize_with = "obligations_as_list")]
     pub obligations: BTreeMap<Scope, BTreeMap<String, Obligation>>,
     /// Last verified readback.
     pub last_state: BTreeMap<String, String>,
@@ -197,6 +205,26 @@ pub struct Ledger {
     pub outcome: Option<Outcome>,
     pub message: Option<String>,
     pub acknowledged: bool,
+}
+
+fn obligations_as_list<S: serde::Serializer>(
+    m: &BTreeMap<Scope, BTreeMap<String, Obligation>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Row<'a> {
+        scope: &'a Scope,
+        field: &'a str,
+        #[serde(flatten)]
+        obligation: &'a Obligation,
+    }
+    s.collect_seq(m.iter().flat_map(|(scope, fields)| {
+        fields.iter().map(move |(field, obligation)| Row {
+            scope,
+            field,
+            obligation,
+        })
+    }))
 }
 
 pub(crate) fn norm_field(field: &str, raw: &str) -> String {
@@ -247,6 +275,9 @@ impl Ledger {
                     if to != norm_field(&c.field, &ob.original) {
                         if !ob.ours.contains(&to) {
                             ob.ours.push(to);
+                            if ob.ours.len() > OURS_KEPT {
+                                ob.ours.remove(0);
+                            }
                         }
                         ob.restored = false;
                     }

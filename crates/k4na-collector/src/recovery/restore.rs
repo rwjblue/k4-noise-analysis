@@ -127,6 +127,9 @@ fn field_label(field: &str) -> &'static str {
 /// Manual instructions for every changed field not known to be back.
 pub fn manual_steps(ledger: &Ledger) -> Vec<String> {
     let mut out = Vec::new();
+    if !ledger.is_dirty() {
+        return out;
+    }
     for (scope, field, ob) in ledger.dirty() {
         if scope == Scope::Session {
             continue;

@@ -7,6 +7,13 @@
 //! followed by good ones means corruption, and automatic recovery refuses.
 //! A running survey holds an exclusive OS lock on its journal, so a
 //! recovery cannot race it and a crashed process never leaves a stale lock.
+//!
+//! Journals live outside the measurement quotas, so they must stay small on
+//! their own: past [`COMPACT_BYTES`] the journal is rewritten as the minimal
+//! entry sequence that replays to the same ledger (verified before use),
+//! written to a locked side file, fsynced and renamed over the original.
+//! A crash at any point leaves either the old or the new journal, both
+//! complete.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -17,7 +24,12 @@ use k4na_core::time::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Entry, Ledger, Outcome};
+use super::{Change, Entry, Ledger, Outcome, Purpose};
+
+/// Journal size that triggers compaction. A compacted journal holds one
+/// capture per visited scope and at most [`super::OURS_KEPT`] values per
+/// field, so it stays far below this.
+pub const COMPACT_BYTES: u64 = 256 * 1024;
 
 /// Destination for journal lines. `append` must be durable when it
 /// returns `Ok`.
@@ -126,6 +138,7 @@ pub struct JournalInfo {
 
 struct Loaded {
     ledger: Ledger,
+    begin: Option<Entry>,
     started_utc_ns: Option<i64>,
     next_seq: u64,
     valid_len: u64,
@@ -135,6 +148,7 @@ struct Loaded {
 fn parse(path: &Path, bytes: &[u8]) -> Result<Loaded, JournalError> {
     let mut l = Loaded {
         ledger: Ledger::default(),
+        begin: None,
         started_utc_ns: None,
         next_seq: 0,
         valid_len: 0,
@@ -172,6 +186,7 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Loaded, JournalError> {
             .map_err(|e| JournalError::Invalid(format!("{} line {}: {e}", path.display(), i + 1)))?;
         if l.started_utc_ns.is_none() {
             l.started_utc_ns = Some(rec.utc_ns);
+            l.begin = Some(rec.entry);
         }
         l.next_seq += 1;
         offset += line.len();
@@ -276,6 +291,12 @@ pub struct Transaction {
     clock: Arc<dyn Clock>,
     /// Set after a failed append: nothing more may be changed.
     failed: bool,
+    /// The begin entry and its time, carried into compacted journals.
+    begin: Option<Entry>,
+    started_utc_ns: Option<i64>,
+    /// Bytes in the journal file and the size that triggers compaction.
+    bytes: u64,
+    compact_at: u64,
 }
 
 impl Transaction {
@@ -311,6 +332,10 @@ impl Transaction {
             next_seq: 0,
             clock,
             failed: false,
+            begin: None,
+            started_utc_ns: None,
+            bytes: 0,
+            compact_at: COMPACT_BYTES,
         }
     }
 
@@ -334,6 +359,10 @@ impl Transaction {
             next_seq: loaded.next_seq,
             clock,
             failed: false,
+            begin: loaded.begin,
+            started_utc_ns: loaded.started_utc_ns,
+            bytes: loaded.valid_len,
+            compact_at: loaded.valid_len + COMPACT_BYTES,
         })
     }
 
@@ -356,21 +385,160 @@ impl Transaction {
         }
         let mut next = self.ledger.clone();
         next.apply(&e).map_err(JournalError::Invalid)?;
-        let rec = Record {
-            seq: self.next_seq,
-            utc_ns: self.clock.now().utc_ns,
-            entry: e,
-        };
-        let json = serde_json::to_string(&rec).map_err(|e| JournalError::Invalid(e.to_string()))?;
-        let line = format!("{} {json}\n", check(&json));
+        let utc_ns = self.clock.now().utc_ns;
+        let begin = matches!(e, Entry::Begin { .. }).then(|| e.clone());
+        let line = line(self.next_seq, utc_ns, e)?;
         if let Err(e) = self.sink.append(line.as_bytes()) {
             self.failed = true;
             return Err(e.into());
         }
+        if begin.is_some() {
+            self.begin = begin;
+            self.started_utc_ns = Some(utc_ns);
+        }
         self.next_seq += 1;
+        self.bytes += line.len() as u64;
         self.ledger = next;
+        if self.bytes >= self.compact_at {
+            // The entry is already durable; a failed compaction before the
+            // rename leaves the old journal in use and is retried later.
+            let _ = self.compact();
+            self.compact_at = self.bytes + COMPACT_BYTES;
+        }
         Ok(())
     }
+
+    /// Bytes in the journal file.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The minimal entry sequence that replays to the current ledger, or
+    /// `None` if this ledger cannot be reproduced exactly.
+    fn compacted(&self) -> Option<Vec<Entry>> {
+        let l = &self.ledger;
+        let mut out = vec![self.begin.clone()?];
+        for (scope, fields) in &l.obligations {
+            out.push(Entry::Capture {
+                scope: scope.clone(),
+                values: fields.iter().map(|(f, ob)| (f.clone(), ob.original.clone())).collect(),
+            });
+            let changes: Vec<Change> = fields
+                .iter()
+                .flat_map(|(f, ob)| {
+                    ob.ours.iter().map(move |v| Change {
+                        scope: scope.clone(),
+                        field: f.clone(),
+                        from: Some(ob.original.clone()),
+                        to: v.clone(),
+                        wire: String::new(),
+                    })
+                })
+                .collect();
+            if !changes.is_empty() {
+                out.push(Entry::Intent {
+                    purpose: Purpose::Survey,
+                    changes,
+                });
+            }
+        }
+        out.push(Entry::Verified {
+            state: l.last_state.clone(),
+        });
+        if !l.in_flight.is_empty() {
+            out.push(Entry::Intent {
+                purpose: Purpose::Survey,
+                changes: l.in_flight.clone(),
+            });
+        }
+        for (scope, fields) in &l.obligations {
+            let restored: Vec<String> = fields
+                .iter()
+                .filter(|(_, ob)| ob.restored)
+                .map(|(f, _)| f.clone())
+                .collect();
+            if !restored.is_empty() {
+                out.push(Entry::Restored {
+                    scope: scope.clone(),
+                    fields: restored,
+                });
+            }
+        }
+        if let Some(outcome) = l.outcome {
+            out.push(Entry::End {
+                outcome,
+                message: l.message.clone().unwrap_or_default(),
+                manual: Vec::new(),
+            });
+        }
+        if l.acknowledged {
+            out.push(Entry::Acknowledged {
+                note: "carried over by compaction".into(),
+            });
+        }
+        out.push(Entry::Note {
+            message: format!("compacted from {} entries", self.next_seq),
+        });
+        let mut replay = Ledger::default();
+        for e in &out {
+            replay.apply(e).ok()?;
+        }
+        (replay == *l).then_some(out)
+    }
+
+    /// Rewrites a file-backed journal as [`Self::compacted`]. Returns
+    /// whether it was replaced. An error after the rename means later
+    /// entries might not be durable, so the transaction refuses them.
+    fn compact(&mut self) -> Result<bool, JournalError> {
+        let Some(path) = self.path.clone() else {
+            return Ok(false);
+        };
+        let Some(entries) = self.compacted() else {
+            return Ok(false);
+        };
+        let now = self.clock.now().utc_ns;
+        let mut text = String::new();
+        let n = entries.len() as u64;
+        for (seq, e) in (0..).zip(entries) {
+            let utc_ns = if seq == 0 {
+                self.started_utc_ns.unwrap_or(now)
+            } else {
+                now
+            };
+            text.push_str(&line(seq, utc_ns, e)?);
+        }
+        // The rewrite must replay to the same ledger before it replaces
+        // anything.
+        let side = path.with_extension("jsonl.compact");
+        if parse(&side, text.as_bytes()).map(|l| l.ledger).ok().as_ref() != Some(&self.ledger) {
+            return Ok(false);
+        }
+        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&side)?;
+        // Locked before the rename, so the journal is never seen unlocked.
+        file.try_lock().map_err(|_| JournalError::Locked(side.clone()))?;
+        if let Err(e) = file.write_all(text.as_bytes()).and_then(|()| file.sync_all()) {
+            let _ = std::fs::remove_file(&side);
+            return Err(e.into());
+        }
+        std::fs::rename(&side, &path)?;
+        // Appends must go to the new file from here on.
+        self.sink = Box::new(FileSink { file });
+        self.next_seq = n;
+        self.bytes = text.len() as u64;
+        if let Some(dir) = path.parent()
+            && let Err(e) = File::open(dir).and_then(|d| d.sync_all())
+        {
+            self.failed = true;
+            return Err(e.into());
+        }
+        Ok(true)
+    }
+}
+
+fn line(seq: u64, utc_ns: i64, entry: Entry) -> Result<String, JournalError> {
+    let rec = Record { seq, utc_ns, entry };
+    let json = serde_json::to_string(&rec).map_err(|e| JournalError::Invalid(e.to_string()))?;
+    Ok(format!("{} {json}\n", check(&json)))
 }
 
 #[cfg(test)]
@@ -517,5 +685,72 @@ mod tests {
         let path = t.path().unwrap().to_owned();
         drop(t);
         assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+    }
+
+    /// A long survey: one FA intent and verification per tile.
+    fn tile(t: &mut Transaction, band: u8, fa: u64) {
+        let scope = Scope::Band(band);
+        if !t.ledger().has_capture(&scope, "FA") {
+            t.record(Entry::Capture {
+                scope: scope.clone(),
+                values: BTreeMap::from([("FA".into(), "00007000000".into())]),
+            })
+            .unwrap();
+        }
+        t.record(Entry::Intent {
+            purpose: Purpose::Survey,
+            changes: vec![Change {
+                scope,
+                field: "FA".into(),
+                from: None,
+                to: format!("{fa:011}"),
+                wire: format!("FA{fa:011};"),
+            }],
+        })
+        .unwrap();
+        t.record(Entry::Verified {
+            state: BTreeMap::from([("BN".into(), format!("{band:02}")), ("FA".into(), format!("{fa:011}"))]),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn long_journals_are_compacted_to_an_equivalent_locked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = Transaction::begin(dir.path(), begin("a"), clock()).unwrap();
+        let path = t.path().unwrap().to_owned();
+        let mut peak = 0;
+        // About 450 bytes per tile: several compactions.
+        for i in 0..1500u64 {
+            tile(&mut t, 3 + (i % 5) as u8, 7_000_000 + i * 1000);
+            peak = peak.max(std::fs::metadata(&path).unwrap().len());
+        }
+        // Compacted size plus one threshold's worth of appends.
+        assert!(peak <= COMPACT_BYTES + 16 * 1024, "peak {peak}");
+        assert!(t.bytes() < COMPACT_BYTES, "{}", t.bytes());
+        assert_eq!(&load(&path).unwrap(), t.ledger(), "the file replays to the ledger");
+        // Only the last two (normalized) values per field are kept.
+        let ob = t.ledger().obligation(&Scope::Band(7), "FA").unwrap();
+        assert_eq!(ob.ours, vec!["8494000".to_owned(), "8499000".to_owned()]);
+        // Still locked by this transaction after the rename, and no side
+        // file is left behind.
+        assert_eq!(list(dir.path()).unwrap()[0].status, JournalStatus::Running);
+        assert!(matches!(
+            Transaction::resume(&path, clock()),
+            Err(JournalError::Locked(_))
+        ));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        // The original start time survives compaction.
+        let started = list(dir.path()).unwrap()[0].started_utc_ns;
+        let expected = t.ledger().clone();
+        drop(t);
+        let r = Transaction::resume(&path, clock()).unwrap();
+        assert_eq!(r.ledger(), &expected);
+        assert_eq!(list(dir.path()).unwrap()[0].started_utc_ns, started);
+        assert!(serde_json::to_value(r.ledger()).is_ok(), "ledger is JSON-serializable");
     }
 }
