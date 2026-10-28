@@ -505,6 +505,42 @@ fn measurement_settings_round_trip_and_v2_shards_stay_readable() {
 }
 
 #[test]
+fn verified_receiver_settings_decide_the_comparability_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let at = |n: i64| n * NS_PER_SEC;
+    let with = |sid: &str, n: u64, pa: &str| {
+        let mut v = visit(sid, n, at(n as i64));
+        v.radio_state = [("PA".to_string(), pa.to_string()), ("FA".to_string(), format!("{n}"))].into();
+        v
+    };
+    let (mut store, _) = Store::open(opts(&root), big_disk(), session("s1"), ts(0)).unwrap();
+    store.write_visit(&with("s1", 1, "1"), &[]).unwrap();
+    store.write_visit(&with("s1", 2, "1"), &[]).unwrap();
+    store.write_visit(&with("s1", 3, "0"), &[]).unwrap();
+    store.close(ts(at(4)), "end").unwrap();
+    // A later session with the same verified settings joins the segment.
+    let (mut store, _) = Store::open(opts(&root), big_disk(), session("s2"), ts(at(5))).unwrap();
+    store.write_visit(&with("s2", 6, "1"), &[]).unwrap();
+    store.close(ts(at(7)), "end").unwrap();
+
+    let ds = DataSet::open(&root).unwrap();
+    let seg: std::collections::BTreeMap<String, String> = ds
+        .visits()
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.visit_id, v.segment_id))
+        .collect();
+    assert_eq!(seg.len(), 4, "history is kept");
+    assert_eq!(seg["visit-1"], seg["visit-2"], "FA is not a comparability key");
+    assert_ne!(seg["visit-1"], seg["visit-3"], "a preamp change starts a new segment");
+    assert_eq!(
+        seg["visit-1"], seg["visit-6"],
+        "segment ids are deterministic across sessions"
+    );
+}
+
+#[test]
 fn unsupported_schema_versions_are_rejected_by_readers() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("data");

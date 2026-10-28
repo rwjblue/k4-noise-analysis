@@ -79,8 +79,9 @@ and abort/gap reason. Actual bands are half-open [low_hz, high_hz).
 The `band_id` is the survey profile's range id (for example `40m` or
 `40m-cw`). Survey visits store the resolved measurement settings and CAT
 meta-mode as `measurement_json` (a JSON object of strings, `as-found`
-where the profile left a setting alone); the verified values are in the
-segment's state.
+where the profile left a setting alone), plus the effective values
+verified by readback as `verified.<prefix>` raw readback text; the same
+values are part of the segment's state.
 
 Each visit also records its antenna: `antenna_id`, `antenna_revision`,
 `antenna_port` (the registry port) and `antenna_observed_port` (the port

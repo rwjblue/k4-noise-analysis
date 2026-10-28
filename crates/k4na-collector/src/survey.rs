@@ -1267,7 +1267,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         v.requested_span_hz = self.baseline.u64(Query::Span).and_then(|s| u32::try_from(s).ok());
         v.settle_ms = self.profile.settle_ms;
         v.settle_discarded = settled.discarded;
-        v.measurement = measure::visit_settings(&settings, self.meta);
+        // The baseline is the readback verified after the settings.
+        v.measurement = measure::visit_settings(&settings, self.meta, &self.baseline);
         let visit_antenna = VisitAntenna::configured(antenna, self.observed_port());
         let (v, halt) = self.dwell(v).await;
         // Confirm state at the end of the dwell before calling it complete.

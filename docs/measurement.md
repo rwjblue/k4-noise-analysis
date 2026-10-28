@@ -102,11 +102,16 @@ key, so an operator change mid-survey stops it without further setters.
 `survey --dry-run` prints what each antenna's settings would change on
 the current band.
 
-Each survey visit stores the resolved settings (including `as-found`
-fields) and the CAT meta-mode in `measurement_json`. Its state readback
-includes every measurement key, so comparability segments split whenever
-the verified settings differ; `as-found` and an explicit setting with the
-same readback share a segment. Passive visits have no `measurement_json`.
+Each survey visit stores in `measurement_json` the resolved settings
+(including `as-found` fields), the CAT meta-mode, and the effective
+values verified by readback as `verified.<prefix>` (raw readback text in
+that mode, for example `"verified.PA": "0"`). Its state readback
+includes every measurement key, so the comparability segment id (a hash
+of band, antenna, port, pan, rate, versions and the non-frequency state)
+changes whenever the verified settings differ, and is the same across
+cycles and sessions when they do not. `as-found` and an explicit setting
+with the same readback share a segment. Earlier visits keep their
+segment. Passive visits have no `measurement_json`.
 
 The pan span follows the same rule: a band that recalls a span the
 whitelist cannot send back (30 m's `#SPN5000`) is surveyed at that span,

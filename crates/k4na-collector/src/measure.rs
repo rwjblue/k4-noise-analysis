@@ -287,10 +287,17 @@ pub fn plan(
 }
 
 /// The profile settings recorded with each visit (`as-found` or the
-/// configured value) plus the CAT meta-mode the readbacks are in.
-pub fn visit_settings(s: &MeasurementSettings, mode: MetaMode) -> BTreeMap<String, String> {
+/// configured value), the CAT meta-mode the readbacks are in, and the
+/// effective values as verified by readback (`verified.<prefix>`, raw
+/// readback text in that mode).
+pub fn visit_settings(s: &MeasurementSettings, mode: MetaMode, verified: &Readback) -> BTreeMap<String, String> {
     let mut m = s.to_map();
     m.insert("cat_meta_mode".into(), mode.as_str().into());
+    for q in KEYS {
+        if let Some(raw) = verified.raw(q) {
+            m.insert(format!("verified.{}", q.prefix()), raw.to_owned());
+        }
+    }
     m
 }
 
