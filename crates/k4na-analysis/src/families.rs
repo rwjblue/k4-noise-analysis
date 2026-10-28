@@ -252,10 +252,10 @@ pub fn find_families(carriers: &[Carrier], p: &Params) -> Vec<Family> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn carrier(hz: f64) -> Carrier {
+    pub(crate) fn carrier(hz: f64) -> Carrier {
         Carrier {
             band_id: "10m".into(),
             antenna_id: "rx1".into(),

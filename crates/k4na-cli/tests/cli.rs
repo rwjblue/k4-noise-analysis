@@ -317,6 +317,12 @@ fn end_to_end_against_tcp_simulator() {
         .success()
         .stdout(predicate::str::starts_with("band_id,antenna_id,spacing_hz,"));
     k4na()
+        .args(["analyze", "series", "--format", "csv", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("series,fundamental_hz,"));
+    k4na()
         .args(["analyze", "episodes", "--format", "csv", "--data"])
         .arg(dir.path().join("data"))
         .assert()

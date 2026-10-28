@@ -48,6 +48,8 @@
   <div class="panel scroll"><table id="groups"></table></div>
   <h2>Floor episodes</h2>
   <div class="panel scroll"><table id="episodes"></table></div>
+  <h2>Harmonic series (combs on harmonics of one fundamental)</h2>
+  <div class="panel scroll"><table id="series"></table></div>
   <h2>Carrier families (combs)</h2>
   <div class="panel scroll"><table id="families"></table></div>
   <h2>Carriers</h2>
@@ -181,6 +183,13 @@ function tables() {
     A.floor_episodes.map((e) => [e.band_id, e.antenna_id, shortSeg(e.segment_id), e.start_after_utc_ns == null ? "?" : fmtTime(e.start_after_utc_ns),
       fmtTime(e.start_utc_ns), fmtTime(e.end_utc_ns), e.end_before_utc_ns == null ? "?" : fmtTime(e.end_before_utc_ns), e.visits,
       `${e.tiles}/${e.tiles_analyzed}`, e.median_rise_db.toFixed(1), e.max_rise_db.toFixed(1)]));
+  table("series", [["#"], ["f0 Hz"], ["chance"], ["band", 1], ["antenna", 1], ["comb kHz"], ["x f0"], ["harmonics", 1], ["lines"], ["mean offset Hz"], ["rms Hz"]],
+    (A.harmonic_series || []).flatMap((h, i) => [
+      ...h.families.map((f) => [i + 1, h.fundamental_hz.toFixed(2), h.false_alarm.toExponential(1), f.band_id, f.antenna_id,
+        (f.family_spacing_hz / 1e3).toFixed(3), f.multiple, `${f.first_harmonic}–${f.last_harmonic}`, f.members, f.mean_residual_hz.toFixed(0), f.residual_rms_hz.toFixed(0)]),
+      ...h.on_harmonics.map((c) => [i + 1, "", "", c.band_id, c.antenna_id, `carrier ${(c.hz / 1e3).toFixed(3)}`, "", String(c.harmonic), "", c.residual_hz.toFixed(0),
+        `${h.on_harmonics.length} on harmonics, ${h.on_harmonics_expected_by_chance.toFixed(1)} by chance`]),
+    ]));
   table("families", [["band", 1], ["antenna", 1], ["spacing kHz"], ["members"], ["grid lines"], ["fill"], ["MHz", 1], ["rms Hz"], ["chance"]],
     A.families.map((f) => [f.band_id, f.antenna_id, (f.spacing_hz / 1e3).toFixed(3), f.members.length, f.grid_positions, (f.fill * 100).toFixed(0) + "%",
       `${mhz(f.first_hz)}–${mhz(f.last_hz)}`, f.residual_rms_hz.toFixed(0), f.false_alarm.toExponential(1)]));

@@ -26,6 +26,8 @@ fn an_empty_root_renders_a_self_contained_document() {
     let d = embedded(&a);
     assert_eq!(d["report"], k4na_report::REPORT_VERSION);
     assert_eq!(d["analysis"]["provenance"]["visits_analyzed"], 0);
+    assert!(d["analysis"]["harmonic_series"].as_array().unwrap().is_empty());
+    assert!(a.contains("id=\"series\""));
     assert!(d["grids"].as_array().unwrap().is_empty());
 }
 

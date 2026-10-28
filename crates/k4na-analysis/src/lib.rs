@@ -10,6 +10,7 @@ pub mod bands;
 pub mod carriers;
 pub mod episodes;
 pub mod families;
+pub mod series;
 pub mod spectrum;
 pub mod timing;
 
@@ -25,6 +26,7 @@ pub use bands::BandHour;
 pub use carriers::Carrier;
 pub use episodes::{FloorActivity, FloorEpisode};
 pub use families::{Family, find_families};
+pub use series::{HarmonicSeries, find_series};
 pub use spectrum::VisitSpectrum;
 pub use timing::{Feature, TimingGroup};
 
@@ -192,6 +194,9 @@ pub struct Analysis {
     pub carriers: Vec<Carrier>,
     /// Carriers on a common frequency grid, per band and antenna.
     pub families: Vec<Family>,
+    /// Families on several bands (or several on one band) that are
+    /// harmonics of one fundamental.
+    pub harmonic_series: Vec<HarmonicSeries>,
     /// Floor on/off behaviour and episodes per band, antenna and segment.
     pub floor_activity: Vec<FloorActivity>,
     pub floor_episodes: Vec<FloorEpisode>,
@@ -306,6 +311,7 @@ pub fn run(
             .then(a.hz.total_cmp(&b.hz))
     });
     let families = find_families(&carriers, params);
+    let harmonic_series = find_series(&families, &carriers, params);
     let name = |p: &std::path::Path| {
         p.file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -341,6 +347,7 @@ pub fn run(
             params,
         ),
         families,
+        harmonic_series,
         carriers,
         floor_activity,
         floor_episodes,
@@ -486,6 +493,36 @@ pub fn timing_groups_csv(rows: &[TimingGroup]) -> String {
 }
 
 /// Carrier rows as CSV, one header line.
+/// One row per family in each series.
+pub fn harmonic_series_csv(rows: &[HarmonicSeries]) -> String {
+    let mut s = String::from(
+        "series,fundamental_hz,series_rms_hz,false_alarm,band_id,antenna_id,family_spacing_hz,multiple,first_harmonic,last_harmonic,members,mean_residual_hz,residual_rms_hz,chance\n",
+    );
+    for (i, h) in rows.iter().enumerate() {
+        for f in &h.families {
+            let _ = writeln!(
+                s,
+                "{},{:.3},{:.1},{:.3e},{},{},{:.2},{},{},{},{},{:.1},{:.1},{:.3e}",
+                i + 1,
+                h.fundamental_hz,
+                h.residual_rms_hz,
+                h.false_alarm,
+                csv_field(&f.band_id),
+                csv_field(&f.antenna_id),
+                f.family_spacing_hz,
+                f.multiple,
+                f.first_harmonic,
+                f.last_harmonic,
+                f.members,
+                f.mean_residual_hz,
+                f.residual_rms_hz,
+                f.chance,
+            );
+        }
+    }
+    s
+}
+
 pub fn carriers_csv(rows: &[Carrier]) -> String {
     let mut s = String::from(
         "band_id,antenna_id,hz,min_hz,max_hz,class,detections,exposure,masked,persistence,steady_fraction,median_level_db,median_excess_db,max_excess_db,median_width_hz,segments,first_utc,last_utc\n",

@@ -121,6 +121,24 @@ Across visits:
   0.01. Each carrier joins at most one family. A family is a pattern
   (harmonics of one switching or clock source are a common cause), not
   a source identification.
+- `analyze series` looks for families that are harmonics of one
+  fundamental `f0` (lines at `n * f0`, no free offset), as a switching or
+  clock source radiates: on several bands, or several combs on one.
+  Candidates are each family's spacing divided by 1-4, refitted (least
+  squares through the origin) to that family's lines; a family joins
+  when all its members lie within the carrier tolerance of a harmonic
+  and its spacing is 1-4 times `f0`; the fundamental is refitted over
+  all members, and the largest fundamental explaining a set of families
+  is kept. One family is never a series: at harmonic numbers in the
+  hundreds a tiny change of `f0` shifts all its lines almost equally,
+  like a free offset, so a single comb fits *some* `f0`. Each other
+  family's chance of fitting by accident is `2 tol / f0` (offset) times
+  `2 tol / (grid positions * f0)` (spacing); `false_alarm` is the
+  candidate count times the product over all families but the least
+  likely one, and must be at most 0.01. Carriers outside the series'
+  families within half the tolerance of a harmonic are listed with the
+  number expected by chance; they are not used in the fit. Each family
+  joins at most one series.
 - `analyze episodes` finds intervals when a band's floor rose over its
   quiet baseline. Each tile within a band, antenna and segment is one
   series of per-visit floors (tiles of one band can rise by different
@@ -187,8 +205,8 @@ and antenna, in frequency order:
   marks an outage longer than twice the typical pass interval;
 - the median visit floor per pass, and a warning when the grid mixes
   receiver-settings segments;
-- tables of timing groups, floor episodes, families, carriers (by
-  persistence) and band/hour floors.
+- tables of timing groups, floor episodes, harmonic series, families,
+  carriers (by persistence) and band/hour floors.
 
 Rows are passes, not uniform time, so the Y axis is labelled with the
 first and last pass times; hover shows each cell's time and values. UTC
@@ -215,7 +233,12 @@ carriers 15.96 kHz apart into one group (anchored on the 40 m floor:
 onsets 05:35, 05:54, 06:12, 06:27, 06:53); version 3 adds two more
 31.93 kHz comb lines (33 members). The 40 m 9.995 kHz comb's lines lie
 near multiples of 20 kHz (7000.05 ... 7280.08 and 10100.11-10140.09
-kHz), so the 9.995 kHz fit is a sub-multiple. That comb is masked while
+kHz), so the 9.995 kHz fit is a sub-multiple. `analyze series` finds
+the 40 m 15.96 kHz and 20 m 31.93 kHz combs are one harmonic series:
+f0 = 15967.69 Hz, 40 m harmonics 439-457 (every one), 20 m 878-898
+(every other one), mean offsets -4 and +2 Hz, chance 1.3e-4; the three
+30 m carriers of the cycling group are harmonics 633-635 (0.7 expected
+by chance). The 9.995 kHz comb fits no shared fundamental. That comb is masked while
 the cycling source raises the floor. Version 2 put it with three 30 m
 carriers in an 18-member second group whose "onsets" were the cycling
 floor's ends; version 3 dissolves that group into a 3-member one (30 m

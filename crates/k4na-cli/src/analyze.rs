@@ -74,6 +74,11 @@ pub enum AnalyzeCmd {
         #[command(flatten)]
         select: Select,
     },
+    /// Combs on several bands that are harmonics of one fundamental.
+    Series {
+        #[command(flatten)]
+        select: Select,
+    },
     /// Intervals when a band's noise floor rose over its quiet baseline,
     /// with duty cycle and repetition per band.
     Episodes {
@@ -162,6 +167,19 @@ pub fn run(cmd: AnalyzeCmd, json: bool) -> Result<ExitCode> {
                 Format::Json => json_of(&a.provenance, "families", serde_json::to_value(&a.families)?)?,
                 Format::Csv => families_csv(&a.families),
                 Format::Text => families_text(&a),
+            };
+            select.emit(&out)?;
+        }
+        AnalyzeCmd::Series { select } => {
+            let a = select.analyze()?;
+            let out = match format(&select) {
+                Format::Json => json_of(
+                    &a.provenance,
+                    "harmonic_series",
+                    serde_json::to_value(&a.harmonic_series)?,
+                )?,
+                Format::Csv => k4na_analysis::harmonic_series_csv(&a.harmonic_series),
+                Format::Text => series_text(&a),
             };
             select.emit(&out)?;
         }
@@ -430,6 +448,60 @@ fn families_text(a: &Analysis) -> String {
         );
     }
     s += "\nA family is a frequency pattern (harmonics of one switching or clock source are a common cause),\nnot a source identification. chance = expected families this strong from unrelated carriers.\n";
+    s
+}
+
+fn series_text(a: &Analysis) -> String {
+    let mut s = header(a);
+    s += &format!(
+        "{} harmonic series among {} famil(ies)\n",
+        a.harmonic_series.len(),
+        a.families.len()
+    );
+    for (i, h) in a.harmonic_series.iter().enumerate() {
+        s += &format!(
+            "\nseries {}: fundamental {:.2} Hz on {}; rms {:.0} Hz from harmonics, chance {:.1e}\n",
+            i + 1,
+            h.fundamental_hz,
+            h.bands.join(", "),
+            h.residual_rms_hz,
+            h.false_alarm,
+        );
+        for f in &h.families {
+            s += &format!(
+                "  {:<5} {:<11} comb {:>9.3} kHz = {} x f0, harmonics {}-{} ({} lines), mean offset {:+.0} Hz, rms {:.0} Hz\n",
+                f.band_id,
+                f.antenna_id,
+                f.family_spacing_hz / 1000.0,
+                f.multiple,
+                f.first_harmonic,
+                f.last_harmonic,
+                f.members,
+                f.mean_residual_hz,
+                f.residual_rms_hz,
+            );
+        }
+        if !h.on_harmonics.is_empty() {
+            s += &format!(
+                "  other carriers on its harmonics: {} ({:.1} expected by chance)\n",
+                h.on_harmonics.len(),
+                h.on_harmonics_expected_by_chance
+            );
+            for c in &h.on_harmonics {
+                s += &format!(
+                    "    {:<5} {:<11} {:>12.3} kHz  harmonic {:<5} {:+.0} Hz\n",
+                    c.band_id,
+                    c.antenna_id,
+                    c.hz / 1000.0,
+                    c.harmonic,
+                    c.residual_hz
+                );
+            }
+        }
+    }
+    s += "\nA series is a pattern: lines at integer multiples of one frequency, as a switching or clock\n\
+          source radiates. It is not a source identification. chance = expected series this strong\n\
+          from unrelated combs; a single comb never forms a series on its own.\n";
     s
 }
 
