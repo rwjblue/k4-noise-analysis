@@ -124,12 +124,24 @@ fn field_label(field: &str) -> &'static str {
     Query::from_prefix(field).map_or("setting", label)
 }
 
+/// A journaled (normalized) value as the radio would read it back, for
+/// people: `BN03`, not `BN3`. Falls back to the field and raw value.
+pub fn wire_value(field: &str, meta: MetaMode, value: &str) -> String {
+    Query::from_prefix(field)
+        .and_then(|q| setter_for(q, meta, value))
+        .map_or_else(
+            || format!("{field}{value}"),
+            |s| s.wire().trim_end_matches(';').to_owned(),
+        )
+}
+
 /// Manual instructions for every changed field not known to be back.
 pub fn manual_steps(ledger: &Ledger) -> Vec<String> {
     let mut out = Vec::new();
     if !ledger.is_dirty() {
         return out;
     }
+    let meta = ledger.meta.unwrap_or(MetaMode::Basic);
     for (scope, field, ob) in ledger.dirty() {
         if scope == Scope::Session {
             continue;
@@ -141,7 +153,7 @@ pub fn manual_steps(ledger: &Ledger) -> Vec<String> {
             ob.original,
             ob.ours
                 .iter()
-                .map(|v| format!("{field}{v}"))
+                .map(|v| wire_value(&field, meta, v))
                 .collect::<Vec<_>>()
                 .join(" or ")
         ));
@@ -498,6 +510,8 @@ pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreRe
     let band = rb.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
     let mut scopes: Vec<Scope> = ledger.dirty().into_iter().map(|(s, _, _)| s).collect();
     scopes.dedup();
+    // In restore order: the band's own settings first, the band change last.
+    scopes.sort_by_key(|s| *s == Scope::Session);
     let mut sent = Vec::new();
     for scope in scopes {
         let here = match &scope {
@@ -532,7 +546,7 @@ pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreRe
         }
     }
     let msg = format!(
-        "dry run: would send {} on the current band, then settle other bands on arrival; nothing was sent",
+        "would send {} for the current band (other bands are settled on arrival); nothing was sent",
         if sent.is_empty() {
             "nothing".to_owned()
         } else {
@@ -592,6 +606,16 @@ mod tests {
         })
         .unwrap();
         l
+    }
+
+    #[test]
+    fn journaled_values_are_shown_as_the_radio_reads_them() {
+        let b = MetaMode::Basic;
+        assert_eq!(wire_value("BN", b, "3"), "BN03");
+        assert_eq!(wire_value("FA", b, "7030000"), "FA00007030000");
+        assert_eq!(wire_value("#AVG", b, "4"), "#AVG04");
+        assert_eq!(wire_value("PA", b, "0"), "PA0");
+        assert_eq!(wire_value("XX", b, "7"), "XX7");
     }
 
     #[test]

@@ -166,12 +166,14 @@ fn show(info: &JournalInfo, json: bool) -> Result<ExitCode> {
     if dirty.is_empty() {
         println!("nothing the collector changed is pending");
     }
+    let meta = ledger.meta.unwrap_or(k4na_collector::measure::MetaMode::Basic);
     for (scope, field, ob) in dirty {
+        let ours: Vec<String> = ob.ours.iter().map(|v| recovery::wire_value(&field, meta, v)).collect();
         println!(
             "  pending: {} {field}: found {field}{}, collector set {}",
             scope.describe(),
             ob.original,
-            ob.ours.join(" / ")
+            ours.join(" or ")
         );
     }
     for m in &manual {
@@ -185,7 +187,11 @@ fn print_report(r: &RestoreReport, json: bool) {
         println!("{}", serde_json::to_string(r).unwrap_or_default());
         return;
     }
-    println!("restore {}: {}", r.outcome.as_str(), r.message);
+    if r.dry_run {
+        println!("dry run (GET only): {}", r.message);
+    } else {
+        println!("restore {}: {}", r.outcome.as_str(), r.message);
+    }
     for f in &r.fields {
         if f.result == "already_original" {
             continue;

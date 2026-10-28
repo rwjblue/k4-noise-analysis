@@ -19,7 +19,9 @@ use k4na_core::measure::band_label;
 use serde::{Deserialize, Serialize};
 
 pub use journal::{COMPACT_BYTES, JournalError, JournalInfo, JournalSink, JournalStatus, Transaction, list, load};
-pub use restore::{Decision, FieldReport, RestoreReport, decide, manual_steps, plan, restore, state_queries};
+pub use restore::{
+    Decision, FieldReport, RestoreReport, decide, manual_steps, plan, restore, state_queries, wire_value,
+};
 
 use crate::cat::Query;
 use crate::measure::{self, MetaMode};
