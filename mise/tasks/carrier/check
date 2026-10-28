@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Check Carrier formatting, lint and offline tests with locked dependencies"
+set -euo pipefail
+cd "${MISE_PROJECT_ROOT:?}"
+env -u CARRIER_USERNAME -u CARRIER_PASSWORD cargo build --locked -p k4na-cli
+cd integrations/carrier
+uv run --locked ruff format --check .
+uv run --locked ruff check .
+uv run --locked python -m unittest discover -s tests -v

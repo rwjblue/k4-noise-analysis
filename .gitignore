@@ -17,5 +17,12 @@
 *.sqlite-shm
 *.sqlite-journal
 
+# Python integration environments, caches and build products
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+*.egg-info/
+
 # OS/editor
 .DS_Store

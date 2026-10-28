@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#MISE description="Retry completed HVAC marks offline (no Carrier or radio connection)"
+#USAGE flag "--data <dir>" default="data" help="Existing RF measurement root to receive queued HVAC marks"
+#USAGE flag "--k4na <file>" default="./target/debug/k4na" help="Offline marks importer executable"
+#USAGE flag "--telemetry-dir <dir>" default="output/carrier" help="Existing HVAC telemetry directory for this dataset"
+#USAGE flag "--max-bytes <bytes>" default="67108864" help="Telemetry byte budget, including import headroom"
+#USAGE flag "--min-free-bytes <bytes>" default="1073741824" help="Free-space reserve for offline mark import"
+set -euo pipefail
+cd "${MISE_PROJECT_ROOT:?}"
+env -u CARRIER_USERNAME -u CARRIER_PASSWORD cargo build --locked -p k4na-cli
+exec uv run --locked --project integrations/carrier python integrations/carrier/run.py import "$@"

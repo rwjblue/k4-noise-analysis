@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#MISE description="Record RF and Carrier telemetry together (passive by default)"
+#USAGE include file="../carrier-common.usage.kdl"
+#USAGE flag "--config <file>" default="config/local.toml" help="Station config; Carrier credentials are loaded from .env"
+#USAGE flag "--mode <mode>" default="capture" help="Passive capture or explicitly authorized survey" {
+#USAGE   choices "capture" "survey"
+#USAGE }
+#USAGE flag "--profile <file>" help="Optional capture/survey profile TOML"
+#USAGE flag "--allow-retune" help="Explicit CLI retune consent for survey; station consent is also required"
+#USAGE flag "--without-hvac" help="Explicitly skip Carrier access and mark HVAC coverage unknown"
+#USAGE flag "--raw-full-rate <duration>" help="Retain full-rate RF frames for a bounded period, e.g. 5m"
+#USAGE flag "--raw-full-rate-max-bytes <bytes>" help="RF full-rate byte cap; requires --raw-full-rate"
+set -euo pipefail
+cd "${MISE_PROJECT_ROOT:?}"
+env -u CARRIER_USERNAME -u CARRIER_PASSWORD cargo build --locked -p k4na-cli
+# Forward only the original argv, not Usage environment defaults: retune
+# consent must be explicit on the command line, never synthesized from env.
+exec uv run --locked --project integrations/carrier python integrations/carrier/run.py record "$@"

@@ -22,9 +22,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      # Installs the Rust toolchain pinned in mise.toml.
+      # Installs the Rust, Python and uv versions pinned in mise.toml/mise.lock.
       - uses: jdx/mise-action@v2
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo test --workspace --locked
+      - run: mise run carrier:check

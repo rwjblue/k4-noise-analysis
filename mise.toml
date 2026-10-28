@@ -4,6 +4,12 @@
 # Bump deliberately to the newest stable Rust release.
 [tools]
 rust = { version = "1.99.1", components = "clippy,rustfmt", profile = "minimal" }
+python = "3.14.4"
+uv = "0.11.7"
+
+# Optional, gitignored operator credentials. Never source this from a script.
+[env]
+_.file = ".env"
 
 [tasks.fmt]
 description = "Format all Rust code"
@@ -27,5 +33,5 @@ run = "cargo test --release --locked -p k4na-collector --test long_run -- --noca
 
 [tasks.ci]
 description = "Everything CI runs, in order"
-depends = ["lint"]
+depends = ["lint", "carrier:check"]
 run = "cargo test --workspace --locked"

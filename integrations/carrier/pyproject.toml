@@ -1,0 +1,18 @@
+[project]
+name = "k4na-carrier"
+version = "0.1.0"
+description = "Read-only Carrier telemetry and supervised K4 recording"
+requires-python = ">=3.14,<3.15"
+dependencies = ["carrier-api==3.6.2"]
+
+[dependency-groups]
+dev = ["ruff>=0.14,<1"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

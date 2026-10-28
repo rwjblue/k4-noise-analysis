@@ -1,0 +1,10 @@
+// Shared by record and carrier:log. Keep defaults in sync with cli.parser().
+flag "--duration <duration>" default="8h" help="Recording duration, e.g. 5m, 8h or 1h30m"
+flag "--k4na <file>" default="./target/debug/k4na" help="RF/marks CLI executable (built before recording)"
+flag "--telemetry-dir <dir>" default="output/carrier" help="Private, capped HVAC telemetry directory"
+flag "--poll-seconds <seconds>" default="30" help="Carrier polling interval; minimum 5 seconds"
+flag "--timeout-seconds <seconds>" default="20" help="Timeout for each Carrier request"
+flag "--max-age-seconds <seconds>" default="600" help="Maximum source status age before it is unknown"
+flag "--max-bytes <bytes>" default="67108864" help="Total HVAC telemetry byte cap; stops logging rather than deleting"
+flag "--shard-bytes <bytes>" default="4194304" help="Rotate HVAC source shards at this byte target"
+flag "--min-free-bytes <bytes>" help="Override the HVAC free-space reserve (station reserve for record; 1 GiB for log)"

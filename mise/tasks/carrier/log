@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Run Carrier telemetry separately, without connecting to the radio"
+#USAGE include file="../../carrier-common.usage.kdl"
+#USAGE flag "--data <dir>" default="data" help="Existing RF measurement root to receive HVAC marks"
+set -euo pipefail
+cd "${MISE_PROJECT_ROOT:?}"
+env -u CARRIER_USERNAME -u CARRIER_PASSWORD cargo build --locked -p k4na-cli
+exec uv run --locked --project integrations/carrier python integrations/carrier/run.py log "$@"
