@@ -109,12 +109,38 @@ pub fn decode_stats(
 }
 
 /// Raw frames: exact wire bytes, optionally zstd-compressed.
+/// Raw codec written by schema 4: the packet's even bytes, then its odd
+/// bytes, zstd-compressed. K4 bins are big-endian `i16` at an even
+/// offset, so this puts each bin's slowly varying high byte in one plane
+/// and its noisy low byte in another: about 13% smaller than plain zstd on
+/// real K4D frames (2,319 vs 2,664 bytes). Lossless for any length.
+pub const RAW_SHUFFLE_ZSTD: &str = "shuffle2+zstd";
+
+fn shuffle2(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend(bytes.iter().step_by(2));
+    out.extend(bytes.iter().skip(1).step_by(2));
+    out
+}
+
+fn unshuffle2(planes: &[u8]) -> Vec<u8> {
+    let (even, odd) = planes.split_at(planes.len().div_ceil(2));
+    let mut out = Vec::with_capacity(planes.len());
+    for (i, &e) in even.iter().enumerate() {
+        out.push(e);
+        if let Some(&o) = odd.get(i) {
+            out.push(o);
+        }
+    }
+    out
+}
+
 pub fn encode_raw(bytes: &[u8], compression: Compression) -> Result<(&'static str, Vec<u8>), StoreError> {
     match compression {
         Compression::None => Ok(("none", bytes.to_vec())),
         Compression::Zstd(level) => Ok((
-            "zstd",
-            zstd::bulk::compress(bytes, level).map_err(|e| StoreError::Codec(e.to_string()))?,
+            RAW_SHUFFLE_ZSTD,
+            zstd::bulk::compress(&shuffle2(bytes), level).map_err(|e| StoreError::Codec(e.to_string()))?,
         )),
     }
 }
@@ -126,6 +152,9 @@ pub fn decode_raw(compression: &str, byte_len: usize, data: &[u8]) -> Result<Vec
     let out = match compression {
         "none" => data.to_vec(),
         "zstd" => zstd::bulk::decompress(data, byte_len).map_err(|e| StoreError::Codec(format!("zstd: {e}")))?,
+        RAW_SHUFFLE_ZSTD => {
+            unshuffle2(&zstd::bulk::decompress(data, byte_len).map_err(|e| StoreError::Codec(format!("zstd: {e}")))?)
+        }
         other => return Err(StoreError::Codec(format!("unsupported compression {other:?}"))),
     };
     if out.len() != byte_len {
@@ -147,6 +176,23 @@ mod tests {
                 .map(|i| (i as i16).wrapping_mul(7) - 1500 + k as i16)
                 .collect()
         })
+    }
+
+    #[test]
+    fn raw_codecs_round_trip_and_old_zstd_frames_still_decode() {
+        for len in [0usize, 1, 2, 7, 4164] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 % 251) as u8).collect();
+            assert_eq!(unshuffle2(&shuffle2(&bytes)), bytes, "len {len}");
+            for c in [Compression::None, Compression::Zstd(3)] {
+                let (name, data) = encode_raw(&bytes, c).unwrap();
+                assert_eq!(decode_raw(name, len, &data).unwrap(), bytes);
+            }
+        }
+        assert_eq!(encode_raw(&[1, 2], Compression::Zstd(3)).unwrap().0, RAW_SHUFFLE_ZSTD);
+        // Schema 3 shards hold plain zstd frames.
+        let old = zstd::bulk::compress(&[9, 8, 7], 3).unwrap();
+        assert_eq!(decode_raw("zstd", 3, &old).unwrap(), [9, 8, 7]);
+        assert!(decode_raw("lz4", 3, &old).is_err());
     }
 
     #[test]

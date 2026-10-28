@@ -1,5 +1,7 @@
-//! SQLite schema version 3. See docs/storage.md for semantics.
+//! SQLite schema version 4. See docs/storage.md for semantics.
 //!
+//! Version 4 writes raw frames as `shuffle2+zstd` (v3 wrote `zstd`, still
+//! decoded) in raw shards with 16 KiB pages; tables are unchanged.
 //! Version 3 adds `visits.measurement_json` (the profile measurement
 //! settings in effect; NULL for passive visits). Version 2 moved antenna
 //! identity from the session to each visit; v2 shards stay readable and
@@ -7,10 +9,17 @@
 //! produced by tests and the simulator; it is not readable.
 
 pub const FORMAT: &str = "k4na-shard";
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Versions readers accept (and the writer may finalize after a crash).
-pub const READABLE_VERSIONS: [u32; 2] = [2, 3];
+pub const READABLE_VERSIONS: [u32; 3] = [2, 3, 4];
+
+/// Raw shards hold one ~2.3 KB frame per row; with 4 KiB pages each row
+/// took a page of its own. On a real K4D hour (3,081 frames) 16 KiB pages
+/// took 8.9 MB against 13.0 MB; 32 and 64 KiB were no smaller and raise
+/// each shard's fixed size (a page per table and index). Summary rows are
+/// larger and already pack well in the default pages.
+pub const RAW_PAGE_SIZE: u32 = 16_384;
 
 /// Tables common to both shard kinds.
 const COMMON: &str = r#"

@@ -328,6 +328,10 @@ impl Store {
         }
         let conn = Connection::open(&path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        if kind == ShardKind::Raw {
+            // Only takes effect before the first write, which WAL mode is.
+            conn.pragma_update(None, "page_size", crate::schema::RAW_PAGE_SIZE)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(
             None,
@@ -335,7 +339,13 @@ impl Store {
             if kind == ShardKind::Summary { "FULL" } else { "NORMAL" },
         )?;
         conn.pragma_update(None, "journal_size_limit", 4 * 1024 * 1024)?;
-        conn.pragma_update(None, "wal_autocheckpoint", 256)?;
+        // Checkpoint at about 1 MiB of WAL whatever the page size.
+        let page = if kind == ShardKind::Raw {
+            crate::schema::RAW_PAGE_SIZE
+        } else {
+            4096
+        };
+        conn.pragma_update(None, "wal_autocheckpoint", (1 << 20) / page)?;
         conn.execute_batch(&ddl(kind))?;
         let period_end = period_start + self.opts.shard_duration_ns;
         let s = &self.session;
@@ -500,33 +510,89 @@ impl Store {
     /// Stores a sampled original frame unless raw sampling is paused by
     /// storage pressure. Raw data is expendable; drops are counted.
     pub fn write_raw(&mut self, raw: &RawFrameRecord) -> Result<RawOutcome, StoreError> {
-        if self.status.suspended.is_some() || self.status.raw_paused {
-            self.status.raw_dropped += 1;
-            return Ok(RawOutcome::Dropped);
+        Ok(if self.write_raws(std::slice::from_ref(raw))? == 1 {
+            RawOutcome::Written
+        } else {
+            RawOutcome::Dropped
+        })
+    }
+
+    /// Stores a batch of sampled frames with one commit per shard, so a
+    /// full-rate capture does not pay a WAL commit (several pages) per
+    /// frame. Returns how many were written; the rest count as dropped.
+    /// On an error the open batch is rolled back and counted as dropped.
+    pub fn write_raws(&mut self, raws: &[RawFrameRecord]) -> Result<u64, StoreError> {
+        let mut open: Option<i64> = None;
+        let mut pending = 0u64;
+        let mut written = 0u64;
+        let r = self.write_raws_inner(raws, &mut open, &mut pending, &mut written);
+        if open.is_some()
+            && let Some(shard) = self.raw.as_ref()
+        {
+            if r.is_ok() && shard.conn.execute_batch("COMMIT").is_ok() {
+                written += pending;
+            } else {
+                let _ = shard.conn.execute_batch("ROLLBACK");
+                self.status.raw_dropped += pending;
+            }
         }
-        let (compression, data) = encode_raw(&raw.bytes, self.opts.compression)?;
-        let shard = self.shard_for(ShardKind::Raw, raw.received.utc_ns)?;
-        shard.conn.execute(
-            "INSERT INTO raw_frames (session_id, visit_id, pan, received_utc_ns, received_mono_ns, sequence, center_hz,
-                sample_rate_hz, sampling_policy, compression, byte_len, data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                raw.session_id,
-                raw.visit_id,
-                raw.pan.as_str(),
-                raw.received.utc_ns,
-                raw.received.mono_ns as i64,
-                raw.sequence,
-                raw.center_hz as i64,
-                raw.sample_rate_hz,
-                raw.sampling_policy,
-                compression,
-                raw.bytes.len() as i64,
-                data
-            ],
-        )?;
-        self.status.raw_written += 1;
-        Ok(RawOutcome::Written)
+        self.status.raw_written += written;
+        r.map(|()| written)
+    }
+
+    fn write_raws_inner(
+        &mut self,
+        raws: &[RawFrameRecord],
+        open: &mut Option<i64>,
+        pending: &mut u64,
+        written: &mut u64,
+    ) -> Result<(), StoreError> {
+        for raw in raws {
+            if self.status.suspended.is_some() || self.status.raw_paused {
+                self.status.raw_dropped += 1;
+                continue;
+            }
+            let want = self
+                .period_start(raw.received.utc_ns)
+                .max(self.next_period[kind_slot(ShardKind::Raw)]);
+            if let Some(p) = *open
+                && want > p
+            {
+                // Commit before shard_for finalizes this shard.
+                if let Some(shard) = self.raw.as_ref() {
+                    shard.conn.execute_batch("COMMIT")?;
+                }
+                *written += std::mem::take(pending);
+                *open = None;
+            }
+            let (compression, data) = encode_raw(&raw.bytes, self.opts.compression)?;
+            let shard = self.shard_for(ShardKind::Raw, raw.received.utc_ns)?;
+            if open.is_none() {
+                shard.conn.execute_batch("BEGIN")?;
+                *open = Some(shard.name.period_start_utc_ns);
+            }
+            shard.conn.execute(
+                "INSERT INTO raw_frames (session_id, visit_id, pan, received_utc_ns, received_mono_ns, sequence, center_hz,
+                    sample_rate_hz, sampling_policy, compression, byte_len, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    raw.session_id,
+                    raw.visit_id,
+                    raw.pan.as_str(),
+                    raw.received.utc_ns,
+                    raw.received.mono_ns as i64,
+                    raw.sequence,
+                    raw.center_hz as i64,
+                    raw.sample_rate_hz,
+                    raw.sampling_policy,
+                    compression,
+                    raw.bytes.len() as i64,
+                    data
+                ],
+            )?;
+            *pending += 1;
+        }
+        Ok(())
     }
 
     /// Periodic housekeeping: time-based rotation and budget enforcement.

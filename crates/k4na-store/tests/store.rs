@@ -225,6 +225,25 @@ fn rotates_hourly_and_round_trips_summaries() {
     })
     .unwrap();
     assert_eq!(replayed, 30);
+
+    // Raw shards use large pages and the shuffled codec; summaries keep
+    // the default page size.
+    for s in k4na_store::shard::discover(&root).unwrap() {
+        let c = rusqlite::Connection::open_with_flags(&s.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let page: u32 = c.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        let raw = s.path.file_name().unwrap().to_string_lossy().starts_with("raw-");
+        assert_eq!(page, if raw { 16_384 } else { 4_096 }, "{}", s.path.display());
+        if raw {
+            let codecs: Vec<String> = c
+                .prepare("SELECT DISTINCT compression FROM raw_frames")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(codecs, ["shuffle2+zstd"]);
+        }
+    }
 }
 
 #[test]
@@ -486,6 +505,31 @@ fn retention_prunes_old_raw_independently() {
     let summary_shards = ds.shards().filter(|s| s.kind == "summary").count();
     assert!(raw_shards <= 3, "{raw_shards}");
     assert_eq!(summary_shards, 6);
+}
+
+#[test]
+fn raw_batches_commit_per_shard_across_an_hour_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let sid = "0d0d0d0d";
+    let (mut store, _) = Store::open(opts(&root), big_disk(), session(sid), ts(0)).unwrap();
+    // 30 fps for four seconds straddling the top of the hour.
+    let start = NS_PER_HOUR - 2 * NS_PER_SEC;
+    let batch: Vec<_> = (0..120)
+        .map(|i| raw(sid, start + i * NS_PER_SEC / 30, i as u8))
+        .collect();
+    assert_eq!(store.write_raws(&batch).unwrap(), 120);
+    assert_eq!(store.status().raw_written, 120);
+    store.close(ts(NS_PER_HOUR + 5 * NS_PER_SEC), "end").unwrap();
+    let ds = DataSet::open(&root).unwrap();
+    assert_eq!(ds.shards().filter(|s| s.kind == "raw").count(), 2);
+    let mut times = Vec::new();
+    ds.for_each_raw(|row| {
+        times.push(row.received_utc_ns);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(times, batch.iter().map(|r| r.received.utc_ns).collect::<Vec<_>>());
 }
 
 #[test]

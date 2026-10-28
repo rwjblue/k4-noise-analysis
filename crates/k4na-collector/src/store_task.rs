@@ -17,6 +17,13 @@ use tokio::sync::oneshot;
 
 pub const RAW_QUEUE: usize = 32;
 
+/// Raw frames are committed in batches: one WAL commit writes whole pages
+/// (a table leaf and two index leaves), so committing each frame would
+/// write several times the data at full rate. Raw frames are expendable;
+/// a crash loses at most the unflushed batch.
+const RAW_BATCH: usize = 64;
+const RAW_FLUSH: Duration = Duration::from_secs(5);
+
 enum Cmd {
     Visit(Box<VisitRecord>, Vec<Event>, oneshot::Sender<Result<(), StoreError>>),
     Events(Vec<Event>, Timestamp, oneshot::Sender<Result<(), StoreError>>),
@@ -197,13 +204,30 @@ fn writer_loop(
     status: Arc<Mutex<StoreStatus>>,
 ) {
     let mut store = Some(store);
+    let mut batch: Vec<RawFrameRecord> = Vec::with_capacity(RAW_BATCH);
+    let mut last_flush = std::time::Instant::now();
+    let flush = |s: &mut Store, batch: &mut Vec<RawFrameRecord>| {
+        if !batch.is_empty()
+            && let Err(e) = s.write_raws(batch)
+        {
+            tracing::warn!("raw frames not stored: {e}");
+        }
+        batch.clear();
+    };
     loop {
         let cmd = cmd_rx.recv_timeout(Duration::from_millis(100));
         let Some(s) = store.as_mut() else { break };
         while let Ok(raw) = raw_rx.try_recv() {
-            if let Err(e) = s.write_raw(&raw) {
-                tracing::warn!("raw frame not stored: {e}");
+            batch.push(raw);
+            if batch.len() >= RAW_BATCH {
+                flush(s, &mut batch);
+                last_flush = std::time::Instant::now();
             }
+        }
+        let closing = matches!(cmd, Ok(Cmd::Close(..)) | Err(mpsc::RecvTimeoutError::Disconnected));
+        if closing || last_flush.elapsed() >= RAW_FLUSH {
+            flush(s, &mut batch);
+            last_flush = std::time::Instant::now();
         }
         match cmd {
             Ok(Cmd::Visit(v, events, ack)) => {
