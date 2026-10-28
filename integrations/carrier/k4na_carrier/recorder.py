@@ -90,10 +90,11 @@ class Recorder:
         self.last_utc_ns = now_ns
         self.last_elapsed_ns = elapsed_ns
         self.recovered = True
+        return intervals
 
     def unavailable(self, reason: str, now_ns: int, elapsed_ns: int):
         units = list(self.tracks) or ["all-units"]
-        self.tick([Reading(unit, None, {}, reason) for unit in units], now_ns, elapsed_ns)
+        return self.tick([Reading(unit, None, {}, reason) for unit in units], now_ns, elapsed_ns)
 
     def finish(self, now_ns: int):
         intervals = []
@@ -110,3 +111,4 @@ class Recorder:
             )
         self.journal.commit([], intervals, {"last_utc_ns": now_ns, "tracks": {}}, critical=True)
         self.tracks.clear()
+        return intervals

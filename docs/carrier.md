@@ -79,6 +79,16 @@ mise run carrier:log --data ./data --duration 8h
 `carrier:log` never connects to the radio. Both loggers are foreground programs;
 there is no installed service, login item, or automatic recording on boot.
 
+The console prints and flushes a safe summary after each saved observation:
+UTC receive time, unit alias, initial/change/unchanged/unknown/resumed status,
+reported indoor/outdoor operation, numeric output, airflow and blower RPM when
+present, and source timestamp age. Percent units are shown only for recognized
+variable-capacity equipment types; other values remain native. Closed intervals,
+successful mark imports, and final observed/unknown/change counts are also
+printed. A change means the equipment snapshots differ, not that exact hardware
+switching time is known. No profiles, credentials, or raw account responses are
+printed; terminal controls in returned strings are removed.
+
 ## What is recorded and displayed
 
 The first version **polls every 30 seconds**, not a push event subscription.

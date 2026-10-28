@@ -14,6 +14,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from .api import CarrierClient
+from .display import Console
 from .recorder import Recorder
 from .store import Journal, JournalError, StorageFull, child_env, iso
 
@@ -191,10 +192,15 @@ async def supervise(
     telemetry_failed = False
     with Journal(args.telemetry_dir, args.max_bytes, args.shard_bytes, min_free, data) as journal:
         recorder = Recorder(journal, max(args.poll_seconds * 3, args.timeout_seconds * 2))
+        console = Console()
+        console.line(f"HVAC source log: {journal.path}; poll interval={args.poll_seconds:g}s")
 
         async def import_marks():
             try:
-                return await journal.import_marks(args.k4na, data)
+                count = await journal.import_marks(args.k4na, data)
+                if count:
+                    console.line(f"HVAC marks: imported {count} completed interval(s).")
+                return count
             except Exception as error:
                 # Exception messages from subprocesses/libraries are never emitted.
                 print(
@@ -205,7 +211,9 @@ async def supervise(
 
         try:
             if disabled:
-                recorder.unavailable("disabled by --without-hvac", time.time_ns(), 0)
+                now = time.time_ns()
+                console.intervals(recorder.unavailable("disabled by --without-hvac", now, 0))
+                console.unavailable("disabled by --without-hvac", now)
                 print(
                     "HVAC: explicitly disabled; coverage will be marked unknown.", file=sys.stderr
                 )
@@ -224,11 +232,10 @@ async def supervise(
                     raise Refused(
                         "Carrier startup has missing/stale/disconnected readings; RF not started"
                     )
-                recorder.tick(readings, time.time_ns(), time.monotonic_ns() - origin)
-                print(
-                    f"HVAC ready: {len(readings)} unit(s), first observation {iso(time.time_ns())}",
-                    file=sys.stderr,
-                )
+                now = time.time_ns()
+                console.intervals(recorder.tick(readings, now, time.monotonic_ns() - origin))
+                console.observations(readings, now)
+                console.line(f"HVAC ready: {len(readings)} unit(s), first observation {iso(now)}")
             await import_marks()
             if stop.is_set():
                 raise Stopped
@@ -284,11 +291,15 @@ async def supervise(
                     continue
                 try:
                     if disabled:
-                        recorder.unavailable(
-                            "disabled by --without-hvac",
-                            time.time_ns(),
-                            time.monotonic_ns() - origin,
+                        now = time.time_ns()
+                        console.intervals(
+                            recorder.unavailable(
+                                "disabled by --without-hvac",
+                                now,
+                                time.monotonic_ns() - origin,
+                            )
                         )
+                        console.unavailable("disabled by --without-hvac", now)
                     else:
                         try:
                             readings = await until_stopped(
@@ -299,21 +310,23 @@ async def supervise(
                         except Exception:
                             # HTTP/transport errors are retryable. A failure to
                             # persist the resulting gap is handled separately.
-                            recorder.unavailable(
-                                "cloud request failed", time.time_ns(), time.monotonic_ns() - origin
+                            now = time.time_ns()
+                            console.intervals(
+                                recorder.unavailable(
+                                    "cloud request failed", now, time.monotonic_ns() - origin
+                                )
                             )
+                            console.unavailable("cloud request failed", now)
                             print(
                                 "HVAC: cloud unavailable; RF continues, retrying next poll.",
                                 file=sys.stderr,
                             )
                         else:
-                            recorder.tick(readings, time.time_ns(), time.monotonic_ns() - origin)
-                            count = sum(r.quality == "observed" for r in readings)
-                            print(
-                                f"HVAC {count}/{len(readings)} observed at {iso(time.time_ns())}; "
-                                "stale/disconnected units are unknown.",
-                                file=sys.stderr,
+                            now = time.time_ns()
+                            console.intervals(
+                                recorder.tick(readings, now, time.monotonic_ns() - origin)
                             )
+                            console.observations(readings, now)
                     await import_marks()
                 except Stopped:
                     break
@@ -336,7 +349,7 @@ async def supervise(
                 await client.close()
             if recorder.recovered:
                 try:
-                    recorder.finish(time.time_ns())
+                    console.intervals(recorder.finish(time.time_ns()))
                     await import_marks()
                 except Exception as error:
                     print(
@@ -346,6 +359,7 @@ async def supervise(
                     )
             elif started_rf:
                 print("HVAC coverage unavailable for this recording.", file=sys.stderr)
+            console.summary()
 
 
 async def run(args) -> int:
@@ -377,7 +391,7 @@ async def run(args) -> int:
 
 def main() -> int:
     # Some upstream HTTP/GraphQL debug logs include account data. The helper
-    # emits only its own fixed, redacted status messages, never payload dumps.
+    # emits safe allowlisted equipment summaries, never account payload dumps.
     logging.disable(logging.CRITICAL)
     args = parser().parse_args()
     try:
