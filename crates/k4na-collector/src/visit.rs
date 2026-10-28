@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use k4na_core::aggregate::{PushOutcome, VisitAccumulator};
 use k4na_core::config::RawCapture;
-use k4na_core::model::{RadioState, RawFrameRecord, TileRef, VisitAntenna, VisitRecord, VisitStatus};
+use k4na_core::model::{RadioState, RawFrameRecord, TileRef, VisitAntenna, VisitPair, VisitRecord, VisitStatus};
 use k4na_core::time::Timestamp;
 use k4na_core::units::BinGeometry;
 use k4na_protocol::PanId;
@@ -130,6 +130,8 @@ pub struct VisitBuilder {
     pub settle_discarded: u32,
     pub rejected: u32,
     pub flags: Vec<String>,
+    /// The other pan of a paired visit, if any.
+    pub pair: Option<VisitPair>,
     max_frames: usize,
     acc: Option<VisitAccumulator>,
 }
@@ -151,6 +153,7 @@ impl VisitBuilder {
             settle_discarded: 0,
             rejected: 0,
             flags: Vec::new(),
+            pair: None,
             max_frames,
             acc: None,
         }
@@ -258,6 +261,7 @@ impl VisitBuilder {
             radio_state,
             measurement: self.measurement,
             stats,
+            pair: self.pair,
         })
     }
 }

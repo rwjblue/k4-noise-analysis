@@ -7,7 +7,7 @@
 host = "k4.local"
 cat_port = 9200
 spectrum_port = 9201
-receiver = "main"             # main uses PAN A; paired main+sub is later
+receiver = "main"             # main uses PAN A (paired profiles need main)
 require_firmware_readback = true
 
 # Antenna registry. `port` is the K4 main-RX input the antenna is wired
@@ -35,6 +35,11 @@ survey_profile = "surveys/hf-full.toml" # relative to this file; --profile overr
 # TX antenna is never changed). Required for profiles with 2+ antennas.
 # When false, a band whose RX input is not the wanted antenna is skipped.
 allow_rx_antenna_switch = false
+# Paired profiles (docs/paired.md) measure two antennas at once on the main
+# and sub receivers. They turn the sub on (SB1), tune VFO B (FB) and route
+# the sub's RX input (AR$), and put each back. Needs a KRX4, BI0 and
+# allow_rx_antenna_switch = true. Never changes split, diversity, BI or AN.
+allow_sub_receiver = false
 # A fixed pan (#FXT1) does not follow FA. When true the survey switches
 # each band it visits to track mode and puts that band's #FXT back when
 # leaving; when false a fixed pan refuses the survey.

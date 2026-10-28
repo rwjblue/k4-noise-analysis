@@ -2,9 +2,11 @@
 //!
 //! Safety layers:
 //! 1. Callers can only express commands through [`Query`] (GET forms) and
-//!    [`Setter`] (`BN`, `FA`, `#SPN`, `#FXT`, `AR`). There is no string API.
-//!    `AR` only routes an input to the main receiver; the TX antenna (`AN`)
-//!    can be read but never set.
+//!    [`Setter`] (band, VFO, span, track mode, RX input and receiver
+//!    measurement settings, for the main receiver and, with `$`, the sub
+//!    receiver). There is no string API. `AR`/`AR$` only route an input to
+//!    a receiver; the TX antenna (`AN`), split, diversity and band
+//!    independence can be read but never set.
 //! 2. Every byte sequence is re-validated by [`check_wire`] immediately
 //!    before it reaches the socket. Setters are refused on a read-only link.
 //! 3. A [`ControlCat`] link can only be created with a [`RetuneConsent`],
@@ -61,10 +63,26 @@ pub enum Query {
     PeakMode,
     FramesPerSecond,
     Overflow,
+    /// `BI`: VFO B may sit on a different band from VFO A.
+    BandIndependent,
+    // Sub-receiver (`$`) forms. Each is its own query so main and sub
+    // readbacks can never be confused.
+    SubBand,
+    SubSpan,
+    SubRefLevel,
+    SubPanNoiseBlanker,
+    SubPreamp,
+    SubAttenuator,
+    SubAgc,
+    SubRfGain,
+    SubNoiseBlanker,
+    SubNoiseReduction,
+    SubRxAntenna,
+    SubOverflow,
 }
 
 impl Query {
-    pub const ALL: [Query; 37] = [
+    pub const ALL: [Query; 50] = [
         Query::Identify,
         Query::OptionModules,
         Query::Revisions,
@@ -102,7 +120,58 @@ impl Query {
         Query::PeakMode,
         Query::FramesPerSecond,
         Query::Overflow,
+        Query::BandIndependent,
+        Query::SubBand,
+        Query::SubSpan,
+        Query::SubRefLevel,
+        Query::SubPanNoiseBlanker,
+        Query::SubPreamp,
+        Query::SubAttenuator,
+        Query::SubAgc,
+        Query::SubRfGain,
+        Query::SubNoiseBlanker,
+        Query::SubNoiseReduction,
+        Query::SubRxAntenna,
+        Query::SubOverflow,
     ];
+
+    /// Sub-receiver state recorded with each visit. On a K4D one
+    /// receiver's level can depend on the other's input (see
+    /// docs/paired.md), so `AR$` belongs with the main receiver's state.
+    pub const SUB_STATE: [Query; 11] = [
+        Query::VfoB,
+        Query::BandIndependent,
+        Query::SubBand,
+        Query::SubSpan,
+        Query::SubRefLevel,
+        Query::SubPanNoiseBlanker,
+        Query::SubPreamp,
+        Query::SubAttenuator,
+        Query::SubAgc,
+        Query::SubRfGain,
+        Query::SubRxAntenna,
+    ];
+
+    /// The sub-receiver form of a main-receiver measurement query, if the
+    /// K4 has one. `#AVG`, `#FXT` and `#FPS` are shared by both pans.
+    pub fn sub_form(self) -> Option<Query> {
+        Some(match self {
+            Query::Band => Query::SubBand,
+            Query::Span => Query::SubSpan,
+            Query::RefLevel => Query::SubRefLevel,
+            Query::PanNoiseBlanker => Query::SubPanNoiseBlanker,
+            Query::Preamp => Query::SubPreamp,
+            Query::Attenuator => Query::SubAttenuator,
+            Query::Agc => Query::SubAgc,
+            Query::RfGain => Query::SubRfGain,
+            Query::NoiseBlanker => Query::SubNoiseBlanker,
+            Query::NoiseReduction => Query::SubNoiseReduction,
+            Query::RxAntenna => Query::SubRxAntenna,
+            Query::Overflow => Query::SubOverflow,
+            Query::VfoA => Query::VfoB,
+            _ => return None,
+        })
+    }
 
     /// State recorded with each visit for comparability segments.
     pub const STATE: [Query; 23] = [
@@ -171,6 +240,19 @@ impl Query {
             Query::PeakMode => "#PKM",
             Query::FramesPerSecond => "#FPS",
             Query::Overflow => "OV",
+            Query::BandIndependent => "BI",
+            Query::SubBand => "BN$",
+            Query::SubSpan => "#SPN$",
+            Query::SubRefLevel => "#REF$",
+            Query::SubPanNoiseBlanker => "#NB$",
+            Query::SubPreamp => "PA$",
+            Query::SubAttenuator => "RA$",
+            Query::SubAgc => "GT$",
+            Query::SubRfGain => "RG$",
+            Query::SubNoiseBlanker => "NB$",
+            Query::SubNoiseReduction => "NR$",
+            Query::SubRxAntenna => "AR$",
+            Query::SubOverflow => "OV$",
         }
     }
 
@@ -210,8 +292,8 @@ fn rx_input_ok(n: u8) -> bool {
 }
 
 /// The only radio-state changes the collector can make. Each is reviewed:
-/// band select, VFO A frequency, pan span, pan track/fixed mode and the
-/// main-RX input.
+/// band select, VFO A/B frequency, pan span, pan track/fixed mode, the RX
+/// inputs, sub receiver on/off and receive measurement settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setter {
     /// `BNnn;` K4 band number 0..=10 (HF/6 m only; no transverter bands).
@@ -226,6 +308,19 @@ pub enum Setter {
     RxInput(RxInput),
     /// Main-receiver measurement settings (receive path only).
     Receiver(ReceiverSetter),
+    /// `SB0;`/`SB1;` sub receiver off/on.
+    SubRx(bool),
+    /// `FBnnnnnnnnnnn;` VFO B in Hz, same range as VFO A. Only sent with
+    /// split off (`FT0`), where VFO B is not the transmit frequency.
+    VfoB(u64),
+    /// `#SPN$n;` sub pan span in Hz. (The sub band is never set: paired
+    /// surveys require `BI0`, where VFO B follows VFO A's band.)
+    SubSpan(u32),
+    /// `AR$n;` sub-RX input (receive routing only).
+    SubRxInput(RxInput),
+    /// Sub-receiver measurement settings. `#AVG` has no sub form, so
+    /// `SubReceiver(PanAveraging(_))` is never sendable.
+    SubReceiver(ReceiverSetter),
 }
 
 /// Main-receiver settings that change what the receiver and panadapter
@@ -263,20 +358,40 @@ pub enum ReceiverSetter {
 
 impl ReceiverSetter {
     pub fn wire(self) -> String {
+        self.wire_for(false)
+    }
+
+    /// The command for the main receiver, or with `sub` its `$` form.
+    pub fn wire_for(self, sub: bool) -> String {
         let f = u8::from;
+        let s = if sub { "$" } else { "" };
         match self {
-            ReceiverSetter::PreampBasic(l) => format!("PA{l};"),
-            ReceiverSetter::PreampAdvanced(l, on) => format!("PA{l}{};", f(on)),
-            ReceiverSetter::AttenuatorOffBasic => "RA00;".to_owned(),
-            ReceiverSetter::AttenuatorAdvanced(db, on) => format!("RA{db:02}{};", f(on)),
-            ReceiverSetter::RfGain(db) => format!("RG-{db:02};"),
-            ReceiverSetter::AgcBasic { slow } => if slow { "GT004;" } else { "GT002;" }.to_owned(),
-            ReceiverSetter::AgcAdvanced(n) => format!("GT{n};"),
-            ReceiverSetter::NoiseBlankerBasic(on) => format!("NB{};", f(on)),
-            ReceiverSetter::NoiseBlankerAdvanced(l, on) => format!("NB{l:02}{};", f(on)),
-            ReceiverSetter::NoiseReduction(l, on) => format!("NR{l:02}{};", f(on)),
-            ReceiverSetter::PanNoiseBlanker(n) => format!("#NB{n};"),
-            ReceiverSetter::PanAveraging(n) => format!("#AVG{n:02};"),
+            ReceiverSetter::PreampBasic(l) => format!("PA{s}{l};"),
+            ReceiverSetter::PreampAdvanced(l, on) => format!("PA{s}{l}{};", f(on)),
+            ReceiverSetter::AttenuatorOffBasic => format!("RA{s}00;"),
+            ReceiverSetter::AttenuatorAdvanced(db, on) => format!("RA{s}{db:02}{};", f(on)),
+            ReceiverSetter::RfGain(db) => format!("RG{s}-{db:02};"),
+            ReceiverSetter::AgcBasic { slow } => format!("GT{s}{};", if slow { "004" } else { "002" }),
+            ReceiverSetter::AgcAdvanced(n) => format!("GT{s}{n};"),
+            ReceiverSetter::NoiseBlankerBasic(on) => format!("NB{s}{};", f(on)),
+            ReceiverSetter::NoiseBlankerAdvanced(l, on) => format!("NB{s}{l:02}{};", f(on)),
+            ReceiverSetter::NoiseReduction(l, on) => format!("NR{s}{l:02}{};", f(on)),
+            ReceiverSetter::PanNoiseBlanker(n) => format!("#NB{s}{n};"),
+            ReceiverSetter::PanAveraging(n) => format!("#AVG{s}{n:02};"),
+        }
+    }
+
+    /// The main-receiver query whose readback verifies this setting.
+    pub fn query(self) -> Query {
+        match self {
+            ReceiverSetter::PreampBasic(_) | ReceiverSetter::PreampAdvanced(..) => Query::Preamp,
+            ReceiverSetter::AttenuatorOffBasic | ReceiverSetter::AttenuatorAdvanced(..) => Query::Attenuator,
+            ReceiverSetter::RfGain(_) => Query::RfGain,
+            ReceiverSetter::AgcBasic { .. } | ReceiverSetter::AgcAdvanced(_) => Query::Agc,
+            ReceiverSetter::NoiseBlankerBasic(_) | ReceiverSetter::NoiseBlankerAdvanced(..) => Query::NoiseBlanker,
+            ReceiverSetter::NoiseReduction(..) => Query::NoiseReduction,
+            ReceiverSetter::PanNoiseBlanker(_) => Query::PanNoiseBlanker,
+            ReceiverSetter::PanAveraging(_) => Query::Averaging,
         }
     }
 }
@@ -290,10 +405,17 @@ impl Setter {
             Setter::FixedTune(fixed) => format!("#FXT{};", u8::from(fixed)),
             Setter::RxInput(i) => format!("AR{};", i.0),
             Setter::Receiver(r) => r.wire(),
+            Setter::SubRx(on) => format!("SB{};", u8::from(on)),
+            Setter::VfoB(hz) => format!("FB{hz:011};"),
+            Setter::SubSpan(hz) => format!("#SPN${hz};"),
+            Setter::SubRxInput(i) => format!("AR${};", i.0),
+            Setter::SubReceiver(r) => r.wire_for(true),
         }
     }
 
-    /// The query whose readback verifies this setter.
+    /// The query whose readback verifies this setter. `SubReceiver` of a
+    /// shared pan setting (`#AVG`) maps to the main query, but is never
+    /// sendable.
     pub fn query(self) -> Query {
         match self {
             Setter::Band(_) => Query::Band,
@@ -301,17 +423,21 @@ impl Setter {
             Setter::Span(_) => Query::Span,
             Setter::FixedTune(_) => Query::FixedTune,
             Setter::RxInput(_) => Query::RxAntenna,
-            Setter::Receiver(r) => match r {
-                ReceiverSetter::PreampBasic(_) | ReceiverSetter::PreampAdvanced(..) => Query::Preamp,
-                ReceiverSetter::AttenuatorOffBasic | ReceiverSetter::AttenuatorAdvanced(..) => Query::Attenuator,
-                ReceiverSetter::RfGain(_) => Query::RfGain,
-                ReceiverSetter::AgcBasic { .. } | ReceiverSetter::AgcAdvanced(_) => Query::Agc,
-                ReceiverSetter::NoiseBlankerBasic(_) | ReceiverSetter::NoiseBlankerAdvanced(..) => Query::NoiseBlanker,
-                ReceiverSetter::NoiseReduction(..) => Query::NoiseReduction,
-                ReceiverSetter::PanNoiseBlanker(_) => Query::PanNoiseBlanker,
-                ReceiverSetter::PanAveraging(_) => Query::Averaging,
-            },
+            Setter::Receiver(r) => r.query(),
+            Setter::SubRx(_) => Query::SubRx,
+            Setter::VfoB(_) => Query::VfoB,
+            Setter::SubSpan(_) => Query::SubSpan,
+            Setter::SubRxInput(_) => Query::SubRxAntenna,
+            Setter::SubReceiver(r) => r.query().sub_form().unwrap_or(r.query()),
         }
+    }
+
+    /// Whether this setter changes the sub receiver or VFO B.
+    pub fn is_sub(self) -> bool {
+        matches!(
+            self,
+            Setter::SubRx(_) | Setter::VfoB(_) | Setter::SubSpan(_) | Setter::SubRxInput(_) | Setter::SubReceiver(_)
+        )
     }
 
     /// Whether the whitelist would send this setter. A value the radio
@@ -335,8 +461,9 @@ pub enum CatError {
 }
 
 /// Splits a response or command into (known prefix, parameters). Longest
-/// known prefix wins (`#AR` vs `AR`); `$` (sub receiver) is kept with the
-/// prefix so main/sub responses can never be confused.
+/// known prefix wins (`#AR` vs `AR`, `AR$` vs `AR`). A `$` after a prefix
+/// with no known sub form is reported as `true` (an unknown sub-receiver
+/// item), so main/sub responses can never be confused.
 pub fn split_prefix(item: &str) -> Option<(&'static str, bool, &str)> {
     let mut best: Option<&'static str> = None;
     for q in Query::ALL {
@@ -379,6 +506,18 @@ pub fn check_wire(wire: &str, allow_setters: bool) -> Result<(), CatError> {
 /// The reviewed setter grammar: exact parameter shapes and ranges for the
 /// only prefixes the collector may set. Everything else is refused.
 fn setter_params_ok(prefix: &str, params: &str) -> bool {
+    // Sub-receiver measurement settings share the main grammar. `#AVG`
+    // has no sub form and never reaches here (no `#AVG$` prefix).
+    let prefix = match prefix {
+        "PA$" => "PA",
+        "RA$" => "RA",
+        "RG$" => "RG",
+        "GT$" => "GT",
+        "NB$" => "NB",
+        "NR$" => "NR",
+        "#NB$" => "#NB",
+        p => p,
+    };
     // RF gain is the one setter with a sign: exactly `-nn`.
     if prefix == "RG" {
         return params
@@ -397,10 +536,11 @@ fn setter_params_ok(prefix: &str, params: &str) -> bool {
     let len = params.len();
     match prefix {
         "BN" => len == 2 && n <= 10,
-        "FA" => len == 11 && (100_000..=54_000_000).contains(&n),
-        "#SPN" => (6_000..=368_000).contains(&n),
+        "FA" | "FB" => len == 11 && (100_000..=54_000_000).contains(&n),
+        "#SPN" | "#SPN$" => (6_000..=368_000).contains(&n),
         "#FXT" => len == 1 && n <= 1,
-        "AR" => len == 1 && rx_input_ok(n as u8),
+        "AR" | "AR$" => len == 1 && rx_input_ok(n as u8),
+        "SB" => len == 1 && n <= 1,
         // PAn (basic level) or PAnm (level, on/off).
         "PA" => (len == 1 && n <= 3) || (len == 2 && digit(0) <= 3 && digit(1) <= 1),
         // RA00 (basic off) or RAnnm (dB in 3 dB steps, on/off).
@@ -717,6 +857,23 @@ mod tests {
             Setter::Receiver(ReceiverSetter::PanNoiseBlanker(2)),
             Setter::Receiver(ReceiverSetter::PanAveraging(1)),
             Setter::Receiver(ReceiverSetter::PanAveraging(20)),
+            Setter::SubRx(true),
+            Setter::SubRx(false),
+            Setter::VfoB(14_045_000),
+            Setter::SubSpan(40_000),
+            Setter::SubRxInput(RxInput::for_port(k4na_core::config::K4Port::RxAntIn1)),
+            Setter::SubRxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)),
+            Setter::SubReceiver(ReceiverSetter::PreampBasic(2)),
+            Setter::SubReceiver(ReceiverSetter::PreampAdvanced(2, true)),
+            Setter::SubReceiver(ReceiverSetter::AttenuatorOffBasic),
+            Setter::SubReceiver(ReceiverSetter::AttenuatorAdvanced(6, true)),
+            Setter::SubReceiver(ReceiverSetter::RfGain(10)),
+            Setter::SubReceiver(ReceiverSetter::AgcBasic { slow: true }),
+            Setter::SubReceiver(ReceiverSetter::AgcAdvanced(1)),
+            Setter::SubReceiver(ReceiverSetter::NoiseBlankerBasic(false)),
+            Setter::SubReceiver(ReceiverSetter::NoiseBlankerAdvanced(3, true)),
+            Setter::SubReceiver(ReceiverSetter::NoiseReduction(5, false)),
+            Setter::SubReceiver(ReceiverSetter::PanNoiseBlanker(0)),
         ];
         for s in ok {
             check_wire(&s.wire(), true).unwrap();
@@ -727,6 +884,28 @@ mod tests {
             Setter::RxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)).wire(),
             "AR6;"
         );
+        assert_eq!(
+            Setter::SubRxInput(RxInput::for_port(k4na_core::config::K4Port::Ant2)).wire(),
+            "AR$6;"
+        );
+        assert_eq!(Setter::VfoB(7_000_000).wire(), "FB00007000000;");
+        assert_eq!(Setter::SubSpan(40_000).wire(), "#SPN$40000;");
+        assert_eq!(Setter::SubReceiver(ReceiverSetter::RfGain(6)).wire(), "RG$-06;");
+        assert_eq!(
+            Setter::SubReceiver(ReceiverSetter::AgcBasic { slow: false }).wire(),
+            "GT$002;"
+        );
+        assert_eq!(
+            Setter::SubReceiver(ReceiverSetter::PreampBasic(1)).query(),
+            Query::SubPreamp
+        );
+        assert_eq!(
+            Setter::SubRxInput(RxInput::from_readback("4").unwrap()).query(),
+            Query::SubRxAntenna
+        );
+        // Pan averaging is shared by both pans: no sub form exists.
+        assert!(!Setter::SubReceiver(ReceiverSetter::PanAveraging(4)).is_sendable());
+        assert!(Setter::VfoB(14_000_000).is_sub() && !Setter::VfoA(14_000_000).is_sub());
         // Disconnect-all and the internal transverter input are not inputs
         // the collector can select or restore.
         assert_eq!(RxInput::from_readback("0"), None);
@@ -748,6 +927,11 @@ mod tests {
             Setter::Receiver(ReceiverSetter::PanNoiseBlanker(3)),
             Setter::Receiver(ReceiverSetter::PanAveraging(0)),
             Setter::Receiver(ReceiverSetter::PanAveraging(21)),
+            Setter::VfoB(99_999),
+            Setter::SubSpan(368_001),
+            Setter::SubReceiver(ReceiverSetter::PreampBasic(4)),
+            Setter::SubReceiver(ReceiverSetter::RfGain(61)),
+            Setter::SubReceiver(ReceiverSetter::PanAveraging(4)),
         ] {
             assert!(check_wire(&bad.wire(), true).is_err(), "{bad:?}");
         }
@@ -775,14 +959,26 @@ mod tests {
             "AI2;",
             "K31;",
             "K40;",
-            "FB00014000000;",
             "FA$00014000000;",
+            "FB$00014000000;",
+            "FB0001400000;",
             "BN$05;",
+            "BN$$05;",
+            "BI0;",
             "MD3;",
+            "MD$3;",
             "PA4;",
             "PA12;",
             "PA/;",
-            "PA$1;",
+            "PA$4;",
+            "PA$$1;",
+            "SB2;",
+            "SB$1;",
+            "DV1;",
+            "DV0;",
+            "BI1;",
+            "FT1;",
+            "FT0;",
             "RA1;",
             "RA01;",
             "RA011;",
@@ -795,7 +991,7 @@ mod tests {
             "GT001;",
             "NB2;",
             "NB161;",
-            "NB$1;",
+            "NB$161;",
             "NR001;",
             "NR111;",
             "#NB3;",
@@ -811,13 +1007,20 @@ mod tests {
             "AR8;",
             "AR12;",
             "AR/;",
-            "AR$4;",
+            "AR$0;",
+            "AR$3;",
+            "AR$8;",
             "AN1;",
             "AN2;",
+            "AN$1;",
             "AN/;",
-            "#SPN$40000;",
+            "#SPN$5999;",
+            "#AVG$04;",
+            "#FXT$1;",
             "#FXA1;",
             "#REF-110;",
+            "#REF$-110;",
+            "OV$1;",
             "FA14045000;",
             "FA0001404500;",
             "FA;TX;",
@@ -838,7 +1041,12 @@ mod tests {
     fn prefixes_disambiguate_main_sub_and_hash_forms() {
         assert_eq!(split_prefix("#AR0906+081"), Some(("#AR", false, "0906+081")));
         assert_eq!(split_prefix("AR1"), Some(("AR", false, "1")));
-        assert_eq!(split_prefix("PA$1"), Some(("PA", true, "1")));
+        assert_eq!(split_prefix("PA$1"), Some(("PA$", false, "1")));
+        assert_eq!(split_prefix("AR$6"), Some(("AR$", false, "6")));
+        assert_eq!(split_prefix("RG$-00"), Some(("RG$", false, "-00")));
+        // A `$` form with no known sub query stays marked as sub.
+        assert_eq!(split_prefix("MD$3"), Some(("MD", true, "3")));
+        assert_eq!(split_prefix("#AVG$04"), Some(("#AVG", true, "04")));
         assert_eq!(split_prefix("K41"), Some(("K4", false, "1")));
         assert_eq!(split_prefix("RV.FP-03.57"), Some(("RV", false, ".FP-03.57")));
         assert_eq!(split_prefix("#SPN40000"), Some(("#SPN", false, "40000")));
@@ -859,22 +1067,29 @@ mod tests {
         let srv = tokio::spawn(async move {
             let mut buf = [0u8; 256];
             let n = server.read(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], b"TQ;FA;#AR;AR;");
+            assert_eq!(&buf[..n], b"TQ;FA;#AR;AR;AR$;");
             server
-                .write_all(b"FA$00007000000;TQ0;?;FA00014045000;AR2;#AR0906+081;")
+                .write_all(b"FA$00007000000;AR$6;TQ0;?;FA00014045000;AR2;#AR0906+081;")
                 .await
                 .unwrap();
             server
         });
         let rb = cat
-            .query(&[Query::Transmit, Query::VfoA, Query::AutoRef, Query::RxAntenna])
+            .query(&[
+                Query::Transmit,
+                Query::VfoA,
+                Query::AutoRef,
+                Query::RxAntenna,
+                Query::SubRxAntenna,
+            ])
             .await
             .unwrap();
         assert_eq!(rb.flag(Query::Transmit), Some(false));
         assert_eq!(rb.u64(Query::VfoA), Some(14_045_000));
         assert_eq!(rb.raw(Query::AutoRef), Some("0906+081"));
         assert_eq!(rb.raw(Query::RxAntenna), Some("2"));
-        assert_eq!(cat.sent(), ["TQ;FA;#AR;AR;"]);
+        assert_eq!(rb.raw(Query::SubRxAntenna), Some("6"));
+        assert_eq!(cat.sent(), ["TQ;FA;#AR;AR;AR$;"]);
         drop(srv.await.unwrap());
     }
 

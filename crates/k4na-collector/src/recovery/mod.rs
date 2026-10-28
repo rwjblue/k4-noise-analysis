@@ -38,14 +38,31 @@ pub enum Scope {
     Band(u8),
     /// Receiver settings on a band with a given RX input (`AR` raw value).
     Context(u8, String),
+    /// The sub receiver on/off (`SB`).
+    SubSession,
+    /// The sub receiver's memory on a band: `FB`, `#SPN$` and its RX input
+    /// `AR$`. Paired surveys require `BI0`, so VFO B is on the main band.
+    SubBand(u8),
+    /// Sub-receiver settings on a band with a given sub RX input (`AR$`).
+    SubContext(u8, String),
 }
 
 impl Scope {
     pub fn band(&self) -> Option<u8> {
         match self {
-            Scope::Session => None,
-            Scope::Band(b) | Scope::Context(b, _) => Some(*b),
+            Scope::Session | Scope::SubSession => None,
+            Scope::Band(b) | Scope::Context(b, _) | Scope::SubBand(b) | Scope::SubContext(b, _) => Some(*b),
         }
+    }
+
+    /// Whether this scope holds sub-receiver state.
+    pub fn is_sub(&self) -> bool {
+        matches!(self, Scope::SubSession | Scope::SubBand(_) | Scope::SubContext(..))
+    }
+
+    /// Restored last: the band change and the sub receiver on/off.
+    pub fn is_session(&self) -> bool {
+        matches!(self, Scope::Session | Scope::SubSession)
     }
 
     pub fn describe(&self) -> String {
@@ -53,6 +70,11 @@ impl Scope {
             Scope::Session => "the radio".to_owned(),
             Scope::Band(b) => format!("{} (BN{b:02})", band_label(Some(*b))),
             Scope::Context(b, ar) => format!("{} (BN{b:02}) with main RX input AR{ar}", band_label(Some(*b))),
+            Scope::SubSession => "the sub receiver".to_owned(),
+            Scope::SubBand(b) => format!("{} (BN{b:02}) on the sub receiver", band_label(Some(*b))),
+            Scope::SubContext(b, ar) => {
+                format!("{} (BN{b:02}) with sub RX input AR${ar}", band_label(Some(*b)))
+            }
         }
     }
 }
@@ -60,11 +82,17 @@ impl Scope {
 /// Fields captured per scope.
 pub const BAND_FIELDS: [Query; 4] = [Query::VfoA, Query::Span, Query::FixedTune, Query::RxAntenna];
 
+/// The sub receiver's band memory fields.
+pub const SUB_BAND_FIELDS: [Query; 3] = [Query::VfoB, Query::SubSpan, Query::SubRxAntenna];
+
 pub fn fields(scope: &Scope) -> Vec<Query> {
     match scope {
         Scope::Session => vec![Query::Band],
         Scope::Band(_) => BAND_FIELDS.to_vec(),
         Scope::Context(..) => measure::KEYS.to_vec(),
+        Scope::SubSession => vec![Query::SubRx],
+        Scope::SubBand(_) => SUB_BAND_FIELDS.to_vec(),
+        Scope::SubContext(..) => measure::SUB_KEYS.to_vec(),
     }
 }
 

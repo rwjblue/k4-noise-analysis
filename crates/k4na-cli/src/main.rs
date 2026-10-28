@@ -147,8 +147,10 @@ enum Cmd {
         config: ConfigArgs,
         #[arg(long, value_parser = humantime::parse_duration)]
         duration: Duration,
-        /// Consent to retune the radio (BN/FA/#SPN/#FXT, and AR when
-        /// `collection.allow_rx_antenna_switch` is set).
+        /// Consent to retune the radio (BN/FA/#SPN/#FXT, AR when
+        /// `collection.allow_rx_antenna_switch` is set, and for a paired
+        /// profile SB/FB/#SPN$/AR$ when `collection.allow_sub_receiver` is
+        /// set).
         #[arg(long)]
         allow_retune: bool,
         /// GET-only preflight and plan preview; sends no setters.
@@ -380,8 +382,11 @@ fn check(args: &ConfigArgs, json: bool) -> Result<ExitCode> {
     println!("config OK: {}", args.config.display());
     println!("  digest   {}", cfg.digest());
     println!(
-        "  mode     {:?} (allow_retune = {}, allow_rx_antenna_switch = {})",
-        cfg.collection.mode, cfg.collection.allow_retune, cfg.collection.allow_rx_antenna_switch
+        "  mode     {:?} (allow_retune = {}, allow_rx_antenna_switch = {}, allow_sub_receiver = {})",
+        cfg.collection.mode,
+        cfg.collection.allow_retune,
+        cfg.collection.allow_rx_antenna_switch,
+        cfg.collection.allow_sub_receiver
     );
     for a in &cfg.antennas {
         println!("  antenna  {} on {} rev {:?}", a.id, a.port, a.revision);
@@ -773,14 +778,37 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
             None => println!("no spectrum frame on pan {pan} within 10 s"),
         }
         if let (Some(Ok(p)), Some(s)) = (&plan, cfg.profile.as_ref()) {
-            let antennas = s.antennas.len();
+            // A paired survey measures both antennas in one pass.
+            let passes = if s.paired { 1 } else { s.antennas.len() };
+            let what = if s.paired {
+                format!(
+                    "1 paired pass ({} on main, {} on sub{})",
+                    s.antennas[0],
+                    s.antennas[1],
+                    if s.swap { ", swapped every other cycle" } else { "" }
+                )
+            } else {
+                format!("{passes} antenna(s)")
+            };
             println!(
-                "plan at the CURRENT packet rate: {} tiles x {antennas} antenna(s), cycle needs ~{} s, \
-                 starts at most every {} s",
+                "plan at the CURRENT packet rate: {} tiles x {what}, cycle needs ~{} s, starts at most every {} s",
                 p.tiles.len(),
-                (p.cycle_duration(s.settle_ms, s.dwell_ms, VISIT_OVERHEAD_MS) * antennas as u32).as_secs(),
+                (p.cycle_duration(s.settle_ms, s.dwell_ms, VISIT_OVERHEAD_MS) * passes as u32).as_secs(),
                 s.min_cycle_ms / 1000
             );
+            if s.paired
+                && let Ok(pre) = &pre
+            {
+                use k4na_collector::cat::Query;
+                let r = &pre.readback;
+                println!(
+                    "sub receiver now: SB {}, FB {}, AR$ {}; the survey sets SB1, FB, #SPN$ and AR$ and puts \
+                     each back",
+                    r.raw(Query::SubRx).unwrap_or("?"),
+                    r.raw(Query::VfoB).unwrap_or("?"),
+                    r.raw(Query::SubRxAntenna).unwrap_or("?")
+                );
+            }
             println!("  (the survey re-plans from the rate observed after applying #SPN)");
             for b in cfg.ranges() {
                 println!("  {:>8}: {} tile(s)", b.id, p.tiles_for_band(&b.id).count());
@@ -795,7 +823,9 @@ async fn survey_dry_run(cfg: &Config, json: bool) -> Result<ExitCode> {
                     port.map_or("unknown", |p| p.as_str())
                 );
                 for a in cfg.survey_antennas() {
-                    let note = if Some(a.port) == port {
+                    let note = if s.paired && cfg.collection.allow_rx_antenna_switch {
+                        "will be selected with AR (main) or AR$ (sub)"
+                    } else if Some(a.port) == port {
                         "selected"
                     } else if cfg.collection.allow_rx_antenna_switch {
                         "will be selected with AR"

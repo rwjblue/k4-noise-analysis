@@ -32,7 +32,14 @@
 //!   back if it still holds the collector's value, and leaves others.
 //! * Cycles start at most every `min_cycle_ms`; between cycles the survey
 //!   holds the last tile without retuning and keeps polling the interlock.
+//! * A paired profile (docs/paired.md, with `collection.allow_sub_receiver`)
+//!   also tunes the sub receiver to each tile (`SB1`, `FB`, `#SPN$`,
+//!   `AR$` and the `$` receiver settings) and records pans A and B over the
+//!   same dwell as two linked visits. It needs a KRX4, split, diversity and
+//!   band independence off (`BI0`, so VFO B follows the main band), and
+//!   watches and puts back the sub receiver like the main one.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,14 +48,14 @@ use k4na_core::aggregate::PushOutcome;
 use k4na_core::band::k4_band_number;
 use k4na_core::config::{AntennaConfig, K4Port, SurveyProfile};
 use k4na_core::measure::{MeasurementSettings, band_label};
-use k4na_core::model::{Event, EventKind, RadioState, TileRef, VisitAntenna, VisitStatus};
+use k4na_core::model::{Event, EventKind, RadioState, TileRef, VisitAntenna, VisitPair, VisitStatus};
 use k4na_core::plan::{SurveyPlan, Tile};
 use k4na_core::time::{Clock, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::{BIN_COUNT, DecoderDiagnostics, PanId};
 
 use crate::cat::{CatControl, CatError, CatQuery, Query, Readback, RxInput, Setter};
-use crate::measure::{self, MetaMode, expected_readback, setter_for};
+use crate::measure::{self, MetaMode, Receiver, expected_readback, setter_for};
 use crate::passive::{RunError, RunSummary};
 use crate::recovery::{self, Change, Decision, Entry, JournalError, Outcome, Purpose, Scope, Transaction};
 use crate::runtime::{RunContext, Stop};
@@ -126,9 +133,14 @@ pub struct Preflight {
 /// Reads state with GET queries only and decides whether a survey may
 /// start. Never sends a setter.
 pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflight, String> {
+    let paired = cfg.profile.as_ref().is_some_and(|p| p.paired);
     let mut queries = interlock_queries();
     queries.extend(Query::STATE);
     queries.extend([Query::Identify, Query::Revisions]);
+    if paired {
+        queries.extend(sub_watch());
+        queries.push(Query::OptionModules);
+    }
     queries.sort();
     queries.dedup();
     let rb = cat
@@ -142,6 +154,10 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
         None => problems.push("transmit state (TQ) is unreadable".to_owned()),
     }
     for q in MUST_BE_OFF {
+        if paired && q == Query::SubRx {
+            // A paired survey turns the sub on itself (and back off).
+            continue;
+        }
         match rb.flag(q) {
             Some(false) => {}
             Some(true) => problems.push(format!("{} is on (survey needs a simple main-RX setup)", q.prefix())),
@@ -165,6 +181,9 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
     if rb.u64(Query::VfoA).is_none() || rb.u64(Query::Band).is_none() {
         problems.push("original FA/BN are unreadable, so restoration would be impossible".to_owned());
     }
+    if paired {
+        problems.extend(paired_problems(&rb, cfg));
+    }
     if cfg.radio.require_firmware_readback && rb.revisions.is_empty() {
         problems.push("firmware revisions (RV) were not read back".to_owned());
     }
@@ -184,6 +203,46 @@ pub async fn preflight<C: CatQuery>(cat: &mut C, cfg: &Config) -> Result<Preflig
         readback: rb,
         meta: meta.unwrap_or(MetaMode::Basic),
     })
+}
+
+/// Why a paired survey cannot start (docs/paired.md), from GET readbacks.
+fn paired_problems(rb: &Readback, cfg: &Config) -> Vec<String> {
+    let mut p = Vec::new();
+    if !cfg.collection.allow_sub_receiver {
+        p.push("a paired survey needs collection.allow_sub_receiver = true".to_owned());
+    }
+    if cfg.radio.receiver.pan() != PanId::A {
+        p.push("a paired survey measures the main receiver as pan A; set radio.receiver = \"main\"".to_owned());
+    }
+    // OM position 4 is S for "SUB RX (KRX4 + 2nd KDDC4)".
+    let om = rb.raw(Query::OptionModules).map(str::trim_start);
+    if om.and_then(|o| o.chars().nth(3)) != Some('S') {
+        p.push(format!(
+            "no KRX4 sub receiver reported: OM reads {om:?} (position 4 must be S), so the sub cannot use its own \
+             antenna"
+        ));
+    }
+    match rb.flag(Query::BandIndependent) {
+        Some(false) => {}
+        Some(true) => p.push(
+            "band independence is on (BI1); a paired survey needs VFO B on the main band, so turn it off (BI0)"
+                .to_owned(),
+        ),
+        None => p.push("band independence (BI) is unreadable".to_owned()),
+    }
+    if rb.flag(Query::SubRx).is_none() {
+        p.push("the sub receiver state (SB) is unreadable".to_owned());
+    }
+    for (q, what) in [
+        (Query::VfoB, "VFO B (FB)"),
+        (Query::SubRxAntenna, "the sub RX input (AR$)"),
+        (Query::SubBand, "the sub band (BN$)"),
+    ] {
+        if rb.raw(q).is_none() {
+            p.push(format!("{what} is unreadable, so it could not be put back"));
+        }
+    }
+    p
 }
 
 /// Starts the survey's recovery journal with the preflight readback as the
@@ -289,6 +348,8 @@ pub struct SurveyReport {
     pub antenna_skips: u64,
     /// Tiles skipped because measurement settings could not be applied.
     pub measurement_skips: u64,
+    /// Paired visits (two linked pan visits each).
+    pub pairs: u64,
     /// `complete`, `partial`, `unsupported`, `conflict` or `not_restored`.
     pub restore_outcome: String,
     /// Manual steps when restoration was not complete.
@@ -317,6 +378,11 @@ struct Survey<'a, S, C> {
     pan: PanId,
     baseline: Readback,
     offset_hz: i64,
+    /// Fields the interlock compares with the baseline: [`WATCH`], plus
+    /// the sub receiver's in a paired survey.
+    watch: Vec<Query>,
+    /// Set for a paired survey.
+    paired: Option<PairedState>,
     plan: Option<SurveyPlan>,
     sampler: RawSampler,
     diag_at_last_visit: DecoderDiagnostics,
@@ -325,10 +391,47 @@ struct Survey<'a, S, C> {
     report: SurveyReport,
 }
 
-/// Outcome of settling on a tuned frequency.
+/// Outcome of settling on a tuned frequency, per tracked pan.
+#[derive(Default)]
 struct Settled {
-    geometry: Option<BinGeometry>,
-    discarded: u32,
+    geometry: BTreeMap<PanId, BinGeometry>,
+    discarded: BTreeMap<PanId, u32>,
+}
+
+impl Settled {
+    fn of(&self, pan: PanId) -> Option<BinGeometry> {
+        self.geometry.get(&pan).copied()
+    }
+
+    fn discarded(&self, pan: PanId) -> u32 {
+        self.discarded.get(&pan).copied().unwrap_or(0)
+    }
+
+    fn add(&mut self, later: Settled) {
+        self.geometry = later.geometry;
+        for (p, n) in later.discarded {
+            *self.discarded.entry(p).or_default() += n;
+        }
+    }
+}
+
+/// A paired survey's sub-receiver tuning state.
+struct PairedState {
+    swap: bool,
+    /// Learned pan B center minus `FB`.
+    offset_hz: i64,
+    /// The last `FB` tuned.
+    fb: u64,
+}
+
+/// Sub-receiver fields a paired survey watches and records.
+fn sub_watch() -> Vec<Query> {
+    let mut q = vec![Query::SubRx, Query::BandIndependent];
+    q.extend(Query::SUB_STATE);
+    q.extend(measure::SUB_KEYS);
+    q.sort();
+    q.dedup();
+    q
 }
 
 impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
@@ -344,8 +447,25 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         self.store.event(e).await.map_err(Halt::from)
     }
 
+    /// What the interlock reads: transmit state and the watched fields.
+    fn interlock(&self) -> Vec<Query> {
+        let mut q = vec![Query::Transmit];
+        q.extend(&self.watch);
+        q
+    }
+
+    /// Pans whose frames this survey measures.
+    fn pans(&self) -> Vec<PanId> {
+        if self.paired.is_some() {
+            vec![PanId::A, PanId::B]
+        } else {
+            vec![self.pan]
+        }
+    }
+
     async fn read(&mut self) -> Step<Readback> {
-        Ok(self.cat.query(&interlock_queries()).await?)
+        let q = self.interlock();
+        Ok(self.cat.query(&q).await?)
     }
 
     /// Reads the interlock and compares it with the baseline.
@@ -370,7 +490,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 return Err(Halt::Conflict("transmit state unreadable".into()));
             }
         }
-        let diffs = diff(&self.baseline, &rb, &WATCH);
+        let diffs = diff(&self.baseline, &rb, &self.watch);
         if !diffs.is_empty() {
             let msg = format!("radio changed outside the collector: {}", diffs.join(", "));
             self.record(self.event(EventKind::ExternalChange, &msg)).await?;
@@ -394,6 +514,10 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 Scope::Band(self.band_now()?)
             }
             Setter::Receiver(_) => Scope::Context(self.band_now()?, self.input_now()?),
+            Setter::SubRx(_) => Scope::SubSession,
+            // BI0: VFO B is on the main band, so its memory is keyed by it.
+            Setter::VfoB(_) | Setter::SubSpan(_) | Setter::SubRxInput(_) => Scope::SubBand(self.band_now()?),
+            Setter::SubReceiver(_) => Scope::SubContext(self.band_now()?, self.sub_input_now()?),
         })
     }
 
@@ -402,6 +526,13 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             .raw(Query::RxAntenna)
             .map(str::to_owned)
             .ok_or_else(|| Halt::Conflict("main RX input (AR) unreadable".into()))
+    }
+
+    fn sub_input_now(&self) -> Step<String> {
+        self.baseline
+            .raw(Query::SubRxAntenna)
+            .map(str::to_owned)
+            .ok_or_else(|| Halt::Conflict("sub RX input (AR$) unreadable".into()))
     }
 
     fn dirty(&self, scope: &Scope, field: &str) -> bool {
@@ -486,6 +617,10 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                         Query::FixedTune,
                     ]);
                     may_change.extend(measure::KEYS);
+                    // With BI0 the sub receiver follows, recalling its own
+                    // band memory (unverified on hardware).
+                    may_change.extend([Query::SubBand, Query::SubSpan, Query::SubRxAntenna]);
+                    may_change.extend(measure::SUB_KEYS);
                     rb.u64(Query::Band) == Some(u64::from(n))
                 }
                 Setter::RxInput(i) => {
@@ -503,17 +638,48 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     may_change.push(Query::FixedTune);
                     rb.flag(Query::FixedTune) == Some(f)
                 }
-                Setter::Receiver(_) => {
+                Setter::Receiver(_) | Setter::SubReceiver(_) => {
                     let q = s.query();
                     may_change.push(q);
                     rb.raw(q).map(|r| measure::norm(q, r)) == Some(measure::norm(q, &expected_readback(*s)))
+                }
+                Setter::SubRx(on) => {
+                    // Turning the sub on may recall its settings.
+                    may_change.push(Query::SubRx);
+                    may_change.extend([Query::VfoB, Query::SubSpan, Query::SubRxAntenna]);
+                    may_change.extend(measure::SUB_KEYS);
+                    rb.flag(Query::SubRx) == Some(on)
+                }
+                Setter::VfoB(hz) => {
+                    may_change.push(Query::VfoB);
+                    rb.u64(Query::VfoB) == Some(hz)
+                }
+                Setter::SubSpan(hz) => {
+                    may_change.push(Query::SubSpan);
+                    rb.u64(Query::SubSpan) == Some(u64::from(hz))
+                }
+                Setter::SubRxInput(i) => {
+                    // Sub settings may be stored per RX input.
+                    may_change.push(Query::SubRxAntenna);
+                    may_change.extend(measure::SUB_KEYS);
+                    rb.u64(Query::SubRxAntenna) == Some(u64::from(i.value()))
                 }
             };
             if !ok {
                 problems.push(format!("{} not confirmed by readback", s.wire()));
             }
         }
-        let others: Vec<Query> = WATCH.into_iter().filter(|q| !may_change.contains(q)).collect();
+        if self.paired.is_some() {
+            let band = |q| rb.raw(q).map(|b| measure::norm(Query::Band, b));
+            if band(Query::SubBand) != band(Query::Band) {
+                problems.push(format!(
+                    "the sub receiver is on BN${} but the main on BN{} (paired surveys need BI0)",
+                    rb.raw(Query::SubBand).unwrap_or("?"),
+                    rb.raw(Query::Band).unwrap_or("?")
+                ));
+            }
+        }
+        let others: Vec<Query> = self.watch.iter().copied().filter(|q| !may_change.contains(q)).collect();
         problems.extend(diff(&self.baseline, &rb, &others));
         if !problems.is_empty() {
             let msg = format!("readback disagrees after retune: {}", problems.join(", "));
@@ -637,7 +803,58 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         let mut setters = self.pan_setup()?;
         setters.push(Setter::VfoA(fa));
         self.apply(&setters, Purpose::Survey).await?;
+        if self.paired.is_some() {
+            let fb = self.tune_sub(center_hz).await?;
+            if let Some(p) = self.paired.as_mut() {
+                p.fb = fb;
+            }
+        }
         Ok(fa)
+    }
+
+    /// Tunes VFO B so pan B is expected to center on `center_hz`, with the
+    /// sub pan at the main pan's span when that can be set and put back.
+    /// Coverage is still decided by pan B's own frame headers.
+    async fn tune_sub(&mut self, center_hz: u64) -> Step<u64> {
+        let offset = self.paired.as_ref().map_or(0, |p| p.offset_hz);
+        let fb = round_to_step(center_hz as i64 - offset);
+        let mut setters = Vec::new();
+        if let Some(span) = self.baseline.u64(Query::Span).and_then(|s| u32::try_from(s).ok())
+            && self.baseline.u64(Query::SubSpan) != Some(u64::from(span))
+            && Setter::SubSpan(span).is_sendable()
+            && self.sub_span_restorable()?
+        {
+            setters.push(Setter::SubSpan(span));
+        }
+        if self.baseline.u64(Query::VfoB) != Some(fb) {
+            setters.push(Setter::VfoB(fb));
+        }
+        if !setters.is_empty() {
+            self.apply(&setters, Purpose::Survey).await?;
+        }
+        Ok(fb)
+    }
+
+    fn sub_span_restorable(&self) -> Step<bool> {
+        Ok(self.dirty(&Scope::SubBand(self.band_now()?), "#SPN$")
+            || self
+                .baseline
+                .raw(Query::SubSpan)
+                .is_some_and(|f| setter_for(Query::SubSpan, self.meta, f).is_some()))
+    }
+
+    /// Turns the sub receiver on for a paired survey (journaled; put back
+    /// at the end).
+    async fn sub_on(&mut self) -> Step<()> {
+        match self.baseline.flag(Query::SubRx) {
+            Some(true) => Ok(()),
+            Some(false) => {
+                self.apply(&[Setter::SubRx(true)], Purpose::Survey).await?;
+                self.record(self.event(EventKind::StateChanged, "turned the sub receiver on with SB1"))
+                    .await
+            }
+            None => Err(Halt::Conflict("sub receiver state (SB) unreadable".into())),
+        }
     }
 
     fn time_left(&self) -> Step<()> {
@@ -662,7 +879,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     }
 
     fn note_ignored(&mut self, rf: &ReceivedFrame) -> bool {
-        if rf.frame.pan() == self.pan {
+        let pan = rf.frame.pan();
+        if pan == self.pan || (self.paired.is_some() && pan == PanId::B) {
             return false;
         }
         *self
@@ -726,17 +944,16 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     }
 
     /// Discards frames until `settle_ms` after the confirmed retune, and
-    /// returns the last observed pan geometry.
+    /// returns the last observed geometry of each tracked pan (waiting up
+    /// to [`FRAME_WAIT`] for every pan to be seen).
     async fn settle(&mut self) -> Step<Settled> {
         let settle_end = tokio::time::Instant::now() + Duration::from_millis(self.profile.settle_ms);
         let wait_end = settle_end + FRAME_WAIT;
-        let mut s = Settled {
-            geometry: None,
-            discarded: 0,
-        };
+        let pans = self.pans();
+        let mut s = Settled::default();
         loop {
             let now = tokio::time::Instant::now();
-            if now >= settle_end && s.geometry.is_some() {
+            if now >= settle_end && pans.iter().all(|p| s.geometry.contains_key(p)) {
                 return Ok(s);
             }
             let until = if now < settle_end { settle_end } else { wait_end };
@@ -750,10 +967,10 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     self.on_reconnect(rf.at).await?;
                     // After the settle time, the first frame defines the
                     // geometry the dwell must keep.
-                    let g = BinGeometry::from_header(rf.frame.header());
-                    s.geometry = Some(g);
+                    let pan = rf.frame.pan();
+                    s.geometry.insert(pan, BinGeometry::from_header(rf.frame.header()));
                     if tokio::time::Instant::now() < settle_end {
-                        s.discarded += 1;
+                        *s.discarded.entry(pan).or_default() += 1;
                     }
                 }
                 Some(SpectrumEvent::Connected) => {
@@ -763,7 +980,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 Some(SpectrumEvent::Disconnected { reason, stalled }) => {
                     self.on_disconnect(reason, stalled).await?;
                     return Ok(Settled {
-                        geometry: None,
+                        geometry: BTreeMap::new(),
                         discarded: s.discarded,
                     });
                 }
@@ -771,27 +988,29 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         }
     }
 
-    /// Accepts frames for `dwell_ms`, polling the interlock. Returns the
-    /// visit and the halt that ended it early, if any.
-    async fn dwell(&mut self, mut v: VisitBuilder) -> (VisitBuilder, Option<Halt>) {
+    /// Accepts frames for `dwell_ms` into the visit of each frame's pan,
+    /// polling the interlock. Returns the visits and the halt that ended
+    /// the dwell early, if any. A paired dwell ends for both pans at once.
+    async fn dwell(&mut self, mut vs: Vec<VisitBuilder>) -> (Vec<VisitBuilder>, Option<Halt>) {
         let dwell_end = tokio::time::Instant::now() + Duration::from_millis(self.profile.dwell_ms);
         let poll = poll_interval(self.cfg);
         let mut next_poll = tokio::time::Instant::now() + poll;
+        let flag_all = |vs: &mut Vec<VisitBuilder>, f: &str| vs.iter_mut().for_each(|v| v.flag(f));
         loop {
             let now = tokio::time::Instant::now();
             if now >= dwell_end {
-                return (v, None);
+                return (vs, None);
             }
             if now >= next_poll {
                 next_poll = now + poll;
                 if let Err(h) = self.check().await {
-                    v.flag("interlock");
-                    return (v, Some(h));
+                    flag_all(&mut vs, "interlock");
+                    return (vs, Some(h));
                 }
             }
             let ev = match self.next_event(dwell_end.min(next_poll)).await {
                 Ok(ev) => ev,
-                Err(h) => return (v, Some(h)),
+                Err(h) => return (vs, Some(h)),
             };
             match ev {
                 None => {}
@@ -799,6 +1018,9 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     if self.note_ignored(&rf) {
                         continue;
                     }
+                    let Some(v) = vs.iter_mut().find(|v| v.pan == rf.frame.pan()) else {
+                        continue;
+                    };
                     match v.accept(&rf) {
                         PushOutcome::Accepted => {
                             if !self.store.raw_paused() && self.sampler.due(rf.at, rf.frame.raw().len()) {
@@ -811,7 +1033,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                         PushOutcome::Full => {
                             v.rejected = v.rejected.saturating_sub(1);
                             v.flag("frame_cap");
-                            return (v, None);
+                            return (vs, None);
                         }
                         _ => {
                             // Geometry moved without a collector setter.
@@ -822,17 +1044,17 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                                     "pan geometry changed during dwell without a CAT state change".into(),
                                 ),
                             };
-                            return (v, Some(h));
+                            return (vs, Some(h));
                         }
                     }
                 }
                 Some(SpectrumEvent::Connected) => {}
                 Some(SpectrumEvent::Disconnected { reason, stalled }) => {
-                    v.flag("spectrum_lost");
+                    flag_all(&mut vs, "spectrum_lost");
                     if let Err(h) = self.on_disconnect(reason, stalled).await {
-                        return (v, Some(h));
+                        return (vs, Some(h));
                     }
-                    return (v, None);
+                    return (vs, None);
                 }
             }
         }
@@ -851,7 +1073,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         .map_err(|e| Halt::NoSpectrum(format!("cannot plan with observed sample rate: {e}")))?;
         let rebuilt = self.plan.is_some();
         self.report.tiles_planned = plan.tiles.len();
-        self.schedule = schedule(&plan, self.antennas.len());
+        self.schedule = schedule(&plan, self.passes());
         self.plan = Some(plan);
         Ok(rebuilt)
     }
@@ -859,13 +1081,17 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     async fn plan_event(&self, rebuilt: bool) -> Step<()> {
         let Some(p) = &self.plan else { return Ok(()) };
         let s = self.profile;
-        let busy = p.cycle_duration(s.settle_ms, s.dwell_ms, 250) * self.antennas.len() as u32;
+        let busy = p.cycle_duration(s.settle_ms, s.dwell_ms, 250) * self.passes() as u32;
         let target = Duration::from_millis(s.min_cycle_ms);
+        let passes = if self.paired.is_some() {
+            "1 paired pass (2 antennas at once)".to_owned()
+        } else {
+            format!("{} antenna(s)", self.antennas.len())
+        };
         let msg = format!(
-            "{} tiles x {} antenna(s) = {} visits/cycle, observed packet rate {} Hz, usable {} Hz; \
+            "{} tiles x {passes} = {} visits/cycle, observed packet rate {} Hz, usable {} Hz; \
              cycle needs about {} s, target start-to-start {} s{}",
             p.tiles.len(),
-            self.antennas.len(),
             self.schedule.len(),
             p.sample_rate_hz,
             p.usable_width_hz,
@@ -888,6 +1114,52 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// The main-RX input resolved from the current baseline readback.
     fn observed_port(&self) -> Option<K4Port> {
         K4Port::from_readback(self.baseline.raw(Query::RxAntenna), self.baseline.raw(Query::TxAntenna))
+    }
+
+    /// The sub-RX input resolved from the current baseline readback.
+    fn observed_sub_port(&self) -> Option<K4Port> {
+        K4Port::from_readback(
+            self.baseline.raw(Query::SubRxAntenna),
+            self.baseline.raw(Query::TxAntenna),
+        )
+    }
+
+    /// [`Survey::select_antenna`] for the sub receiver, with `AR$`.
+    async fn select_sub_antenna(&mut self, a: &AntennaConfig, band: Option<&str>, tile: Option<&str>) -> Step<bool> {
+        if self.observed_sub_port() == Some(a.port) {
+            return Ok(true);
+        }
+        let current = self.sub_input_now()?;
+        let band_scope = Scope::SubBand(self.band_now()?);
+        if !self.dirty(&band_scope, "AR$") && setter_for(Query::SubRxAntenna, self.meta, &current).is_none() {
+            let msg = format!(
+                "sub RX input is AR${current}, which the collector cannot select again afterwards; antenna {} \
+                 tile skipped",
+                a.id
+            );
+            self.report.antenna_skips += 1;
+            self.record(self.event(EventKind::AntennaMismatch, msg).band(band, tile))
+                .await?;
+            return Ok(false);
+        }
+        self.put_back(&Scope::SubContext(self.band_now()?, current.clone()))
+            .await?;
+        let setter = Setter::SubRxInput(RxInput::for_port(a.port));
+        self.apply(&[setter], Purpose::Survey).await?;
+        if self.observed_sub_port() != Some(a.port) {
+            let msg = format!("{} did not select port {}", setter.wire(), a.port);
+            self.record(self.event(EventKind::ReadbackMismatch, &msg)).await?;
+            return Err(Halt::Conflict(msg));
+        }
+        let msg = format!(
+            "selected antenna {} ({}) on the sub receiver with {} (was AR${current})",
+            a.id,
+            a.port,
+            setter.wire()
+        );
+        self.record(self.event(EventKind::AntennaSelected, msg).band(band, tile))
+            .await?;
+        Ok(true)
     }
 
     /// Ensures the main-RX input is `a`. Returns `false`, having changed
@@ -956,6 +1228,12 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         let band = self.band_now()?;
         let mut wire = self.put_back(&Scope::Context(band, self.input_now()?)).await?;
         wire.push_str(&self.put_back(&Scope::Band(band)).await?);
+        if self.paired.is_some() {
+            // The sub receiver follows the main band (BI0): its memory on
+            // this band goes back too, after the main's.
+            wire.push_str(&self.put_back(&Scope::SubContext(band, self.sub_input_now()?)).await?);
+            wire.push_str(&self.put_back(&Scope::SubBand(band)).await?);
+        }
         Ok(wire)
     }
 
@@ -964,19 +1242,25 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// cannot be measured as configured.
     async fn apply_measurement(
         &mut self,
+        rx: Receiver,
         a: &AntennaConfig,
         band: Option<&str>,
         tile: Option<&str>,
     ) -> Step<Option<MeasurementSettings>> {
         let k4_band = self.baseline.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
         let settings = self.profile.measurement.resolve(k4_band, &a.id);
-        match measure::plan(self.meta, &settings, k4_band, &self.baseline) {
+        let on = if rx == Receiver::Sub {
+            " on the sub receiver"
+        } else {
+            ""
+        };
+        match measure::plan_for(rx, self.meta, &settings, k4_band, &self.baseline) {
             Ok(changes) if changes.is_empty() => Ok(Some(settings)),
             Ok(changes) => {
                 let setters: Vec<Setter> = changes.iter().map(|c| c.setter).collect();
                 self.apply(&setters, Purpose::Survey).await?;
                 let msg = format!(
-                    "measurement settings for {} on {}: {}",
+                    "measurement settings for {}{on} on {}: {}",
                     a.id,
                     band_label(k4_band),
                     changes
@@ -992,8 +1276,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             Err(why) => {
                 self.report.measurement_skips += 1;
                 let msg = format!(
-                    "antenna {} on {} cannot be measured as configured ({settings}): {why}; tile skipped, nothing \
-                     changed",
+                    "antenna {}{on} on {} cannot be measured as configured ({settings}): {why}; tile skipped, \
+                     nothing changed",
                     a.id,
                     band_label(k4_band)
                 );
@@ -1004,67 +1288,114 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         }
     }
 
-    /// Tunes for a center, selects the antenna and settles; up to
-    /// `max_tile_corrections` learned-offset retunes if the observed usable
-    /// span misses `target`. `None` if the antenna could not be selected.
+    /// Tunes for a center, selects the antennas and settles; up to
+    /// `max_tile_corrections` learned-offset retunes if a tracked pan's
+    /// observed usable span misses `target`. `None` if an antenna could not
+    /// be selected or measured as configured. `antennas` holds the main
+    /// receiver's antenna, then (paired) the sub's.
     async fn tune_and_settle(
         &mut self,
         center_hz: u64,
         target: Option<&HzRange>,
-        antenna: Option<&AntennaConfig>,
+        antennas: &[AntennaConfig],
         band: Option<&str>,
         tile: Option<&str>,
-    ) -> Step<Option<(u64, Settled, MeasurementSettings)>> {
+    ) -> Step<Option<(u64, Settled, Vec<MeasurementSettings>)>> {
         let mut fa = self.tune(center_hz).await?;
-        let Some(settings) = self.prepare_context(antenna, band, tile).await? else {
+        let Some(mut settings) = self.prepare_context(antennas, band, tile).await? else {
             return Ok(None);
         };
         let mut settled = self.settle().await?;
         let mut corrections = 0;
-        while let Some(g) = settled.geometry {
+        let uf = self.cfg.collection.usable_fraction;
+        while let Some(g) = settled.of(self.pan) {
             self.offset_hz = g.center_hz as i64 - fa as i64;
+            if let (Some(gb), Some(p)) = (settled.of(PanId::B), self.paired.as_mut()) {
+                p.offset_hz = gb.center_hz as i64 - p.fb as i64;
+            }
             let Some(target) = target else { break };
-            if g.usable_range(self.cfg.collection.usable_fraction).covers(target)
-                || corrections >= self.cfg.collection.max_tile_corrections
-            {
+            let misses: Vec<String> = self
+                .pans()
+                .into_iter()
+                .filter_map(|pan| {
+                    let g = settled.of(pan)?;
+                    (!g.usable_range(uf).covers(target)).then(|| format!("pan {pan} center {} Hz", g.center_hz))
+                })
+                .collect();
+            if misses.is_empty() || corrections >= self.cfg.collection.max_tile_corrections {
                 break;
             }
             corrections += 1;
+            let sub = self.paired.as_ref().map_or(String::new(), |p| {
+                format!(" (FB {} Hz, offset {} Hz)", p.fb, p.offset_hz)
+            });
             let msg = format!(
-                "pan center {} Hz with FA {} Hz misses target {}..{} Hz; retuning with learned offset {} Hz",
-                g.center_hz, fa, target.low_hz, target.high_hz, self.offset_hz
+                "{} with FA {} Hz misses target {}..{} Hz; retuning with learned offset {} Hz{sub}",
+                misses.join(", "),
+                fa,
+                target.low_hz,
+                target.high_hz,
+                self.offset_hz
             );
             self.record(self.event(EventKind::RetuneCorrection, msg).band(band, tile))
                 .await?;
             fa = self.tune(center_hz).await?;
-            if self.prepare_context(antenna, band, tile).await?.is_none() {
-                return Ok(None);
+            match self.prepare_context(antennas, band, tile).await? {
+                Some(s) => settings = s,
+                None => return Ok(None),
             }
             let again = self.settle().await?;
-            settled = Settled {
-                geometry: again.geometry,
-                discarded: settled.discarded + again.discarded,
-            };
+            settled.add(again);
         }
         Ok(Some((fa, settled, settings)))
     }
 
-    /// Selects the antenna and applies its measurement settings. `None`
-    /// when the tile must be skipped. Without an antenna (the geometry
-    /// probe, which is not stored) the radio is left as found.
+    /// Selects the antennas and applies their measurement settings: the
+    /// main receiver's, then (paired) the sub's. `None` when the tile must
+    /// be skipped. Without antennas (the geometry probe, which is not
+    /// stored) the radio is left as found.
     async fn prepare_context(
         &mut self,
-        antenna: Option<&AntennaConfig>,
+        antennas: &[AntennaConfig],
         band: Option<&str>,
         tile: Option<&str>,
-    ) -> Step<Option<MeasurementSettings>> {
-        let Some(a) = antenna else {
-            return Ok(Some(MeasurementSettings::as_found()));
+    ) -> Step<Option<Vec<MeasurementSettings>>> {
+        let Some(main) = antennas.first() else {
+            return Ok(Some(vec![MeasurementSettings::as_found()]));
         };
-        if !self.select_antenna(a, band, tile).await? {
+        if !self.select_antenna(main, band, tile).await? {
             return Ok(None);
         }
-        self.apply_measurement(a, band, tile).await
+        let Some(ms) = self.apply_measurement(Receiver::Main, main, band, tile).await? else {
+            return Ok(None);
+        };
+        let mut out = vec![ms];
+        if let Some(sub) = antennas.get(1) {
+            let k4_band = self.baseline.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
+            let ss = self.profile.measurement.resolve(k4_band, &sub.id);
+            if ss.pan_averaging != ms.pan_averaging {
+                // #AVG has no sub form: both pans average alike.
+                self.report.measurement_skips += 1;
+                let msg = format!(
+                    "antennas {} and {} resolve different pan_averaging on {}, but both pans share #AVG; tile \
+                     skipped",
+                    main.id,
+                    sub.id,
+                    band_label(k4_band)
+                );
+                self.record(self.event(EventKind::MeasurementSkipped, msg).band(band, tile))
+                    .await?;
+                return Ok(None);
+            }
+            if !self.select_sub_antenna(sub, band, tile).await? {
+                return Ok(None);
+            }
+            let Some(ss) = self.apply_measurement(Receiver::Sub, sub, band, tile).await? else {
+                return Ok(None);
+            };
+            out.push(ss);
+        }
+        Ok(Some(out))
     }
 
     /// Holds the current tile without retuning until `until`, still
@@ -1189,7 +1520,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 .count(delta.rejected_candidates()),
             );
         }
-        let state = self.baseline.to_state(&interlock_queries());
+        let state = self.baseline.to_state(&self.interlock());
         if !antenna.verified() {
             // The interlock watches AR/AN, so this means the dwell's state
             // was inconsistent; never attribute it as verified.
@@ -1211,14 +1542,16 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         Ok(())
     }
 
-    async fn visit_tile(&mut self, tile: &Tile, antenna: &AntennaConfig) -> Step<()> {
+    /// Visits one tile with the main receiver on `antennas[0]` and, in a
+    /// paired survey, the sub receiver on `antennas[1]` over the same dwell.
+    async fn visit_tile(&mut self, tile: &Tile, antennas: &[AntennaConfig]) -> Step<()> {
         let tile_id = tile.id();
         let started = self.now();
         let Some((fa, settled, settings)) = self
             .tune_and_settle(
                 tile.center_hz,
                 Some(&tile.target),
-                Some(antenna),
+                antennas,
                 Some(&tile.band_id),
                 Some(&tile_id),
             )
@@ -1227,7 +1560,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             self.report.coverage_unverified += 1;
             return Ok(());
         };
-        let Some(g) = settled.geometry else {
+        let Some(g) = settled.of(self.pan) else {
             self.report.coverage_unverified += 1;
             let e = self
                 .event(EventKind::CoverageUnverified, "no spectrum frames after tuning")
@@ -1252,37 +1585,91 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             return self.record(e.interval(started.utc_ns, self.now().utc_ns)).await;
         }
         let c = &self.cfg.collection;
-        let mut v = VisitBuilder::new(
-            &self.session_id,
-            self.pan,
-            started,
-            c.usable_fraction,
-            c.max_frames_per_visit,
-        );
-        v.band_id = Some(tile.band_id.clone());
-        v.tile = Some(TileRef {
-            index: tile.index,
-            id: tile_id,
-            target: tile.target,
-        });
-        v.requested_vfo_hz = Some(fa);
-        v.requested_span_hz = self.baseline.u64(Query::Span).and_then(|s| u32::try_from(s).ok());
-        v.settle_ms = self.profile.settle_ms;
-        v.settle_discarded = settled.discarded;
-        // The baseline is the readback verified after the settings.
-        v.measurement = measure::visit_settings(&settings, self.meta, &self.baseline);
-        let visit_antenna = VisitAntenna::configured(antenna, self.observed_port());
-        let (v, halt) = self.dwell(v).await;
+        let mut visits = Vec::new();
+        let mut visit_antennas = Vec::new();
+        for (i, pan) in self.pans().into_iter().enumerate() {
+            let rx = if i == 0 { Receiver::Main } else { Receiver::Sub };
+            let mut v = VisitBuilder::new(
+                &self.session_id,
+                pan,
+                started,
+                c.usable_fraction,
+                c.max_frames_per_visit,
+            );
+            v.band_id = Some(tile.band_id.clone());
+            v.tile = Some(TileRef {
+                index: tile.index,
+                id: tile_id.clone(),
+                target: tile.target,
+            });
+            v.requested_vfo_hz = Some(match rx {
+                Receiver::Main => fa,
+                Receiver::Sub => self.paired.as_ref().map_or(fa, |p| p.fb),
+            });
+            v.requested_span_hz = self
+                .baseline
+                .u64(rx.form(Query::Span))
+                .and_then(|s| u32::try_from(s).ok());
+            v.settle_ms = self.profile.settle_ms;
+            v.settle_discarded = settled.discarded(pan);
+            // The baseline is the readback verified after the settings.
+            v.measurement = measure::visit_settings_for(rx, &settings[i], self.meta, &self.baseline);
+            let port = match rx {
+                Receiver::Main => self.observed_port(),
+                Receiver::Sub => self.observed_sub_port(),
+            };
+            visit_antennas.push(VisitAntenna::configured(&antennas[i], port));
+            visits.push(v);
+        }
+        if let [a, b] = visits.as_mut_slice() {
+            let pair_id = format!("pair-{}", a.visit_id);
+            let orientation = u8::from(antennas[0].id != self.antennas[0].id);
+            a.pair = Some(VisitPair {
+                pair_id: pair_id.clone(),
+                orientation,
+                peer_visit_id: b.visit_id.clone(),
+                peer_pan: b.pan,
+                peer_antenna: visit_antennas[1].clone(),
+            });
+            b.pair = Some(VisitPair {
+                pair_id,
+                orientation,
+                peer_visit_id: a.visit_id.clone(),
+                peer_pan: a.pan,
+                peer_antenna: visit_antennas[0].clone(),
+            });
+            self.report.pairs += 1;
+        }
+        let (visits, halt) = self.dwell(visits).await;
         // Confirm state at the end of the dwell before calling it complete.
         let halt = match halt {
             Some(h) => Some(h),
             None => self.check().await.err(),
         };
-        self.finish_visit(v, tile, visit_antenna, halt.as_ref()).await?;
+        for (v, a) in visits.into_iter().zip(visit_antennas) {
+            self.finish_visit(v, tile, a, halt.as_ref()).await?;
+        }
         match halt {
             Some(h) => Err(h),
             None => Ok(()),
         }
+    }
+
+    /// The antennas for a visit: the main receiver's, then (paired) the
+    /// sub's, exchanged on odd cycles when `swap` is set.
+    fn visit_antennas(&self, ant: usize) -> Vec<AntennaConfig> {
+        match &self.paired {
+            None => vec![self.antennas[ant].clone()],
+            Some(p) => {
+                let o = usize::from(p.swap && self.report.cycles % 2 == 1);
+                vec![self.antennas[o].clone(), self.antennas[1 - o].clone()]
+            }
+        }
+    }
+
+    /// Antenna passes per cycle: every antenna in turn, or one paired pass.
+    fn passes(&self) -> usize {
+        if self.paired.is_some() { 1 } else { self.antennas.len() }
     }
 
     async fn run(&mut self) -> Step<()> {
@@ -1296,12 +1683,15 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             .min_by_key(|b| b.low_hz)
             .ok_or_else(|| Halt::NoSpectrum("no ranges".into()))?;
         let center = first.range().midpoint();
+        if self.paired.is_some() {
+            self.sub_on().await?;
+        }
         // The geometry probe is not stored, so any antenna will do.
         let settled = self
-            .tune_and_settle(center, None, None, Some(&first.id), None)
+            .tune_and_settle(center, None, &[], Some(&first.id), None)
             .await?
             .map(|(_, s, _)| s);
-        let Some(g) = settled.and_then(|s| s.geometry) else {
+        let Some(g) = settled.and_then(|s| s.of(self.pan)) else {
             return Err(Halt::NoSpectrum(
                 "no spectrum frames after tuning; coverage cannot be verified".into(),
             ));
@@ -1324,8 +1714,8 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
             let (ant, tile_idx) = self.schedule[pos];
             let tile = plan.tiles[tile_idx].clone();
             let rate = plan.sample_rate_hz;
-            let antenna = self.antennas[ant].clone();
-            self.visit_tile(&tile, &antenna).await?;
+            let antennas = self.visit_antennas(ant);
+            self.visit_tile(&tile, &antennas).await?;
             self.maybe_tick().await?;
             let plan = self.plan.as_ref().ok_or_else(|| Halt::NoSpectrum("no plan".into()))?;
             if plan.sample_rate_hz != rate {
@@ -1450,6 +1840,26 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
             "the recovery journal does not belong to this session's preflight".into(),
         ));
     }
+    let paired = profile.paired.then_some(PairedState {
+        swap: profile.swap,
+        offset_hz: 0,
+        fb: 0,
+    });
+    if paired.is_some() {
+        let problems = paired_problems(&preflight.readback, cfg);
+        if antennas.len() != 2 || !problems.is_empty() {
+            return Err(RunError::Config(format!(
+                "a paired survey needs exactly two registered antennas and a passing preflight: {}",
+                problems.join("; ")
+            )));
+        }
+    }
+    let mut watch = WATCH.to_vec();
+    if paired.is_some() {
+        watch.extend(sub_watch());
+        watch.sort();
+        watch.dedup();
+    }
     let journal = txn.path().map(|p| p.display().to_string());
     let mut s = Survey {
         cfg,
@@ -1469,6 +1879,8 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         pan: cfg.radio.receiver.pan(),
         baseline: preflight.readback,
         offset_hz: 0,
+        watch,
+        paired,
         plan: None,
         sampler,
         diag_at_last_visit: DecoderDiagnostics::default(),
@@ -1485,6 +1897,7 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
             idle_s: 0.0,
             antenna_skips: 0,
             measurement_skips: 0,
+            pairs: 0,
             restore_outcome: String::new(),
             manual: Vec::new(),
             journal,
@@ -1494,8 +1907,9 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
         .event(s.event(
             EventKind::SessionStart,
             format!(
-                "authorized survey for {} s with profile {:?} on antenna(s) {}; setters limited to \
-                 BN/FA/#SPN/#FXT{} and receiver measurement settings; CAT meta-mode {}; journal {}",
+                "authorized {}survey for {} s with profile {:?} on antenna(s) {}; setters limited to \
+                 BN/FA/#SPN/#FXT{}{} and receiver measurement settings; CAT meta-mode {}; journal {}",
+                if s.paired.is_some() { "paired " } else { "" },
                 duration.as_secs(),
                 profile.id,
                 profile.antennas.join(", "),
@@ -1504,6 +1918,7 @@ pub async fn run_survey<S: SpectrumSource, C: CatControl>(
                 } else {
                     ""
                 },
+                if s.paired.is_some() { "/SB/FB/#SPN$/AR$" } else { "" },
                 preflight.meta,
                 s.report.journal.as_deref().unwrap_or("in memory")
             ),

@@ -49,6 +49,8 @@ impl Connector for SimConnector {
 pub const STATION: &str = include_str!("../../../../config/example.toml");
 pub const HF_FULL: &str = include_str!("../../../../config/surveys/hf-full.toml");
 pub const RX_VS_DXC: &str = include_str!("../../../../config/surveys/rx-vs-dxc.toml");
+#[allow(dead_code)]
+pub const RX_VS_DXC_PAIRED: &str = include_str!("../../../../config/surveys/rx-vs-dxc-paired.toml");
 
 pub fn station(root: &Path, mode: &str) -> String {
     STATION

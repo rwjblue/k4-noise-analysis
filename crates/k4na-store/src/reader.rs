@@ -64,9 +64,17 @@ pub struct VisitRow {
     /// Profile measurement settings JSON (NULL for passive visits and v2
     /// shards).
     pub measurement_json: Option<String>,
+    /// [`k4na_core::model::VisitPair`] JSON for paired visits (NULL
+    /// otherwise, and in shards before v5).
+    pub pair_json: Option<String>,
 }
 
 impl VisitRow {
+    /// The paired-visit link, if this visit is one pan of a pair.
+    pub fn pair(&self) -> Option<k4na_core::model::VisitPair> {
+        serde_json::from_str(self.pair_json.as_deref()?).ok()
+    }
+
     /// Delivered frames per second, rounded; see
     /// [`k4na_core::model::delivered_frame_rate`].
     pub fn frame_rate(&self) -> Option<u32> {
@@ -515,7 +523,7 @@ pub fn union_len(mut ranges: Vec<(i64, i64)>) -> u64 {
 }
 
 /// Number of columns [`visit_columns`] selects.
-const VISIT_COLUMNS: usize = 28;
+const VISIT_COLUMNS: usize = 29;
 
 /// The `visits v` columns [`visit_from_row`] reads, in order.
 fn visit_columns(c: &Connection) -> Result<String, StoreError> {
@@ -525,11 +533,18 @@ fn visit_columns(c: &Connection) -> Result<String, StoreError> {
     } else {
         "NULL"
     };
+    // Shards before v5 predate pair_json.
+    let pair = if has_column(c, "visits", "pair_json")? {
+        "v.pair_json"
+    } else {
+        "NULL"
+    };
     Ok(format!(
         "v.visit_id, v.session_id, v.segment_id, v.pan, v.band_id, v.tile_id, v.target_low_hz, v.target_high_hz,
          v.requested_vfo_hz, v.center_hz, v.sample_rate_hz, v.bin_count, v.actual_low_hz, v.actual_high_hz,
          v.started_utc_ns, v.ended_utc_ns, v.accepted_frames, v.rejected_frames, v.settle_discarded, v.status, v.flags,
-         v.end_reason, v.antenna_id, v.antenna_port, v.antenna_observed_port, {measurement}, v.first_mono_ns, v.last_mono_ns"
+         v.end_reason, v.antenna_id, v.antenna_port, v.antenna_observed_port, {measurement}, v.first_mono_ns, v.last_mono_ns,
+         {pair}"
     ))
 }
 
@@ -563,6 +578,7 @@ fn visit_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisitRow> {
         measurement_json: r.get(25)?,
         first_mono_ns: r.get(26)?,
         last_mono_ns: r.get(27)?,
+        pair_json: r.get(28)?,
     })
 }
 

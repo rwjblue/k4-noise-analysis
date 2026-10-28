@@ -1,7 +1,12 @@
 # On-disk format and bounded retention
 
-Status: implemented (schema version 4) in crates/k4na-store; no migrations
-yet. Readers reject unsupported schema versions. Version 4 changed only
+Status: implemented (schema version 5) in crates/k4na-store; no migrations
+yet. Readers reject unsupported schema versions. Version 5 adds
+`visits.pair_json`: for one pan of a paired visit ([paired.md](paired.md)),
+a JSON object with the shared `pair_id`, `orientation` (0: main on the
+profile's first antenna, 1: swapped), and the peer's `peer_visit_id`,
+`peer_pan` and `peer_antenna`; NULL otherwise. Readers still open
+version 2-4 shards (the column reads as NULL). Version 4 changed only
 how raw frames are stored (the `shuffle2+zstd` codec and 16 KiB raw-shard
 pages, below); readers still decode version 2 and 3 `zstd` frames, and
 older binaries refuse version 4 shards at open rather than failing on an

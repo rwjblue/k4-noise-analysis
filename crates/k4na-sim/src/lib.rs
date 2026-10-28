@@ -68,6 +68,24 @@ pub struct RadioModel {
     /// observed recalling a band's span (and so its packet rate) on `BN`.
     pub band_span: BTreeMap<u8, u32>,
     pub band_fixed: BTreeMap<u8, bool>,
+    /// KRX4 sub receiver installed (`OM` position 4 `S`).
+    pub krx4: bool,
+    /// Band independence (`BI`): off means VFO B follows the main band.
+    pub band_independent: bool,
+    /// Sub pan span (`#SPN$`) and sub-RX input (`AR$`).
+    pub sub_span: u32,
+    pub sub_input: u8,
+    /// Current sub-receiver settings, stored like the main's (`rx_scope`)
+    /// keyed by (band, sub input).
+    pub sub: RxSettings,
+    pub sub_memory: BTreeMap<(u8, u8), RxSettings>,
+    pub sub_pan_nb: u8,
+    /// Per-band VFO B, sub span and sub input, recalled by `BN` (a
+    /// stand-in; real K4 behavior is unverified).
+    pub band_sub: BTreeMap<u8, (u64, u32, u8)>,
+    /// Synthetic sub-minus-main level difference (native tenths), so tests
+    /// can check that a swap separates receivers from antennas.
+    pub sub_bias: i16,
 }
 
 /// Main-receiver settings that affect measurements.
@@ -158,10 +176,41 @@ impl RadioModel {
         }
     }
 
+    /// The sub-receiver settings stored for (`band`, sub `input`).
+    pub fn sub_settings(&self, band: u8, input: u8) -> RxSettings {
+        match self.rx_key(band, input) {
+            None => self.sub,
+            Some(k) if self.rx_key(self.bn, self.sub_input) == Some(k) => self.sub,
+            Some(k) => self.sub_memory.get(&k).copied().unwrap_or(self.sub),
+        }
+    }
+
+    /// Saves the sub settings for the current (band, sub input) and recalls
+    /// the ones for (`band`, `input`).
+    fn switch_sub_context(&mut self, band: u8, input: u8) {
+        if let Some(k) = self.rx_key(self.bn, self.sub_input) {
+            self.sub_memory.insert(k, self.sub);
+        }
+        if let Some(k) = self.rx_key(band, input) {
+            self.sub = self.sub_memory.get(&k).copied().unwrap_or(self.sub);
+        }
+    }
+
+    /// The port feeding the sub receiver.
+    pub fn sub_port(&self) -> Option<&'static str> {
+        let m = RadioModel {
+            rx_input: self.sub_input,
+            ..self.clone()
+        };
+        m.rx_port()
+    }
+
     fn rx_readback(&self, prefix: &str) -> String {
+        Self::rx_readback_of(&self.rx, self.meta_advanced, prefix)
+    }
+
+    fn rx_readback_of(rx: &RxSettings, adv: bool, prefix: &str) -> String {
         let f = |b: bool| u8::from(b);
-        let rx = &self.rx;
-        let adv = self.meta_advanced;
         match prefix {
             "PA" if adv => format!("{}{}", rx.preamp_level, f(rx.preamp_on)),
             "PA" => format!("{}", if rx.preamp_on { rx.preamp_level } else { 0 }),
@@ -302,6 +351,15 @@ impl Default for RadioModel {
             band_span: BTreeMap::new(),
             band_fixed: BTreeMap::new(),
             atu: true,
+            krx4: true,
+            band_independent: false,
+            sub_span: 40_000,
+            sub_input: 4,
+            sub: RxSettings::default(),
+            sub_memory: BTreeMap::new(),
+            sub_pan_nb: 0,
+            band_sub: BTreeMap::new(),
+            sub_bias: 0,
         }
     }
 }
@@ -333,6 +391,8 @@ pub struct Faults {
     /// Accept but ignore setters with these prefixes (readback then
     /// mismatches), e.g. `"PA"`.
     pub ignore_setters: Vec<String>,
+    /// In track mode pan B centers on `FB + offset`.
+    pub sub_pan_center_offset_hz: i64,
 }
 
 #[derive(Debug, Default)]
@@ -436,16 +496,32 @@ impl SimRadio {
         (center, rate)
     }
 
+    /// Pan B follows VFO B (`#FXT` is shared by both pans).
+    fn sub_pan_center_and_rate(&self) -> (u64, u32) {
+        let g = self.lock();
+        let rate = g
+            .faults
+            .rate_override
+            .unwrap_or_else(|| rate_for_span(g.model.sub_span));
+        let center = (g.model.fb as i64 + g.faults.sub_pan_center_offset_hz).max(0) as u64;
+        (center, rate)
+    }
+
     /// Handles one `;`-free CAT command and returns the response, if any.
     pub fn handle_cat(&self, cmd: &str) -> Option<String> {
         let mut g = self.lock();
         g.commands.push(format!("{cmd};"));
-        let rx_input_setter = cmd
-            .strip_prefix("AR")
-            .is_some_and(|v| matches!(v, "1" | "2" | "4" | "5" | "6" | "7"));
+        let input_ok = |v: &str| matches!(v, "1" | "2" | "4" | "5" | "6" | "7");
+        let rx_input_setter = cmd.strip_prefix("AR").is_some_and(input_ok);
+        let sub_input_setter = cmd.strip_prefix("AR$").is_some_and(input_ok);
+        let vfo_b_setter = cmd
+            .strip_prefix("FB")
+            .is_some_and(|v| v.len() == 11 && v.bytes().all(|b| b.is_ascii_digit()));
         if FORBIDDEN_PREFIXES.iter().any(|p| cmd.starts_with(p))
-            && !matches!(cmd, "AR" | "AN" | "MD" | "FB" | "K4")
+            && !matches!(cmd, "AR" | "AN" | "MD" | "FB" | "K4" | "AR$")
             && !rx_input_setter
+            && !sub_input_setter
+            && !vfo_b_setter
         {
             // Parameterless GET forms of these are allowed; anything else
             // in a forbidden family is recorded.
@@ -458,7 +534,20 @@ impl SimRadio {
         let flag = |b: bool| u8::from(b);
         let resp = match cmd {
             "K4" => format!("K4{}", flag(m.meta_advanced)),
-            "OM" => "OM -P-S----4---".to_owned(),
+            "OM" => format!("OM -P-{}----4---", if m.krx4 { 'S' } else { '-' }),
+            "BI" => format!("BI{}", flag(m.band_independent)),
+            "BN$" => format!("BN${:02}", m.bn),
+            "#SPN$" => format!("#SPN${}", m.sub_span),
+            "#REF$" => "#REF$-110".to_owned(),
+            "#NB$" => format!("#NB${}", m.sub_pan_nb),
+            "OV$" => "OV$00".to_owned(),
+            "AR$" => format!("AR${}", m.sub_input),
+            "PA$" | "RA$" | "GT$" | "RG$" | "NB$" | "NR$" => {
+                format!(
+                    "{cmd}{}",
+                    RadioModel::rx_readback_of(&m.sub, m.meta_advanced, &cmd[..2])
+                )
+            }
             "TQ" => {
                 if faults.no_tq {
                     return None;
@@ -508,6 +597,44 @@ impl SimRadio {
                     }
                     return None;
                 }
+                if let Some(v) = cmd.strip_prefix("FB").and_then(|v| v.parse::<u64>().ok()) {
+                    if !m.lock && !m.transmitting {
+                        m.fb = v;
+                    }
+                    return None;
+                }
+                if let Some(v) = cmd.strip_prefix("SB").and_then(|v| v.parse::<u8>().ok()) {
+                    if v <= 1 && !m.transmitting {
+                        m.sub_rx = v == 1;
+                    }
+                    return None;
+                }
+                if sub_input_setter {
+                    let v: u8 = cmd[3..].parse().unwrap_or(0);
+                    if !m.transmitting && m.krx4 && (m.atu || !(5..=7).contains(&v)) {
+                        let bn = m.bn;
+                        m.switch_sub_context(bn, v);
+                        m.sub_input = v;
+                    }
+                    return None;
+                }
+                if let Some(v) = cmd.strip_prefix("#SPN$").and_then(|v| v.parse::<u32>().ok()) {
+                    m.sub_span = v.clamp(6_000, 368_000);
+                    return None;
+                }
+                if let Some(v) = cmd.strip_prefix("#NB$").and_then(|v| v.parse::<u8>().ok()) {
+                    m.sub_pan_nb = v;
+                    return None;
+                }
+                if let Some(main_form) = sub_receiver_command(cmd) {
+                    if faults.ignore_setters.iter().any(|p| cmd.starts_with(p.as_str())) {
+                        return None;
+                    }
+                    std::mem::swap(&mut m.rx, &mut m.sub);
+                    let ok = m.rx_set(&main_form);
+                    std::mem::swap(&mut m.rx, &mut m.sub);
+                    return if ok { None } else { Some("?;".into()) };
+                }
                 if let Some(v) = cmd.strip_prefix("BN").and_then(|v| v.parse::<u8>().ok()) {
                     if v <= 10 && !m.transmitting {
                         let cur = m.bn;
@@ -519,6 +646,17 @@ impl SimRadio {
                         m.band_fixed.insert(cur, fixed);
                         let new_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
                         m.switch_rx_context(v, new_input);
+                        if !m.band_independent {
+                            // VFO B follows the main band with its own memory.
+                            let (fb, sub_span, sub_input) = (m.fb, m.sub_span, m.sub_input);
+                            m.band_sub.insert(cur, (fb, sub_span, sub_input));
+                            let recalled = m.band_sub.get(&v).copied();
+                            let new_sub_input = recalled.map_or(m.sub_input, |r| r.2);
+                            m.switch_sub_context(v, new_sub_input);
+                            m.sub_input = new_sub_input;
+                            m.sub_span = recalled.map_or(m.sub_span, |r| r.1);
+                            m.fb = recalled.map_or_else(|| m.band_stack.get(&v).copied().unwrap_or(m.fb), |r| r.0);
+                        }
                         m.bn = v;
                         m.fa = m.band_stack.get(&v).copied().unwrap_or(m.fa);
                         m.rx_input = new_input;
@@ -566,11 +704,21 @@ impl SimRadio {
             let g = self.lock();
             (g.model.freeze, g.faults.wrong_pan)
         };
-        let center = if pan == PanId::A { center } else { 7_074_000 };
+        let (center, rate) = if pan == PanId::A {
+            (center, rate)
+        } else {
+            self.sub_pan_center_and_rate()
+        };
         let seed_index = if freeze { 0 } else { frame_index };
-        let port = self.lock().model.rx_port();
+        let offset = {
+            let m = &self.lock().model;
+            if pan == PanId::A {
+                port_floor_offset(m.rx_port()) + m.rx.level_offset()
+            } else {
+                port_floor_offset(m.sub_port()) + m.sub.level_offset() + m.sub_bias
+            }
+        };
         let mut bins = synth_bins(center, rate, seed_index);
-        let offset = port_floor_offset(port) + self.lock().model.rx.level_offset();
         for b in &mut bins {
             *b = b.saturating_add(offset);
         }
@@ -587,13 +735,23 @@ impl SimRadio {
     }
 }
 
+/// The main-form command for a sub-receiver measurement setter
+/// (`PA$1` -> `PA1`), if `cmd` is one.
+fn sub_receiver_command(cmd: &str) -> Option<String> {
+    ["PA", "RA", "RG", "GT", "NB", "NR"].into_iter().find_map(|p| {
+        let rest = cmd.strip_prefix(p)?.strip_prefix('$')?;
+        (!rest.is_empty()).then(|| format!("{p}{rest}"))
+    })
+}
+
 fn is_setter(cmd: &str) -> bool {
-    let body = cmd.trim_end_matches(';');
+    let body = cmd.trim_end_matches(';').replace('$', "");
+    let body = body.as_str();
     let prefixes = [
         // Longer prefixes first (`#NBL` before `#NB`).
         "#NBL", "#PKM", "#FPS", "#SPN", "#FXT", "#FXA", "#FRZ", "#REF", "#SCL", "#AVG", "#AR", "#NB", "FA", "FB", "BN",
         "MD", "FT", "DV", "SB", "LK", "RT", "XT", "PA", "RA", "GT", "RG", "NB", "NR", "NA", "NM", "OV", "AR", "AN",
-        "TQ", "OM", "RV", "K4",
+        "TQ", "OM", "RV", "K4", "BI",
     ];
     for p in prefixes {
         if let Some(rest) = body.strip_prefix(p) {
@@ -684,7 +842,7 @@ pub async fn serve_pan<S: AsyncWrite + Unpin>(radio: SimRadio, mut stream: S) {
     let mut index: u64 = 0;
     loop {
         tick.tick().await;
-        let (stall, corrupt, garbage, extra) = {
+        let (stall, corrupt, garbage, extra, sub) = {
             let g = radio.lock();
             if g.pan_epoch != epoch {
                 return;
@@ -694,6 +852,7 @@ pub async fn serve_pan<S: AsyncWrite + Unpin>(radio: SimRadio, mut stream: S) {
                 g.faults.corrupt_every,
                 g.faults.garbage_every,
                 g.faults.extra_pans,
+                g.model.sub_rx,
             )
         };
         if stall {
@@ -711,8 +870,12 @@ pub async fn serve_pan<S: AsyncWrite + Unpin>(radio: SimRadio, mut stream: S) {
             a[1000] ^= 0x55;
         }
         bytes.extend_from_slice(&a);
-        if extra {
+        // Pan B streams while the sub receiver is on (a K4D also sends it
+        // with the sub off; tests opt into that with `extra_pans`).
+        if extra || sub {
             bytes.extend(radio.build_frame(PanId::B, seq, index));
+        }
+        if extra {
             bytes.extend(radio.build_frame(PanId::Y, seq, index));
         }
         if stream.write_all(&bytes).await.is_err() {

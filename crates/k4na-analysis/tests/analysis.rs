@@ -119,6 +119,7 @@ fn visit(n: u64, at: i64, status: VisitStatus) -> VisitRecord {
         radio_state: [("PA".to_string(), "PA1".to_string())].into(),
         measurement: [("preamp".to_string(), "pre1".to_string())].into(),
         stats: Some(stats(n, hour)),
+        pair: None,
     }
 }
 
@@ -311,6 +312,7 @@ fn rows_from_shards_without_a_frame_rate_key_are_split_on_read() {
         antenna_port: "rx_ant_in1".into(),
         antenna_observed_port: None,
         measurement_json: None,
+        pair_json: None,
     };
     // The K4D's two observed rates in one stored segment.
     let slow = k4na_analysis::analysis_segment(&row(75, 5_900_000_000));

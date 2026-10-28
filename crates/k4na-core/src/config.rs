@@ -215,6 +215,12 @@ pub struct CollectionConfig {
     /// band whose RX input is not the wanted antenna is then skipped.
     #[serde(default)]
     pub allow_rx_antenna_switch: bool,
+    /// Permit a paired survey to use the sub receiver: turn it on (`SB1`),
+    /// set VFO B and the sub pan span, route its RX input with `AR$` and
+    /// apply the profile's receiver settings to it, all journaled and put
+    /// back. Needs a KRX4 (docs/paired.md). Off by default.
+    #[serde(default)]
+    pub allow_sub_receiver: bool,
     /// Permit the survey to set `#FXT0` (track) if the pan is fixed. Off by
     /// default: a fixed pan makes the survey refuse to start instead.
     #[serde(default)]
@@ -326,6 +332,17 @@ pub struct SurveyProfile {
     /// antenna and antenna+band overrides. See docs/measurement.md.
     #[serde(default)]
     pub measurement: MeasurementConfig,
+    /// Measure exactly two antennas at once: the main receiver (pan A) on
+    /// one and the sub receiver (pan B) on the other, on the same tile.
+    /// Needs `collection.allow_rx_antenna_switch` and
+    /// `collection.allow_sub_receiver`. See docs/paired.md.
+    #[serde(default)]
+    pub paired: bool,
+    /// With `paired`, exchange the receivers' antennas every other cycle so
+    /// the main/sub difference can be separated from the antenna
+    /// difference.
+    #[serde(default = "yes")]
+    pub swap: bool,
 }
 
 impl SurveyProfile {
@@ -698,6 +715,19 @@ impl Config {
                 s.antennas.len()
             ));
         }
+        if s.paired {
+            if s.antennas.len() != 2 {
+                p.push(format!(
+                    "a paired profile measures exactly two antennas at once; it lists {}",
+                    s.antennas.len()
+                ));
+            }
+            if !self.collection.allow_sub_receiver {
+                p.push(
+                    "a paired profile uses the sub receiver, which needs collection.allow_sub_receiver = true".into(),
+                );
+            }
+        }
         if let Some(span) = s.requested_pan_span_hz
             && !K4_SPAN_RANGE.contains(&span)
         {
@@ -809,6 +839,7 @@ mod tests {
     pub(crate) const HF_FULL: &str = include_str!("../../../config/surveys/hf-full.toml");
     const HF_CW: &str = include_str!("../../../config/surveys/hf-cw-us.toml");
     const RX_VS_DXC: &str = include_str!("../../../config/surveys/rx-vs-dxc.toml");
+    const RX_VS_DXC_PAIRED: &str = include_str!("../../../config/surveys/rx-vs-dxc-paired.toml");
 
     fn example() -> Config {
         Config::from_parts(EXAMPLE, Some(HF_FULL)).expect("example config")
@@ -839,6 +870,14 @@ mod tests {
         let ports: Vec<_> = both.survey_antennas().iter().map(|a| a.port).collect();
         assert_eq!(ports, [K4Port::RxAntIn1, K4Port::Ant2]);
         assert!(both.passive_antenna().is_err());
+        // A paired profile also needs the sub-receiver opt-in.
+        let err = Config::from_parts(&station, Some(RX_VS_DXC_PAIRED)).unwrap_err();
+        assert!(err.to_string().contains("allow_sub_receiver"), "{err}");
+        let station = station.replace("allow_sub_receiver = false", "allow_sub_receiver = true");
+        let paired = Config::from_parts(&station, Some(RX_VS_DXC_PAIRED)).expect("paired");
+        let p = paired.profile.as_ref().unwrap();
+        assert!(p.paired && p.swap);
+        assert_eq!(p.antennas, ["log-near-house", "dxc"]);
     }
 
     #[test]

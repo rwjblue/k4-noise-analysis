@@ -875,9 +875,9 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
             actual_low_hz, actual_high_hz, started_utc_ns, started_mono_ns, first_utc_ns, first_mono_ns, last_utc_ns, last_mono_ns,
             ended_utc_ns, ended_mono_ns, settle_ms, settle_discarded, accepted_frames, rejected_frames, status, flags, end_reason,
             noise_field_min, noise_field_median, noise_field_max, sequence_repeats, antenna_id, antenna_revision, antenna_port,
-            antenna_observed_port, radio_state_json, measurement_json)
+            antenna_observed_port, radio_state_json, measurement_json, pair_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
+            ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
         params![
             v.visit_id,
             v.session_id,
@@ -926,7 +926,8 @@ fn insert_visit(conn: &Connection, v: &VisitRecord, segment_id: &str) -> Result<
                 None
             } else {
                 Some(serde_json::to_string(&v.measurement)?)
-            }
+            },
+            v.pair.as_ref().map(serde_json::to_string).transpose()?
         ],
     )?;
     Ok(())

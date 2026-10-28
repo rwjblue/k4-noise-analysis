@@ -1,6 +1,7 @@
-//! SQLite schema version 4. See docs/storage.md for semantics.
+//! SQLite schema version 5. See docs/storage.md for semantics.
 //!
-//! Version 4 writes raw frames as `shuffle2+zstd` (v3 wrote `zstd`, still
+//! Version 5 adds `visits.pair_json` (the link between the two pans of a
+//! paired visit; NULL otherwise). Version 4 writes raw frames as `shuffle2+zstd` (v3 wrote `zstd`, still
 //! decoded) in raw shards with 16 KiB pages; tables are unchanged.
 //! Version 3 adds `visits.measurement_json` (the profile measurement
 //! settings in effect; NULL for passive visits). Version 2 moved antenna
@@ -9,10 +10,10 @@
 //! produced by tests and the simulator; it is not readable.
 
 pub const FORMAT: &str = "k4na-shard";
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Versions readers accept (and the writer may finalize after a crash).
-pub const READABLE_VERSIONS: [u32; 3] = [2, 3, 4];
+pub const READABLE_VERSIONS: [u32; 4] = [2, 3, 4, 5];
 
 /// Raw shards hold one ~2.3 KB frame per row; with 4 KiB pages each row
 /// took a page of its own. On a real K4D hour (3,081 frames) 16 KiB pages
@@ -104,7 +105,8 @@ CREATE TABLE IF NOT EXISTS visits (
     antenna_port        TEXT NOT NULL,
     antenna_observed_port TEXT,
     radio_state_json    TEXT NOT NULL,
-    measurement_json    TEXT
+    measurement_json    TEXT,
+    pair_json           TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS visits_antenna_band_time ON visits (antenna_id, band_id, started_utc_ns);
 CREATE INDEX IF NOT EXISTS visits_session_time ON visits (session_id, started_utc_ns);

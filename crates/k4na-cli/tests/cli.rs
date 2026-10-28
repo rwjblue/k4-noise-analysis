@@ -438,11 +438,12 @@ fn end_to_end_against_tcp_simulator() {
     assert_eq!(probe["values"]["K4"], "0", "{probe}");
     assert_eq!(probe["values"]["#NBL"], "8", "{probe}");
     assert!(
-        probe["commands_sent"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|c| c.as_str().unwrap().len() <= 5),
+        probe["commands_sent"].as_array().unwrap().iter().all(|c| {
+            // A bare prefix (`K4`, `#SPN`, `AR$`): no parameters.
+            let c = c.as_str().unwrap();
+            let body = c.strip_suffix(';').unwrap_or("?").trim_end_matches('$');
+            c.len() <= 6 && (body == "K4" || body.chars().all(|ch| ch.is_ascii_uppercase() || ch == '#'))
+        }),
         "GET forms only: {probe}"
     );
     assert!(

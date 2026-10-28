@@ -129,6 +129,24 @@ pub struct VisitRecord {
     #[serde(default)]
     pub measurement: BTreeMap<String, String>,
     pub stats: Option<VisitStats>,
+    /// Set when this pan was recorded at the same time as another pan of
+    /// one paired visit (docs/paired.md); `None` otherwise.
+    #[serde(default)]
+    pub pair: Option<VisitPair>,
+}
+
+/// Links the two pans of a paired visit: the main receiver (pan A) and the
+/// sub receiver (pan B) dwelling on one tile over the same seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisitPair {
+    /// Shared by both visits of the pair.
+    pub pair_id: String,
+    /// `0`: the main receiver is on the profile's first antenna and the sub
+    /// on the second; `1`: swapped.
+    pub orientation: u8,
+    pub peer_visit_id: String,
+    pub peer_pan: PanId,
+    pub peer_antenna: VisitAntenna,
 }
 
 /// The antenna a visit measured and how that was established.

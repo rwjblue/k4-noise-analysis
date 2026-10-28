@@ -59,9 +59,70 @@ pub const KEYS: [Query; 8] = [
     Query::Averaging,
 ];
 
+/// Sub-receiver settings a paired profile controls, in application
+/// order. `#AVG` is shared by both pans and stays a main-receiver key.
+pub const SUB_KEYS: [Query; 7] = [
+    Query::SubPreamp,
+    Query::SubAttenuator,
+    Query::SubRfGain,
+    Query::SubAgc,
+    Query::SubNoiseBlanker,
+    Query::SubNoiseReduction,
+    Query::SubPanNoiseBlanker,
+];
+
+/// Which receiver a measurement plan targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Receiver {
+    Main,
+    Sub,
+}
+
+impl Receiver {
+    pub fn keys(self) -> &'static [Query] {
+        match self {
+            Receiver::Main => &KEYS,
+            Receiver::Sub => &SUB_KEYS,
+        }
+    }
+
+    /// `q` for this receiver (`PA` -> `PA$` for the sub).
+    pub fn form(self, q: Query) -> Query {
+        match self {
+            Receiver::Main => q,
+            Receiver::Sub => q.sub_form().unwrap_or(q),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Receiver::Main => "main",
+            Receiver::Sub => "sub",
+        }
+    }
+}
+
+/// The main-receiver form of a sub query (`PA$` -> `PA`), if it is one.
+pub fn main_form(q: Query) -> Option<Query> {
+    Query::ALL.into_iter().find(|m| m.sub_form() == Some(q))
+}
+
 /// Human name of a field for reports and manual instructions.
 pub fn label(q: Query) -> &'static str {
     match q {
+        Query::SubRx => "sub receiver on/off",
+        Query::VfoB => "VFO B frequency",
+        Query::SubBand => "sub band",
+        Query::SubSpan => "sub pan span",
+        Query::SubRxAntenna => "sub RX input",
+        Query::SubPreamp => "sub preamp",
+        Query::SubAttenuator => "sub attenuator",
+        Query::SubRfGain => "sub RF gain",
+        Query::SubAgc => "sub AGC",
+        Query::SubNoiseBlanker => "sub noise blanker",
+        Query::SubNoiseReduction => "sub noise reduction",
+        Query::SubPanNoiseBlanker => "sub pan noise blanker",
         Query::Band => "band",
         Query::VfoA => "VFO A frequency",
         Query::Span => "pan span",
@@ -83,7 +144,7 @@ pub fn label(q: Query) -> &'static str {
 /// value `FA14074000` sets and `#AVG2` equals `#AVG02`.
 pub fn norm(q: Query, raw: &str) -> String {
     match q {
-        Query::VfoA | Query::VfoB | Query::Span | Query::Band | Query::Averaging => {
+        Query::VfoA | Query::VfoB | Query::Span | Query::SubSpan | Query::Band | Query::SubBand | Query::Averaging => {
             raw.parse::<u64>().map_or_else(|_| raw.to_owned(), |n| n.to_string())
         }
         _ => raw.to_owned(),
@@ -100,6 +161,25 @@ pub fn expected_readback(s: Setter) -> String {
 /// The whitelisted setter after which `q` reads back `raw` in `mode`, or
 /// `None` when the collector cannot produce that value.
 pub fn setter_for(q: Query, mode: MetaMode, raw: &str) -> Option<Setter> {
+    if q == Query::SubRx {
+        let s = match raw {
+            "0" => Setter::SubRx(false),
+            "1" => Setter::SubRx(true),
+            _ => return None,
+        };
+        return Some(s);
+    }
+    if let Some(main) = main_form(q) {
+        // The sub receiver shares the main grammar with `$` setters.
+        let s = match setter_for(main, mode, raw)? {
+            Setter::VfoA(hz) => Setter::VfoB(hz),
+            Setter::Span(hz) => Setter::SubSpan(hz),
+            Setter::RxInput(i) => Setter::SubRxInput(i),
+            Setter::Receiver(r) => Setter::SubReceiver(r),
+            _ => return None,
+        };
+        return (s.is_sendable() && s.query() == q && norm(q, &expected_readback(s)) == norm(q, raw)).then_some(s);
+    }
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if !digits(raw.trim_start_matches('-')) {
         return None;
@@ -237,11 +317,24 @@ pub fn plan(
     band: Option<u8>,
     rb: &Readback,
 ) -> Result<Vec<Change>, String> {
+    plan_for(Receiver::Main, mode, settings, band, rb)
+}
+
+/// [`plan`] for either receiver; the sub uses its `$` forms and leaves
+/// the shared pan averaging to the main plan.
+pub fn plan_for(
+    rx: Receiver,
+    mode: MetaMode,
+    settings: &MeasurementSettings,
+    band: Option<u8>,
+    rb: &Readback,
+) -> Result<Vec<Change>, String> {
     let mut out = Vec::new();
     let mut problems = Vec::new();
-    for q in KEYS {
+    for &q in rx.keys() {
         let found = rb.raw(q);
-        let t = match target(q, mode, settings, band, found) {
+        let main = main_form(q).unwrap_or(q);
+        let t = match target(main, mode, settings, band, found) {
             Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(e) => {
@@ -291,10 +384,28 @@ pub fn plan(
 /// effective values as verified by readback (`verified.<prefix>`, raw
 /// readback text in that mode).
 pub fn visit_settings(s: &MeasurementSettings, mode: MetaMode, verified: &Readback) -> BTreeMap<String, String> {
+    visit_settings_for(Receiver::Main, s, mode, verified)
+}
+
+/// [`visit_settings`] for the receiver that produced a pan. Keys are the
+/// main-form prefixes (`verified.PA`) so both pans read alike; the sub's
+/// values come from its `$` readbacks, and shared `#AVG` from the main.
+pub fn visit_settings_for(
+    rx: Receiver,
+    s: &MeasurementSettings,
+    mode: MetaMode,
+    verified: &Readback,
+) -> BTreeMap<String, String> {
     let mut m = s.to_map();
     m.insert("cat_meta_mode".into(), mode.as_str().into());
+    // Only the sub is marked, so main-receiver segment identities are
+    // unchanged from single-receiver surveys.
+    if rx == Receiver::Sub {
+        m.insert("receiver".into(), "sub".into());
+    }
     for q in KEYS {
-        if let Some(raw) = verified.raw(q) {
+        let own = if q == Query::Averaging { q } else { rx.form(q) };
+        if let Some(raw) = verified.raw(own) {
             m.insert(format!("verified.{}", q.prefix()), raw.to_owned());
         }
     }

@@ -7,9 +7,12 @@ minutes apart: fading, propagation and cycling local noise change between
 them, so only same-instant comparisons of signal over background are
 trustworthy.
 
-This page records what was checked on hardware, the design (being
-implemented; not yet in a release), and what is still unverified. See [collection.md](collection.md) for the shared survey
-contract and [analysis.md](analysis.md) for `k4na analyze pairs`.
+This page records what was checked on hardware, the design (implemented
+and tested against the simulator; no paired survey has run on a radio
+yet), and what is still unverified. See [collection.md](collection.md) for
+the shared survey contract and [analysis.md](analysis.md#paired-visits)
+for `k4na analyze pairs`. The shipped profile is
+[`config/surveys/rx-vs-dxc-paired.toml`](../config/surveys/rx-vs-dxc-paired.toml).
 
 ## Requirements
 
@@ -18,8 +21,17 @@ contract and [analysis.md](analysis.md) for `k4na analyze pairs`.
   watch and cannot use a different antenna.
 - The station's `allow_rx_antenna_switch = true` and `allow_sub_receiver =
   true`, the profile's `paired = true` with exactly two antennas, and the
-  CLI `--allow-retune`.
+  CLI `--allow-retune`. `radio.receiver` must be `main`.
 - Split off (`FT0`): in split, VFO B is the transmit frequency.
+- Diversity off (`DV0`): in diversity VFO A controls both receivers. The
+  station was found with `DV1` during the hardware check; turn it off on
+  the radio before a paired survey.
+- Band independence off (`BI0`), so VFO B follows the main band and the
+  collector never needs `BN$`.
+
+The sub receiver may be on or off; the survey turns it on (`SB1`) and puts
+back what it found. Preflight checks all of this with GET queries only and
+refuses with the reason; `k4na survey --dry-run` shows the sub's state.
 
 ## Observed on a K4D (R39, 2026-10-28)
 
@@ -55,14 +67,19 @@ the sub on, `FA` 14.063 MHz, `FB` 14.045 MHz, main `PA2`, sub `PA0` and
 ## Design
 
 **Visits.** Each paired visit tunes both receivers to one tile (`FA` and
-`FB`, and `BN$` when band independence (`BI1`) lets the sub sit on another
-band; `#SPN$` matching `#SPN`), sets
-`SB1` if needed, routes `AR` and `AR$`, applies the profile's receiver
-settings to both receivers (`$` forms for the sub; `#AVG` is shared), then
-dwells while recording both pans. Each pan becomes its own visit with its
-own frame-header coverage check, linked by a shared pair id and carrying
-the other receiver's antenna and input. A pan whose header does not cover
-the tile is recorded as coverage-unverified, as in a single-receiver visit.
+`FB`, with `#SPN$` matching `#SPN`), routes `AR` and `AR$`, applies the
+profile's receiver settings to both receivers (`$` forms for the sub; the
+sub uses the settings resolved for its own antenna), then dwells while
+recording both pans. `#AVG` has no sub form, so a tile whose two antennas
+resolve different `pan_averaging` is skipped and reported. Each pan's
+center offset from its VFO is learned separately from its frame headers,
+and a tile is retuned (up to `max_tile_corrections`) until both pans cover
+it. Each pan becomes its own visit, linked by a shared pair id
+(`visits.pair_json`, storage schema 5) and carrying the peer's visit id,
+pan and antenna; the sub's settings record `receiver = "sub"`, so the
+pans are separate comparability segments. A pan whose header does not
+cover the tile is recorded as coverage-unverified, as in a
+single-receiver visit. A cycle is one paired pass over the plan.
 
 **Swap.** With `swap = true` (the default), alternate cycles exchange the
 inputs (main = first antenna and sub = second, then the reverse). If `d`
@@ -74,18 +91,19 @@ the receivers are not comparable (unequal settings or one is limited by
 its own noise), and the antenna estimate is flagged.
 
 **Safety.** The sub-receiver setters are typed and range-checked like the
-main ones (`SB`, `FB`, `BN$`, `#SPN$`, `AR$`, `PA$`, `RA$`, `RG$`, `GT$`,
-`NB$`, `NR$`, `#NB$`); `DV`, `BI`, `AN` and `FT` are read but never set.
-Their found values are journaled before the first change and put back the
-same way as the main receiver's, on band change and at the end, only when
-they still hold a value the collector set. The interlock watches VFO B and
-the sub receiver too; a change the collector did not make stops the
-survey.
+main ones (`SB`, `FB`, `#SPN$`, `AR$`, `PA$`, `RA$`, `RG$`, `GT$`, `NB$`,
+`NR$`, `#NB$`) and need the control link's retune consent; `BN$`, `DV`,
+`BI`, `AN` and `FT` are read but never set. Their found values are
+journaled before the first change and put back the same way as the main
+receiver's (per band on band change, and at the end), only when they still
+hold a value the collector set; `k4na recovery` restores them after a
+crash. The interlock watches VFO B, the sub's band, input, span and
+settings, and `BI`; a change the collector did not make stops the survey
+without restoring.
 
-**Diversity.** The survey leaves `DV` as found. In diversity mode both
-receivers are controlled by VFO A ("RIT applied to VFO A affects both
-receivers"), so `FB` may not move the sub; frame headers decide coverage
-either way.
+**Diversity.** Refused at preflight (see Requirements): in diversity
+mode VFO A controls both receivers ("RIT applied to VFO A affects both
+receivers"), so `FB` may not move the sub.
 
 ## Not planned yet
 

@@ -32,6 +32,25 @@ pub fn state_queries() -> Vec<Query> {
     q
 }
 
+/// [`state_queries`] plus the sub receiver's, for journals that changed
+/// it. (Single-receiver restores do not ask for sub state, so a radio
+/// that does not answer it is not slowed down.)
+pub fn sub_state_queries() -> Vec<Query> {
+    let mut q = state_queries();
+    q.extend([Query::SubRx, Query::BandIndependent, Query::SubBand]);
+    q.extend(super::SUB_BAND_FIELDS);
+    q.extend(measure::SUB_KEYS);
+    q
+}
+
+fn queries_for(ledger: &Ledger) -> Vec<Query> {
+    if ledger.obligations.keys().any(Scope::is_sub) {
+        sub_state_queries()
+    } else {
+        state_queries()
+    }
+}
+
 /// What to do with one field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -142,7 +161,10 @@ pub fn manual_steps(ledger: &Ledger) -> Vec<String> {
         return out;
     }
     let meta = ledger.meta.unwrap_or(MetaMode::Basic);
-    for (scope, field, ob) in ledger.dirty() {
+    // The sub receiver's on/off comes after its band settings.
+    let mut dirty = ledger.dirty();
+    dirty.sort_by_key(|(s, _, _)| *s == Scope::SubSession);
+    for (scope, field, ob) in dirty {
         if scope == Scope::Session {
             continue;
         }
@@ -178,13 +200,51 @@ struct Run<'a, C> {
     rb: Readback,
     sent: Vec<String>,
     fields: Vec<FieldReport>,
+    queries: Vec<Query>,
 }
 
 type Fatal = (Outcome, String);
 
+/// One receiver's scopes on a band, for settling inputs generically.
+#[derive(Clone, Copy)]
+enum Rx {
+    Main,
+    Sub,
+}
+
+impl Rx {
+    fn input(self) -> Query {
+        match self {
+            Rx::Main => Query::RxAntenna,
+            Rx::Sub => Query::SubRxAntenna,
+        }
+    }
+
+    fn band_scope(self, band: u8) -> Scope {
+        match self {
+            Rx::Main => Scope::Band(band),
+            Rx::Sub => Scope::SubBand(band),
+        }
+    }
+
+    fn context(self, band: u8, input: String) -> Scope {
+        match self {
+            Rx::Main => Scope::Context(band, input),
+            Rx::Sub => Scope::SubContext(band, input),
+        }
+    }
+
+    fn context_input(self, s: &Scope, band: u8) -> Option<String> {
+        match (self, s) {
+            (Rx::Main, Scope::Context(b, ar)) | (Rx::Sub, Scope::SubContext(b, ar)) if *b == band => Some(ar.clone()),
+            _ => None,
+        }
+    }
+}
+
 impl<C: CatControl> Run<'_, C> {
     async fn read(&mut self) -> Result<Readback, Fatal> {
-        let rb = self.cat.query(&state_queries()).await.map_err(|e| {
+        let rb = self.cat.query(&self.queries).await.map_err(|e| {
             (
                 Outcome::Partial,
                 format!("CAT readback failed ({e}); radio state is unknown"),
@@ -326,33 +386,39 @@ impl<C: CatControl> Run<'_, C> {
         Ok(())
     }
 
-    /// Restores one band: its RX-input contexts (current input first),
-    /// then its own memory, including the input it was found on.
+    /// Restores one band: each receiver's RX-input contexts (current input
+    /// first), then its own memory, including the input it was found on.
+    /// The main receiver goes first; the sub follows the main band (`BI0`).
     async fn settle_band(&mut self, band: u8) -> Result<(), Fatal> {
         self.select_band(band).await?;
+        self.settle_inputs(band, Rx::Main).await?;
+        self.settle(&Scope::Band(band), false).await?;
+        self.settle_inputs(band, Rx::Sub).await?;
+        self.settle(&Scope::SubBand(band), false).await
+    }
+
+    async fn settle_inputs(&mut self, band: u8, rx: Rx) -> Result<(), Fatal> {
         let meta = self.txn.ledger().meta.unwrap_or(MetaMode::Basic);
         let mut contexts: Vec<String> = self
             .txn
             .ledger()
             .dirty()
             .into_iter()
-            .filter_map(|(s, _, _)| match s {
-                Scope::Context(b, ar) if b == band => Some(ar),
-                _ => None,
-            })
+            .filter_map(|(s, _, _)| rx.context_input(&s, band))
             .collect();
         contexts.dedup();
-        let current = self.rb.raw(Query::RxAntenna).map(str::to_owned);
+        let current = self.rb.raw(rx.input()).map(str::to_owned);
         contexts.sort_by_key(|ar| Some(ar) != current.as_ref());
         for ar in contexts {
-            let scope = Scope::Context(band, ar.clone());
-            if self.rb.raw(Query::RxAntenna) != Some(ar.as_str()) {
+            let scope = rx.context(band, ar.clone());
+            if self.rb.raw(rx.input()) != Some(ar.as_str()) {
                 // Switching inputs is only safe if the input is ours.
-                let band_scope = Scope::Band(band);
-                let input_ok = decide(self.txn.ledger(), &band_scope, &self.rb, true)
-                    .iter()
-                    .any(|d| d.field() == "AR" && matches!(d, Decision::Restore { .. } | Decision::Clean { .. }));
-                match setter_for(Query::RxAntenna, meta, &ar) {
+                let band_scope = rx.band_scope(band);
+                let input_field = rx.input().prefix();
+                let input_ok = decide(self.txn.ledger(), &band_scope, &self.rb, true).iter().any(|d| {
+                    d.field() == input_field && matches!(d, Decision::Restore { .. } | Decision::Clean { .. })
+                });
+                match setter_for(rx.input(), meta, &ar) {
                     Some(s) if input_ok => {
                         let ok = self.send(Purpose::Restore, vec![(band_scope, s)]).await?;
                         if ok != [true] {
@@ -374,7 +440,7 @@ impl<C: CatControl> Run<'_, C> {
             }
             self.settle(&scope, false).await?;
         }
-        self.settle(&Scope::Band(band), false).await
+        Ok(())
     }
 
     async fn run(&mut self) -> Result<(), Fatal> {
@@ -432,7 +498,12 @@ impl<C: CatControl> Run<'_, C> {
         if let Some(ar) = self.rb.raw(Query::RxAntenna).map(str::to_owned) {
             self.settle(&Scope::Context(original_band, ar), true).await?;
         }
-        self.settle(&Scope::Session, true).await
+        self.settle(&Scope::SubBand(original_band), true).await?;
+        if let Some(ar) = self.rb.raw(Query::SubRxAntenna).map(str::to_owned) {
+            self.settle(&Scope::SubContext(original_band, ar), true).await?;
+        }
+        self.settle(&Scope::Session, true).await?;
+        self.settle(&Scope::SubSession, true).await
     }
 }
 
@@ -452,12 +523,14 @@ fn classify(fields: &[FieldReport], ledger: &Ledger) -> Outcome {
 /// Restores what the ledger says the collector changed, journaling every
 /// step, and ends the journal with the outcome.
 pub async fn restore<C: CatControl>(txn: &mut Transaction, cat: &mut C) -> RestoreReport {
+    let queries = queries_for(txn.ledger());
     let mut run = Run {
         txn,
         cat,
         rb: Readback::default(),
         sent: Vec::new(),
         fields: Vec::new(),
+        queries,
     };
     let fatal = run.run().await.err();
     let ledger = run.txn.ledger().clone();
@@ -503,21 +576,23 @@ pub async fn restore<C: CatControl>(txn: &mut Transaction, cat: &mut C) -> Resto
 /// What [`restore`] would do on the current band, from GET queries only.
 pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreReport, String> {
     let rb = cat
-        .query(&state_queries())
+        .query(&queries_for(ledger))
         .await
         .map_err(|e| format!("CAT readback failed: {e}"))?;
     let mut fields = Vec::new();
     let band = rb.u64(Query::Band).and_then(|b| u8::try_from(b).ok());
     let mut scopes: Vec<Scope> = ledger.dirty().into_iter().map(|(s, _, _)| s).collect();
     scopes.dedup();
-    // In restore order: the band's own settings first, the band change last.
-    scopes.sort_by_key(|s| *s == Scope::Session);
+    // In restore order: the band's own settings first, the band change and
+    // the sub receiver's on/off last.
+    scopes.sort_by_key(|s| (s.is_session(), *s == Scope::SubSession));
     let mut sent = Vec::new();
     for scope in scopes {
         let here = match &scope {
-            Scope::Session => true,
-            Scope::Band(b) => Some(*b) == band,
+            Scope::Session | Scope::SubSession => true,
+            Scope::Band(b) | Scope::SubBand(b) => Some(*b) == band,
             Scope::Context(b, ar) => Some(*b) == band && rb.raw(Query::RxAntenna) == Some(ar.as_str()),
+            Scope::SubContext(b, ar) => Some(*b) == band && rb.raw(Query::SubRxAntenna) == Some(ar.as_str()),
         };
         for d in decide(ledger, &scope, &rb, false) {
             let field = d.field().to_owned();

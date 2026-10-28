@@ -1,0 +1,33 @@
+# Survey profile: compare the receive antenna with the DXC at the same time.
+#
+# The main receiver (pan A) measures the first antenna while the sub
+# receiver (pan B) measures the second over the same dwell, so propagation
+# and noise changes are common to both. With swap = true the antennas
+# exchange receivers every other cycle, so `k4na analyze pairs` can separate
+# the antenna difference from the receivers' difference. See docs/paired.md.
+#
+# Requires a KRX4 sub receiver, band independence off (BI0), and in the
+# station file collection.allow_rx_antenna_switch = true and
+# collection.allow_sub_receiver = true. Only AR/AR$ (RX inputs), SB, FB and
+# #SPN$ are added to the survey setters; split, diversity, BI and the TX
+# antenna (AN) are never changed.
+id = "rx-vs-dxc-paired"
+description = "40 and 20 m, receive antenna vs DXC, simultaneous on main and sub"
+antennas = ["log-near-house", "dxc"]
+paired = true
+swap = true
+
+settle_ms = 700
+dwell_ms = 5000
+min_cycle_ms = 300000
+requested_pan_span_hz = 40000
+
+[[ranges]]
+id = "40m"
+low_hz = 7000000
+high_hz = 7300000
+
+[[ranges]]
+id = "20m"
+low_hz = 14000000
+high_hz = 14350000

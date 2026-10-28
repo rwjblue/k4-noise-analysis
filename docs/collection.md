@@ -102,8 +102,13 @@ Configuration is split in two:
   the stored session config cover both files.
 
 Example profiles: `hf-full` (80-10 m), `hf-cw-us` (US CW/data segments
-only, so each frequency is revisited more often) and `rx-vs-dxc` (40 and
-20 m on two antennas).
+only, so each frequency is revisited more often), `rx-vs-dxc` (40 and
+20 m on two antennas in turn) and `rx-vs-dxc-paired` (the same two
+antennas at once on the main and sub receivers). A profile with
+`paired = true` names exactly two antennas and measures the first on the
+main receiver and the second on the sub; `swap = true` (the default)
+exchanges them every other cycle. See [paired.md](paired.md) for its
+requirements, including the station's `allow_sub_receiver`.
 
 Each registry antenna has an `id`, the K4 main-RX `port` it is wired to
 (`rx-ant-in1`, `rx-ant-in2`, `ant1`, `ant2` or `ant3`; `ant2`/`ant3` need a

@@ -136,11 +136,15 @@ async fn survey_with(
     for s in radio.setters_received() {
         let rx_input = s.starts_with("AR") && cfg.collection.allow_rx_antenna_switch;
         let measuring = MEASUREMENT_SETTERS.iter().any(|p| s.starts_with(p));
+        let sub = cfg.collection.allow_sub_receiver && (s.starts_with("SB") || s.starts_with("FB"));
         assert!(
-            rx_input || measuring || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
+            rx_input || measuring || sub || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
             "unexpected setter {s}"
         );
         assert!(!s.starts_with("AN"), "the TX antenna must never be set: {s}");
+        for p in ["BI", "DV", "FT", "BN$"] {
+            assert!(!s.starts_with(p), "{p} must never be set: {s}");
+        }
     }
     Run {
         cfg,
@@ -585,6 +589,179 @@ async fn two_antennas_are_surveyed_band_by_band_and_inputs_put_back() {
     assert!(insp.events_by_kind.get("antenna_selected").copied().unwrap_or(0) >= 4);
 }
 
+/// The example station opted in to paired surveys.
+fn paired_config(root: &Path, profile: &str) -> Config {
+    let station = station(root, "survey")
+        .replace("allow_rx_antenna_switch = false", "allow_rx_antenna_switch = true")
+        .replace("allow_sub_receiver = false", "allow_sub_receiver = true");
+    Config::from_parts(&station, Some(profile)).unwrap()
+}
+
+/// The sub receiver as found: off, VFO B elsewhere in the band, its pan
+/// centered off `FB` by a different amount than pan A off `FA`, and reading
+/// 3 dB high (a receiver difference the swap must separate out).
+fn paired_radio() -> SimRadio {
+    let radio = SimRadio::new(15);
+    radio.faults(|f| {
+        f.pan_center_offset_hz = -11_240;
+        f.sub_pan_center_offset_hz = 7_000;
+    });
+    radio.update(|m| {
+        m.fb = 14_060_000;
+        m.sub_bias = 30;
+    });
+    radio
+}
+
+#[tokio::test(start_paused = true)]
+async fn paired_visits_measure_both_antennas_at_once_and_put_the_sub_back() {
+    let before = paired_radio().model();
+    let run = survey_with(
+        paired_radio(),
+        600,
+        None,
+        |root| paired_config(root, &fast(RX_VS_DXC_PAIRED)),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.restore.starts_with("restored"), "{}", r.restore);
+    assert!(r.cycles >= 2, "{r:?}");
+    assert!(r.pairs > 0, "{r:?}");
+    assert_eq!(r.coverage_unverified, 0, "each pan's offset is learned: {r:?}");
+    assert!(r.restore.contains("SB0"), "{}", r.restore);
+    assert_eq!((r.antenna_skips, r.measurement_skips), (0, 0), "{r:?}");
+
+    // Everything the survey touched is as found: the sub is off again and
+    // VFO B, the sub input and every band's sub memory are back.
+    let m = run.radio.model();
+    assert!(!m.sub_rx);
+    assert_eq!((m.fa, m.fb, m.bn), (before.fa, before.fb, before.bn));
+    assert_eq!((m.rx_input, m.sub_input, m.tx_antenna), (4, 4, 1));
+    assert!(m.band_rx_input.values().all(|v| *v == 4), "{:?}", m.band_rx_input);
+    assert!(m.band_sub.values().all(|s| s.2 == 4), "{:?}", m.band_sub);
+    assert!(!m.split && !m.diversity && !m.band_independent);
+    let setters = run.radio.setters_received();
+    assert!(setters.contains(&"SB1;".to_owned()) && setters.last() != Some(&"SB1;".to_owned()));
+    let inputs: std::collections::BTreeSet<_> = setters.iter().filter(|s| s.starts_with("AR")).collect();
+    assert!(
+        inputs
+            .iter()
+            .all(|s| ["AR4;", "AR6;", "AR$4;", "AR$6;"].contains(&s.as_str())),
+        "{inputs:?}"
+    );
+
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let visits = ds.visits().unwrap();
+    let by_id: std::collections::BTreeMap<_, _> = visits.iter().map(|v| (v.visit_id.as_str(), v)).collect();
+    let mut orientations = std::collections::BTreeSet::new();
+    let mut pairs = 0;
+    for v in visits.iter().filter(|v| v.pan == "A") {
+        let p = v.pair().unwrap_or_else(|| panic!("unpaired pan A visit {v:?}"));
+        let peer = by_id[p.peer_visit_id.as_str()];
+        let back = peer.pair().unwrap();
+        assert_eq!(
+            (peer.pan.as_str(), back.peer_visit_id.as_str()),
+            ("B", v.visit_id.as_str())
+        );
+        assert_eq!((&back.pair_id, back.orientation), (&p.pair_id, p.orientation));
+        assert_eq!(p.peer_antenna.id, peer.antenna_id);
+        assert_ne!(v.antenna_id, peer.antenna_id, "a pair measures two antennas");
+        // Same dwell window and same tile.
+        assert_eq!((v.started_utc_ns, &v.tile_id), (peer.started_utc_ns, &peer.tile_id));
+        let main_antenna = if p.orientation == 0 { "log-near-house" } else { "dxc" };
+        assert_eq!(v.antenna_id, main_antenna);
+        for (x, port) in [(v, &v.antenna_port), (peer, &peer.antenna_port)] {
+            assert_eq!(x.antenna_observed_port.as_ref(), Some(port), "{x:?}");
+        }
+        if v.status == "complete" && peer.status == "complete" {
+            pairs += 1;
+            // Each pan's coverage came from its own headers and learned offset.
+            assert_eq!(v.center_hz, v.requested_vfo_hz.unwrap() - 11_240);
+            assert_eq!(peer.center_hz, peer.requested_vfo_hz.unwrap() + 7_000);
+            for x in [v, peer] {
+                assert!(x.actual_low_hz <= x.target_low_hz.unwrap() && x.actual_high_hz >= x.target_high_hz.unwrap());
+            }
+            assert!(
+                peer.measurement_json
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains(r#""receiver":"sub""#),
+                "{peer:?}"
+            );
+        }
+        orientations.insert(p.orientation);
+    }
+    assert!(pairs > 0);
+    assert_eq!(
+        orientations,
+        [0, 1].into(),
+        "swap exchanges the receivers every other cycle"
+    );
+    assert_eq!(visits.iter().filter(|v| v.pan == "B").count(), visits.len() / 2);
+    let segments: std::collections::BTreeSet<_> = visits.iter().map(|v| (&v.segment_id, &v.pan)).collect();
+    let seg_ids: std::collections::BTreeSet<_> = segments.iter().map(|(s, _)| *s).collect();
+    assert_eq!(seg_ids.len(), segments.len(), "a segment never mixes receivers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn paired_preflight_refuses_without_krx4_band_independence_off_or_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = fast(RX_VS_DXC_PAIRED);
+    for (edit, consent, needle) in [
+        (
+            (|m: &mut RadioModel| m.krx4 = false) as fn(&mut RadioModel),
+            true,
+            "no KRX4",
+        ),
+        (|m: &mut RadioModel| m.band_independent = true, true, "BI1"),
+        (|m: &mut RadioModel| m.split = true, true, "FT"),
+        (|_: &mut RadioModel| {}, false, "allow_sub_receiver"),
+    ] {
+        let radio = paired_radio();
+        radio.update(edit);
+        let root = dir.path().join("data");
+        let station =
+            station(&root, "survey").replace("allow_rx_antenna_switch = false", "allow_rx_antenna_switch = true");
+        let station = if consent {
+            station.replace("allow_sub_receiver = false", "allow_sub_receiver = true")
+        } else {
+            station
+        };
+        let problem = match Config::from_parts(&station, Some(&profile)) {
+            Err(e) => e.to_string(),
+            Ok(cfg) => preflight(&mut control(&radio).await, &cfg).await.unwrap_err(),
+        };
+        assert!(problem.contains(needle), "{needle}: {problem}");
+        assert!(radio.setters_received().is_empty(), "{:?}", radio.setters_received());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sub_retune_during_a_paired_survey_is_operator_activity() {
+    let (mark, script) = after(20, |r| r.update(|m| m.fb = 14_200_000));
+    let run = survey_with(
+        paired_radio(),
+        600,
+        None,
+        |root| paired_config(root, &fast(RX_VS_DXC_PAIRED)),
+        script,
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "conflict", "{r:?}");
+    assert!(r.summary.end_reason.contains("FB"), "{}", r.summary.end_reason);
+    assert!(r.restore.starts_with("not restoring"), "{}", r.restore);
+    // The operator's VFO B is theirs: never overwritten after the change.
+    assert!(
+        !setters_after(&run.radio, &mark).iter().any(|s| s.starts_with("FB")),
+        "{:?}",
+        setters_after(&run.radio, &mark)
+    );
+    assert_eq!(run.radio.model().fb, 14_200_000);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_band_recalling_another_input_is_skipped_without_switch_consent() {
     let radio = SimRadio::new(15);
@@ -782,9 +959,21 @@ struct Interrupted {
 /// future is dropped: no restoration code runs, as with SIGKILL), or
 /// cancelled through its stop handle after `cancel_after`.
 async fn interrupted_survey(radio: &SimRadio, kill_after: Duration, cancel_after: Option<Duration>) -> Interrupted {
-    let dir = tempfile::tempdir().unwrap();
     let profile = two_band_profile(r#""log-near-house", "dxc""#, "");
-    let cfg = config_with(&dir.path().join("data"), "allow_rx_antenna_switch = true", &profile);
+    interrupted_with(radio, kill_after, cancel_after, |root| {
+        config_with(root, "allow_rx_antenna_switch = true", &profile)
+    })
+    .await
+}
+
+async fn interrupted_with(
+    radio: &SimRadio,
+    kill_after: Duration,
+    cancel_after: Option<Duration>,
+    make_config: impl FnOnce(&Path) -> Config,
+) -> Interrupted {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = make_config(&dir.path().join("data"));
     let clock: Arc<dyn Clock> = clock();
     let mut cat = control(radio).await;
     let pre = preflight(&mut cat, &cfg).await.unwrap();
@@ -905,6 +1094,67 @@ async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
     let setters = radio.setters_received().len();
     assert_eq!(recover(&run, &radio).await.outcome, recovery::Outcome::Complete);
     assert_eq!(radio.setters_received().len(), setters);
+}
+
+/// [`recovery_radio`] with the sub receiver off, its VFO B elsewhere and
+/// operator settings in its own per-band-and-input memories.
+fn paired_recovery_radio() -> SimRadio {
+    let radio = recovery_radio();
+    radio.update(|m| {
+        m.fb = 14_060_000;
+        m.sub = operator_rx();
+    });
+    radio
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_paired_survey_killed_at_any_point_is_recoverable() {
+    let profile = format!(
+        "paired = true\nswap = true\n{}",
+        two_band_profile(r#""log-near-house", "dxc""#, "")
+    );
+    let (mut sub_on, mut sub_changed) = (0, 0);
+    for secs in [1, 2, 4, 7, 11, 16, 22, 30, 45, 66] {
+        let radio = paired_recovery_radio();
+        let before = radio.model();
+        let profile = profile.clone();
+        let run = interrupted_with(&radio, Duration::from_secs(secs), None, move |root| {
+            paired_config(root, &profile)
+        })
+        .await;
+        assert!(run.report.is_none(), "{secs} s: still running");
+        let killed = radio.model();
+        sub_on += usize::from(killed.sub_rx);
+        sub_changed += usize::from(killed.sub != before.sub || killed.sub_input != before.sub_input);
+        let report = recover(&run, &radio).await;
+        assert_eq!(report.outcome, recovery::Outcome::Complete, "{secs} s: {report:?}");
+        assert_as_found(&radio, &before);
+        let m = radio.model();
+        assert_eq!(
+            (m.sub_rx, m.fb, m.sub_input, m.sub_span, m.sub),
+            (before.sub_rx, before.fb, before.sub_input, before.sub_span, before.sub),
+            "{secs} s"
+        );
+        for band in [3, 5] {
+            for input in [4, 6] {
+                assert_eq!(
+                    m.sub_settings(band, input),
+                    before.sub,
+                    "{secs} s: sub band {band} input {input}"
+                );
+            }
+            assert_eq!(
+                m.band_sub.get(&band).map_or(4, |s| s.2),
+                4,
+                "{secs} s: band {band} sub input"
+            );
+        }
+        assert_eq!(journal_info(&run.cfg).status, JournalStatus::Resolved);
+    }
+    assert!(
+        sub_on >= 5 && sub_changed >= 5,
+        "kills mid-pair: {sub_on} on, {sub_changed} changed"
+    );
 }
 
 #[tokio::test(start_paused = true)]

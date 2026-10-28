@@ -98,11 +98,14 @@ survey selects each main-RX input with `AR` (verified by readback) and
 measures each band on each antenna in turn. The TX antenna is never set.
 Every visit records its antenna id, revision and observed port.
 
-A **paired** mode records simultaneously observed A/B sweeps from
-separately configured antennas, keyed by exact frequency coverage and
-timestamps, without assuming their nominal scales are calibrated or
-their feedlines and transformers identical. The physical K4D emits A and
-B packets on the local LAN; no 9204 dependency is required. See
+A **paired** survey profile records simultaneously observed A/B sweeps
+from two configured antennas: the main receiver (pan A) and the KRX4 sub
+receiver (pan B) dwell on the same tile with different RX inputs. Each pan
+is its own visit with its own header-derived coverage, linked to its peer
+by a pair id, without assuming the receivers' scales are calibrated or
+equal; swapping the antennas between receivers every other cycle lets
+`k4na analyze pairs` separate the two. The physical K4D emits A and B
+packets on the local LAN; no 9204 dependency is required. See
 [paired.md](paired.md) for the hardware check and design.
 
 ## Rust module boundaries (workspace)

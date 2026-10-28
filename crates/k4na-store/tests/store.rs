@@ -131,6 +131,7 @@ fn visit(session_id: &str, n: u64, at: i64) -> VisitRecord {
         radio_state: [("PA".to_string(), "PA1".to_string())].into(),
         measurement: [("preamp".to_string(), "pre1".to_string())].into(),
         stats: Some(stats(n)),
+        pair: None,
     }
 }
 
@@ -566,6 +567,64 @@ fn measurement_settings_round_trip_and_v2_shards_stay_readable() {
         })
         .unwrap();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn pair_links_round_trip_and_v4_shards_stay_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let sid = "0e0e0e0f";
+    let (mut store, _) = Store::open(opts(&root), big_disk(), session(sid), ts(0)).unwrap();
+    let mut a = visit(sid, 1, NS_PER_SEC);
+    let mut b = visit(sid, 2, NS_PER_SEC);
+    b.pan = PanId::B;
+    let link = |peer: &VisitRecord| k4na_core::model::VisitPair {
+        pair_id: "pair-1".into(),
+        orientation: 1,
+        peer_visit_id: peer.visit_id.clone(),
+        peer_pan: peer.pan,
+        peer_antenna: peer.antenna.clone(),
+    };
+    (a.pair, b.pair) = (Some(link(&b)), Some(link(&a)));
+    store.write_visit(&a, &[]).unwrap();
+    store.write_visit(&b, &[]).unwrap();
+    store.close(ts(2 * NS_PER_SEC), "end").unwrap();
+    let ds = DataSet::open(&root).unwrap();
+    let vs = ds.visits().unwrap();
+    assert_eq!(vs.len(), 2);
+    for v in &vs {
+        let p = v.pair().unwrap();
+        assert_eq!((p.pair_id.as_str(), p.orientation), ("pair-1", 1));
+        let other = vs.iter().find(|o| o.visit_id != v.visit_id).unwrap();
+        assert_eq!(
+            (p.peer_visit_id.as_str(), p.peer_pan.to_string()),
+            (other.visit_id.as_str(), other.pan.clone())
+        );
+    }
+    // Pans are separate comparability segments.
+    assert_ne!(vs[0].segment_id, vs[1].segment_id);
+
+    // A version 4 shard (no pair_json column) must still read.
+    let shard = k4na_store::shard::discover(&root).unwrap().remove(0);
+    let conn = rusqlite::Connection::open(&shard.path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE visits DROP COLUMN pair_json; UPDATE meta SET value = '4' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(conn);
+    let ds = DataSet::open(&root).unwrap();
+    assert!(ds.shards().all(|s| s.error.is_none()));
+    assert!(
+        ds.visits()
+            .unwrap()
+            .iter()
+            .all(|v| v.pair_json.is_none() && v.pair().is_none())
+    );
+    let n = ds.for_each_summary(|v, _| {
+        assert!(v.pair().is_none());
+        Ok(())
+    });
+    assert_eq!(n.unwrap(), 2);
 }
 
 #[test]

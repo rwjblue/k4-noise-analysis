@@ -131,7 +131,9 @@ No interface requiring a running radio is necessary for offline analysis.
 - Export data and render plots, heatmaps and candidate tables.
 - Add paired A/B simultaneous receive support with per-antenna IDs and
   verified readbacks, before/after source tagging and calibrated
-  comparison limitations.
+  comparison limitations. Implemented and simulator-tested
+  ([paired.md](paired.md)); a first attended paired run on the K4D is
+  still needed.
 - Investigate per-band hardware calibration before emitting dBm.
   Do not let these block collector readiness.
 
