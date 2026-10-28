@@ -237,6 +237,34 @@ fn end_to_end_against_tcp_simulator() {
     assert_eq!(insp["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(insp["dirty_shards"], 0);
 
+    // Offline analysis of the same root, labelled as derived and uncalibrated.
+    let out = k4na()
+        .args(["--json", "analyze", "bands", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let bands: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let prov = &bands["provenance"];
+    assert!(prov["visits_analyzed"].as_u64().unwrap() >= 1, "{prov}");
+    assert_eq!(prov["algorithm"], "k4na-analysis/1");
+    assert!(prov["level_units"].as_str().unwrap().contains("not dBm"));
+    assert!(!bands["band_hours"].as_array().unwrap().is_empty(), "{bands}");
+    k4na()
+        .args(["analyze", "carriers", "--format", "csv", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("band_id,antenna_id,hz,"));
+    k4na()
+        .args(["analyze", "bands", "--since", "yesterday", "--data"])
+        .arg(dir.path().join("data"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("RFC 3339"));
+
     let out = k4na()
         .args(["--json", "recovery", "list", "--config"])
         .arg(&survey)

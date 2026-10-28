@@ -26,6 +26,8 @@ k4na probe    --config my.toml                      # GET-only state readout
 k4na recovery list --config my.toml                 # interrupted surveys
 k4na recovery restore <session> --dry-run --config my.toml
 k4na inspect  --data ./data
+k4na analyze bands    --data ./data              # background per band/hour (read-only)
+k4na analyze carriers --data ./data --format csv # recurring narrow peaks
 k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
 ~~~
 

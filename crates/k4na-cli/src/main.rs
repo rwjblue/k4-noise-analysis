@@ -5,6 +5,7 @@
 //! admission, unresolved recovery journal); 3 stopped for operator activity
 //! (transmit or external change) or a restore conflict.
 
+mod analyze;
 mod recovery;
 
 use std::path::{Path, PathBuf};
@@ -115,6 +116,12 @@ enum Cmd {
         #[arg(long)]
         data: PathBuf,
     },
+    /// Derived analysis of a data root without the radio (read-only):
+    /// background per band/hour and recurring carriers.
+    Analyze {
+        #[command(subcommand)]
+        what: analyze::AnalyzeCmd,
+    },
     /// Decode a raw :9201 byte capture offline.
     Replay {
         #[arg(long)]
@@ -213,6 +220,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Recovery { action } => recovery::run(action, json).await,
         Cmd::Inspect { data } => inspect(&data, json),
+        Cmd::Analyze { what } => analyze::run(what, json),
         Cmd::Replay { input } => replay(&input, json),
         Cmd::Simulate {
             host,

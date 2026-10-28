@@ -49,6 +49,58 @@ what the initial data must enable, NOT algorithms required in the v1 writer.
   signal level above background, not raw background reduction alone.
   Never subtract spectra as if both bins were independent calibrated dBm.
 
+## Implemented: `k4na-analysis/1`
+
+The `k4na-analysis` crate and `k4na analyze` read a data root through
+the read-only store reader; they need no radio and can run while a
+collector writes. Every output carries a `provenance` block (in JSON)
+naming the algorithm version, parameters, filter, summary shards,
+sessions, profiles, source units and calibration label, and counts of
+visits analyzed and skipped. Nothing is written back to the data root.
+
+Per **complete** visit (partial and aborted visits are skipped, never
+treated as quiet):
+
+1. Bins are mapped to RF from the stored header geometry
+   (`center_hz`, `sample_rate_hz`, `bin_count`), keeping only bins whose
+   centre lies in the observed coverage clipped to the planned tile, so
+   overlapping tiles are not double counted.
+2. Local background: the 20th percentile of the per-bin median (p50)
+   over a 5 kHz neighbourhood, evaluated every 1 kHz and linearly
+   interpolated. It ignores peaks occupying under ~80% of the window;
+   crowded segments (busy CW/FT8 windows, wideband noise) bias it high.
+3. Visit metrics: `floor` (median background), `occupancy` (fraction of
+   bins with p50 at least 8 dB above background) and `variability`
+   (median p90 - p10, the within-dwell spread).
+4. Peaks: runs of bins with p50 at least 8 dB above background, merged
+   across single-bin dips. A p50 detection means the peak was present
+   for at least half the dwell; p10 above threshold marks it steady.
+
+Across visits:
+
+- `analyze bands` groups visits by band, antenna, comparability segment
+  and UTC hour: visit count, observed Hz, median/p10/p90/min/max of the
+  per-visit floors, median occupancy and variability, and the receiver
+  settings. Text output also names the quietest, noisiest and most
+  variable hour per band/antenna/segment. Floors are only comparable
+  within a segment (same verified receiver settings).
+- `analyze carriers` clusters peaks at most 300 Hz wide whose
+  frequencies chain within 100 Hz (or 1.5 bins) on one band and
+  antenna, keeping clusters seen in at least 3 visits. Exposure counts
+  visits whose coverage included the cluster's median frequency, so
+  persistence = detections / exposure and "not seen" is distinguished
+  from "not covered". Hourly detection and exposure histograms are in
+  JSON. The class is temporal only: `stationary` (seen in >= 90% of at
+  least 6 covering visits, frequency spread within two tolerances),
+  `recurring` (>= 25%), `occasional`, or `insufficient_exposure`.
+
+Caveats specific to v1: thresholds are the exploratory defaults above
+and are not yet exposed as options; a chain of nearby CW or FT8
+signals can merge into one wide-spread cluster (check `min_hz`/`max_hz`);
+a sub-dwell burst shorter than half the dwell does not produce a p50
+peak; and levels are on the uncalibrated K4 scale (native tenths / 10),
+not dBm.
+
 ## Why the capture design preserves five percentiles
 
 A median distinguishes persistent structure from short emissions;

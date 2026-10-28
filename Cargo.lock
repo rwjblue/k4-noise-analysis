@@ -512,6 +512,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "humantime",
+ "k4na-analysis",
  "k4na-collector",
  "k4na-core",
  "k4na-protocol",
