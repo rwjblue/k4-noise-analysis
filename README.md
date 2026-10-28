@@ -1,109 +1,92 @@
 # k4-noise-analysis
 
-Collector-first RF noise survey tooling for an Elecraft K4D, written in Rust.
+The panadapter shows you the noise right now. It doesn't tell you whether
+that comb on 40 meters was there all night or started when something in
+the house kicked on.
 
-**Status: collector implemented.** The protocol decoder replays real R39
-captures. Passive capture and band/antenna survey passes have run on a
-K4D (R39), as has a short check of receiver measurement settings and
-kill-and-recover through the journal. Conflict handling and storage
-limits (including an accelerated 24-hour run under a 64 MiB cap) are
-tested against a simulated K4. See
-[unverified hardware assumptions](docs/collection.md#unverified-on-hardware)
-before trusting unattended runs.
+`k4na` records spectrum from an Elecraft K4 so you can find those
+patterns without spending the night watching the scope. The starting
+point was a loop-on-ground near the house: get a baseline before trying
+a remote LoG, and figure out which noise is worth chasing.
 
-## Quick start
+Leave the radio where it is for passive recording, or dedicate the main
+receiver to a repeating band survey. The supplied profiles cover 80–10
+meters, with a narrower CW/data profile for quicker revisits.
 
-~~~text
-mise install                     # pinned stable Rust
-mise run ci                      # fmt, clippy, tests (no radio needed)
-cargo run -p k4na-cli -- check --config config/example.toml
-k4na estimate --config my.toml --duration 24h
-k4na capture  --config my.toml --duration 5m        # passive, no setters
-k4na capture  --config my.toml --duration 1h --raw-full-rate 30m --raw-full-rate-max-bytes 500MiB
-                                                    # also keep every frame for 30 min (docs/storage.md)
-k4na survey   --config my.toml --duration 1m --dry-run
-k4na survey   --config my.toml --duration 24h --allow-retune
-k4na survey   --config my.toml --profile config/surveys/hf-cw-us.toml --duration 24h --allow-retune
-k4na probe    --config my.toml                      # GET-only state readout
-k4na recovery list --config my.toml                 # interrupted surveys
-k4na recovery restore <session> --dry-run --config my.toml
-k4na inspect  --data ./data
-k4na analyze bands    --data ./data              # background per band/hour (read-only)
-k4na analyze carriers --data ./data --format csv # recurring narrow peaks
-k4na analyze families --data ./data              # combs: carriers on a common grid
-k4na analyze episodes --data ./data              # when each band's floor rose, duty, period
-k4na analyze groups   --data ./data              # floors and carriers that switch together
-k4na analyze series   --data ./data              # combs on harmonics of one fundamental
-k4na mark --data ./data --ago 5m "furnace started"   # operator note for analysis
-k4na mark --data ./data --at 2026-10-29T02:10-04:00 --for 30m "dehumidifier unplugged"
-k4na report  --data ./data --out report.html     # heatmaps + tables, one offline file
-k4na simulate                    # SIMULATED K4 on 127.0.0.1:9200/9201
-~~~
+The result is **one offline HTML report**: band heatmaps, noise-floor
+changes, recurring carriers, and combs that may share a source. It looks
+for features that switch together, with your equipment on/off notes
+alongside them. No server, cloud account, or radio connection needed to
+read it.
 
-A survey journals every radio change before sending it. If one is
-interrupted, new surveys refuse to start until `k4na recovery restore`
-or `acknowledge` settles it; see [docs/recovery.md](docs/recovery.md).
+## What you're looking for
 
-`mise run long-run` runs the accelerated 24-hour simulated survey.
+A made-up example—not station measurements or literal CLI output:
 
-The station file (`config/example.toml`) holds the radio, antenna
-registry, safety and storage settings. Survey profiles under
-`config/surveys/` choose antennas, frequency ranges and cadence; see
-[docs/collection.md](docs/collection.md#station-file-and-survey-profiles).
+| Feature | Example finding |
+| --- | --- |
+| 40 m background | Four rises of about 8 dB during the night |
+| 20 m background | Rises about 5 dB at the same times |
+| Carrier combs | Combs on both bands fit a common fundamental near 24 kHz |
+| Operator note | “Shed power off” falls between the last noisy pass and the next quiet one |
 
-## Motivation
+That's a reason to repeat the power-off test, not a verdict against
+anything in the shed. You get a shorter list of suspects, with
+frequencies and times to check them against.
 
-Establish a reproducible 24+ hour baseline of noise and candidate birdies
-using a near-house loop-on-ground receiving antenna. Later compare that
-antenna with a remote LoG using simultaneous K4D main/sub spectra.
-Keep collection, analysis and rendering independent, preserve measurements
-in original units, and never fill the host disk.
+## Try it
 
-## First release
+You'll need a K4 on your LAN and Rust. From the checkout:
 
-A guarded, receive-only CLI collects the K4's **LAN spectrum stream on
-9201**, optionally querying and tuning over **CAT 9200** when explicitly
-authorized. Configurable full-band survey intervals (80-10m by default)
-are visited repeatedly. All accepted spectrum frames during a dwell
-contribute to per-bin temporal summaries; a sparse sample of original
-checksum-valid packets is retained for replay. Versioned SQLite shards
-have independent summary/raw retention and a hard byte quota.
+```sh
+mise install                     # the project's pinned Rust toolchain
+cargo install --locked --path crates/k4na-cli
+cp config/example.toml config/local.toml
+```
 
-Passive capture never retunes. Active survey must be intentionally enabled,
-and it stops on radio use, unknown TX state, state conflicts, unusable
-spectrum coverage or resource exhaustion. The radio cannot transmit
-through the collector.
+Edit `config/local.toml` for your radio host and antenna wiring. The
+example uses `./data`, a 4 GiB measurement cap, and a 5 GiB free-space
+reserve. Start with passive capture: it never changes radio settings and
+records only the spectrum the radio delivers.
 
-The K4 LAN spectrum readings are in native tenths-of-dB units, **not yet
-established as calibrated dBm**. A stationary carrier is a candidate
-birdie, not automatically a confirmed household RFI source.
+```sh
+k4na check --config config/local.toml
+k4na capture --config config/local.toml --duration 5m
+k4na report --data ./data --out report.html
+```
 
-## Design and implementation entry points
+Open `report.html`. While a later run is recording, use another shell to
+note a test with `k4na mark --data ./data "shed power off"`, then
+regenerate the report.
 
-- [Architecture and invariants](docs/architecture.md)
-- [Survey and protocol acceptance](docs/collection.md)
-- [Receiver measurement settings](docs/measurement.md)
-- [Survey recovery journal](docs/recovery.md)
-- [Storage, quotas and retention](docs/storage.md)
-- [Later analysis and near/far comparison](docs/analysis.md)
-- [Ordered implementation plan and acceptance tests](docs/implementation-plan.md)
-- [Example configuration](config/example.toml)
-- [Agent instructions](AGENTS.md)
+To scan bands, follow the [survey setup](docs/collection.md). Reserve the
+main receiver, preview with `--dry-run`, and start with a short, attended
+run. Retuning requires config consent **and** `--allow-retune`. There are
+no transmit or keying commands. Operator activity or lost CAT state stops
+the survey; interrupted runs need [explicit recovery](docs/recovery.md).
 
-## Prior art
+## Keep the results in perspective
 
-The author has already implemented K4 spectrum handling and captured
-physical K4 R39 packet fixtures for Ham2K HaLo:
-- [K4 LAN spectrum PR](https://github.com/ham2k/halo/pull/3)
-- [K4 secure Main/Sub panadapter PR](https://github.com/ham2k/halo/pull/4)
+Levels are on the K4's native scale, **not calibrated dBm**. Less noise
+doesn't necessarily mean better SNR. A survey can miss noise between
+visits, and a persistent carrier isn't proof of local RFI.
 
-The local 9201 stream has a simpler implementation path than the TLS-PSK
-9204 stream for this tool. For K4 radio CAT syntax, see the
-[Elecraft Programmer's Reference D12](https://ftp.elecraft.com/K4/Manuals%20Downloads/K4ProgrammersReferencerev.D12.html).
+Capture, surveys, analysis, and reports work today, with short live
+checks on a K4D running R39. Read the
+[remaining hardware checks](docs/collection.md#unverified-on-hardware)
+before trusting unattended runs. Simultaneous main/sub antenna comparison
+is still planned.
 
-## Implementation
+## Technical details
 
-Use Rust stable (edition 2024) and follow
-[docs/implementation-plan.md](docs/implementation-plan.md) in small
-testable milestones. The initial deliverable is valid and bounded
-**acquisition**, not a speculative automatic signal classifier.
+- [Collection and survey profiles](docs/collection.md), [receiver settings](docs/measurement.md), and [recovery](docs/recovery.md)
+- [Analysis methods and interpretation](docs/analysis.md)
+- [Storage and retention](docs/storage.md)
+- [Architecture](docs/architecture.md) and [implementation plan](docs/implementation-plan.md)
+
+Written in Rust, with local SQLite storage and read-only offline
+analysis. `mise run ci` runs the checks and tests without a radio.
+
+The protocol work builds on the author's Ham2K HaLo contributions:
+[LAN spectrum](https://github.com/ham2k/halo/pull/3) and
+[Main/Sub panadapters](https://github.com/ham2k/halo/pull/4).
