@@ -460,6 +460,24 @@ impl Setter {
     }
 }
 
+/// How long an RX input change (`AR`/`AR$`) is given to settle before it
+/// is re-read. A K4D (R39) read `AR$6` back right after `AR4;` then
+/// `AR$6;`, and `AR$4` 8 ms later (2026-10-29).
+pub const INPUT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Whether `s` selects an RX input.
+pub fn is_input(s: Setter) -> bool {
+    matches!(s, Setter::RxInput(_) | Setter::SubRxInput(_))
+}
+
+/// The input number an `AR`/`AR$` setter selects (0 for other setters).
+pub fn input_value(s: Setter) -> u8 {
+    match s {
+        Setter::RxInput(i) | Setter::SubRxInput(i) => i.value(),
+        _ => 0,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatError {
     #[error("refused unsafe or non-whitelisted CAT command {0:?}")]

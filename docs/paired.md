@@ -109,6 +109,21 @@ without restoring. Like the main `#REF`, the sub pan's reference level
 the radio moves itself (on 2026-10-29 the K4D moved it from -121 to -108
 when `SB1` turned the sub on, and it drifts by a dB with auto-ref).
 
+**RX input settling.** On 2026-10-29 the K4D read `AR$6` back right after
+`AR4;` then `AR$6;`, and `AR$4` 8 ms later, so the interlock stopped the
+survey for a change nobody made. After any batch that changes `AR` or
+`AR$`, the survey and the restore engine wait 300 ms, re-read, and send
+once more (journaled, with a warning event) any input that read back right
+and then moved; a second miss stops the survey as a readback mismatch. In
+a paired survey a main `AR` change may also move the sub's input and
+settings, which the next `AR$` and the journal put right.
+
+**Attenuator in basic CAT mode.** The sub was found with `RA$03`, which
+basic mode cannot put back (only `RA00` is sendable), so a profile that
+requires the attenuator off skips every sub tile (`measurement_skipped`).
+Use `attenuator_db = "as-found"` in that case; `RA`/`RA$` are recorded
+with each visit and the swap cancels a fixed receiver difference.
+
 **Diversity.** Refused at preflight (see Requirements): in diversity
 mode VFO A controls both receivers ("RIT applied to VFO A affects both
 receivers"), so `FB` may not move the sub.
@@ -128,5 +143,6 @@ sources better than a faster pass.
   from `FB` in track mode.
 - Whether `BN$` recalls per-band sub settings or inputs like `BN` does for
   the main receiver.
-- Settle time after an `AR$` change (the check used 3 s).
+- What makes `AR$` move back after an `AR` change, and whether 300 ms
+  always covers it (the check used 3 s).
 - Main/sub agreement with matched settings on the receive antenna.

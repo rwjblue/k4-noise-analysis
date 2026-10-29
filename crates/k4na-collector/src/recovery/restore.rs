@@ -14,7 +14,7 @@
 use serde::Serialize;
 
 use super::{Change, Entry, Ledger, Outcome, Purpose, Scope, Transaction, fields, norm_field};
-use crate::cat::{CatControl, CatQuery, Query, Readback, Setter};
+use crate::cat::{self, CatControl, CatQuery, Query, Readback, Setter};
 use crate::measure::{self, MetaMode, expected_readback, label, setter_for};
 
 /// Everything restoration reads: transmit state, meta-mode, band memory
@@ -291,6 +291,9 @@ impl<C: CatControl> Run<'_, C> {
             })?;
         }
         self.rb = self.read().await?;
+        if changes.iter().any(|(_, s)| cat::is_input(*s)) {
+            self.recheck_inputs(&changes).await?;
+        }
         let ok: Vec<bool> = changes
             .iter()
             .map(|(_, s)| {
@@ -311,6 +314,43 @@ impl<C: CatControl> Run<'_, C> {
             .record(entry)
             .map_err(|e| (Outcome::Partial, format!("{e}; nothing more was sent")))?;
         Ok(ok)
+    }
+
+    /// Re-reads after an RX input change has settled and sends once more any
+    /// input that read back right and then moved (see `cat::INPUT_SETTLE`).
+    async fn recheck_inputs(&mut self, changes: &[(Scope, Setter)]) -> Result<(), Fatal> {
+        let holds = |rb: &Readback, s: Setter| rb.u64(s.query()) == Some(u64::from(cat::input_value(s)));
+        let first = self.rb.clone();
+        tokio::time::sleep(cat::INPUT_SETTLE).await;
+        self.rb = self.read().await?;
+        let missed: Vec<Setter> = changes
+            .iter()
+            .map(|(_, s)| *s)
+            .filter(|s| cat::is_input(*s) && holds(&first, *s) && !holds(&self.rb, *s))
+            .collect();
+        if missed.is_empty() {
+            return Ok(());
+        }
+        self.txn
+            .record(Entry::Note {
+                message: format!(
+                    "the radio moved {} back after it read right; sending it again",
+                    missed.iter().map(|s| s.wire()).collect::<String>()
+                ),
+            })
+            .map_err(|e| (Outcome::Partial, format!("{e}; nothing more was sent")))?;
+        for s in &missed {
+            self.sent.push(s.wire());
+            self.cat.set(*s).await.map_err(|e| {
+                (
+                    Outcome::Partial,
+                    format!("CAT failed sending {} ({e}); radio state is unknown", s.wire()),
+                )
+            })?;
+        }
+        tokio::time::sleep(cat::INPUT_SETTLE).await;
+        self.rb = self.read().await?;
+        Ok(())
     }
 
     fn report(&mut self, scope: &Scope, field: &str, result: &'static str) {

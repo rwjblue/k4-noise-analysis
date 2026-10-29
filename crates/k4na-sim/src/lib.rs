@@ -76,6 +76,15 @@ pub struct RadioModel {
     /// it from -121 to -108 when the sub was turned on (2026-10-29); the sim
     /// moves it by +13 on `SB1` and back on `SB0`.
     pub sub_ref_level: i32,
+    /// How many more `AR$` changes made right after an `AR` change bounce
+    /// back: the first `AR$;` read shows the new input, the next the old one.
+    /// A K4D (R39) did this once on 2026-10-29 (`AR4` then `AR$6`; `AR$`
+    /// read 4 again 8 ms after reading 6).
+    pub sub_input_bounces: u32,
+    /// Pending bounce: (input to revert to, `AR$;` reads before it does).
+    pub sub_input_bounce: Option<(u8, u8)>,
+    /// The last input setter was the main's `AR`.
+    pub main_input_changed: bool,
     /// The sub band (`BN$`) while band independent; `None` = the main band.
     /// `BI0` puts the sub back on the main band.
     pub sub_bn: Option<u8>,
@@ -361,6 +370,9 @@ impl Default for RadioModel {
             krx4: true,
             band_independent: false,
             sub_bn: None,
+            sub_input_bounces: 0,
+            sub_input_bounce: None,
+            main_input_changed: false,
             sub_ref_level: -121,
             sub_span: 40_000,
             sub_input: 4,
@@ -550,7 +562,19 @@ impl SimRadio {
             "#REF$" => format!("#REF${}", m.sub_ref_level),
             "#NB$" => format!("#NB${}", m.sub_pan_nb),
             "OV$" => "OV$00".to_owned(),
-            "AR$" => format!("AR${}", m.sub_input),
+            "AR$" => {
+                match m.sub_input_bounce {
+                    Some((to, 0)) => {
+                        let bn = m.bn;
+                        m.switch_sub_context(bn, to);
+                        m.sub_input = to;
+                        m.sub_input_bounce = None;
+                    }
+                    Some((to, n)) => m.sub_input_bounce = Some((to, n - 1)),
+                    None => {}
+                }
+                format!("AR${}", m.sub_input)
+            }
             "PA$" | "RA$" | "GT$" | "RG$" | "NB$" | "NR$" => {
                 format!(
                     "{cmd}{}",
@@ -633,10 +657,15 @@ impl SimRadio {
                 if sub_input_setter {
                     let v: u8 = cmd[3..].parse().unwrap_or(0);
                     if !m.transmitting && m.krx4 && (m.atu || !(5..=7).contains(&v)) {
+                        if m.main_input_changed && m.sub_input_bounces > 0 && v != m.sub_input {
+                            m.sub_input_bounces -= 1;
+                            m.sub_input_bounce = Some((m.sub_input, 1));
+                        }
                         let bn = m.bn;
                         m.switch_sub_context(bn, v);
                         m.sub_input = v;
                     }
+                    m.main_input_changed = false;
                     return None;
                 }
                 if let Some(v) = cmd.strip_prefix("#SPN$").and_then(|v| v.parse::<u32>().ok()) {
@@ -696,6 +725,7 @@ impl SimRadio {
                     if !m.transmitting && (m.atu || !(5..=7).contains(&v)) {
                         let bn = m.bn;
                         m.switch_rx_context(bn, v);
+                        m.main_input_changed = v != m.rx_input || m.main_input_changed;
                         m.rx_input = v;
                     }
                     return None;

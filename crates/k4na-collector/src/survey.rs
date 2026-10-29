@@ -55,7 +55,9 @@ use k4na_core::time::{Clock, Timestamp};
 use k4na_core::units::{BinGeometry, HzRange};
 use k4na_protocol::{BIN_COUNT, DecoderDiagnostics, PanId};
 
-use crate::cat::{CatControl, CatError, CatQuery, Query, Readback, RxInput, Setter};
+use crate::cat::{
+    CatControl, CatError, CatQuery, INPUT_SETTLE, Query, Readback, RxInput, Setter, input_value, is_input,
+};
 use crate::measure::{self, MetaMode, Receiver, expected_readback, setter_for};
 use crate::passive::{RunError, RunSummary};
 use crate::recovery::{self, Change, Decision, Entry, JournalError, Outcome, Purpose, Scope, Transaction};
@@ -605,7 +607,10 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
         for s in setters {
             self.cat.set(*s).await?;
         }
-        let rb = self.read().await?;
+        let mut rb = self.read().await?;
+        if setters.iter().any(|s| is_input(*s)) {
+            rb = self.settle_inputs(setters, purpose, rb).await?;
+        }
         if rb.flag(Query::Transmit) != Some(false) {
             self.record(self.event(
                 EventKind::TransmitDetected,
@@ -642,6 +647,12 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     // Receiver settings may be stored per RX input.
                     may_change.push(Query::RxAntenna);
                     may_change.extend(measure::KEYS);
+                    if self.paired.is_some() {
+                        // The sub's input may move with the main's (a K4D
+                        // put AR$ back after AR; see settle_inputs).
+                        may_change.push(Query::SubRxAntenna);
+                        may_change.extend(measure::SUB_KEYS);
+                    }
                     rb.u64(Query::RxAntenna) == Some(u64::from(i.value()))
                 }
                 Setter::VfoA(hz) => rb.u64(Query::VfoA) == Some(hz),
@@ -864,6 +875,41 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 .baseline
                 .raw(Query::SubSpan)
                 .is_some_and(|f| setter_for(Query::SubSpan, self.meta, f).is_some()))
+    }
+
+    /// Re-reads after an RX input change has had time to settle, and sends
+    /// once more (journaled) any input this batch set that did not hold.
+    /// A K4D (R39) read `AR$6` back right after `AR4;` then `AR$6;`, and
+    /// `AR$4` 8 ms later (2026-10-29). A second miss is left to the
+    /// readback check, which stops the survey.
+    async fn settle_inputs(&mut self, setters: &[Setter], purpose: Purpose, first: Readback) -> Step<Readback> {
+        let holds = |rb: &Readback, s: Setter| rb.u64(s.query()) == Some(u64::from(input_value(s)));
+        tokio::time::sleep(INPUT_SETTLE).await;
+        let rb = self.read().await?;
+        let missed: Vec<Setter> = setters
+            .iter()
+            .copied()
+            .filter(|s| is_input(*s) && holds(&first, *s) && !holds(&rb, *s))
+            .collect();
+        if missed.is_empty() || rb.flag(Query::Transmit) != Some(false) {
+            return Ok(rb);
+        }
+        let msg = format!(
+            "the radio put {} back after the collector set {}; sent it again",
+            missed
+                .iter()
+                .map(|s| format!("{}{}", s.query().prefix(), rb.raw(s.query()).unwrap_or("?")))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missed.iter().map(|s| s.wire()).collect::<String>()
+        );
+        self.record(self.event(EventKind::Warning, &msg)).await?;
+        self.journal_intent(purpose, &missed)?;
+        for s in &missed {
+            self.cat.set(*s).await?;
+        }
+        tokio::time::sleep(INPUT_SETTLE).await;
+        self.read().await
     }
 
     /// Turns the sub receiver on for a paired survey (journaled; put back

@@ -741,6 +741,38 @@ async fn a_paired_survey_turns_band_independence_off_and_back_on() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_sub_input_that_bounces_back_after_a_main_input_change_is_set_again() {
+    // As on the K4D: AR4 then AR$6 read back 6, then 4 again.
+    let radio = paired_radio();
+    radio.update(|m| m.sub_input_bounces = 3);
+    let before = radio.model();
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| paired_config(root, &fast(RX_VS_DXC_PAIRED)),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.restore.starts_with("restored"), "{}", r.restore);
+    assert!(r.pairs > 0 && r.cycles >= 2, "{r:?}");
+    let m = run.radio.model();
+    assert_eq!(m.sub_input_bounces, 0, "every bounce happened");
+    assert_eq!((m.rx_input, m.sub_input), (before.rx_input, before.sub_input));
+    assert!(m.band_sub.values().all(|s| s.2 == 4), "{:?}", m.band_sub);
+    let ds = DataSet::open(&run.cfg.storage.root).unwrap();
+    let resent = ds
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.message.contains("sent it again"))
+        .count();
+    assert_eq!(resent, 3);
+}
+
+#[tokio::test(start_paused = true)]
 async fn paired_preflight_refuses_without_krx4_band_independence_off_or_consent() {
     let dir = tempfile::tempdir().unwrap();
     let profile = fast(RX_VS_DXC_PAIRED);
