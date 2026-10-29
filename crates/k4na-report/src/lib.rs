@@ -1,6 +1,6 @@
 //! Static, self-contained HTML report over a data root: per-band
-//! frequency x time heatmaps, floors, carriers, families and band/hour
-//! summaries. Read-only; needs no radio and no network to view.
+//! frequency x time heatmaps, floors, carriers, families, band/hour
+//! summaries and the paired antenna comparison. Read-only; needs no radio and no network to view.
 
 pub mod heatmap;
 
@@ -12,7 +12,7 @@ use serde::Serialize;
 pub use heatmap::{Grid, Heatmaps};
 
 /// Bumped when the report's layout or embedded data contract changes.
-pub const REPORT_VERSION: &str = "k4na-report/1";
+pub const REPORT_VERSION: &str = "k4na-report/2";
 
 const TEMPLATE: &str = include_str!("report.html");
 

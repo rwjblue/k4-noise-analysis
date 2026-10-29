@@ -253,8 +253,11 @@ reconstruct discarded runtime context. The existing coarse imported-mark labels
 are unchanged; no automatic heat-source classifier or new RF overlay is implied.
 
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
-`k4na-report/1`) writes one self-contained HTML file: no network
-resources, data embedded as JSON with the analysis provenance. Per band
+`k4na-report/2`) writes one self-contained HTML file: no network
+resources, data embedded as JSON with the analysis provenance. When the
+data has paired visits it starts with the paired antenna comparison
+(the `analyze pairs` summary per band: antenna and receiver differences
+in signal over background, floors as context, and flags). Per band
 and antenna, in frequency order:
 
 - a heatmap with RF on X and passes on Y (a pass is a run of

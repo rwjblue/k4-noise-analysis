@@ -46,6 +46,13 @@
     <span>0 <canvas id="legend" class="legend" width="220" height="10"></canvas> <span id="legendmax"></span></span>
     <span class="dim">gray = not observed</span>
   </div>
+  <div id="pairsec" style="display:none">
+    <h2>Paired antenna comparison (main and sub at the same time)</h2>
+    <div class="panel">
+      <div class="dim" style="margin-bottom:6px">Per band: <b>antenna</b> is the second antenna minus the first in signal over background on carriers both receivers saw in the same dwell (positive favors the second). Swapping the antennas between receivers every other cycle cancels the <b>receiver</b> difference (sub minus main). Floors are uncalibrated context, not a ranking. Blank cells: too few matched carriers.</div>
+      <div class="scroll"><table id="pairs"></table></div>
+    </div>
+  </div>
   <div id="bands"></div>
   <h2>Operator marks (<code>k4na mark</code>)</h2>
   <div class="panel scroll"><table id="marks"></table></div>
@@ -134,17 +141,29 @@ function markSpan(g, m) {
   return [rowAt(g, Math.max(first, m.start_utc_ns)), rowAt(g, Math.min(last, end))];
 }
 
+// Labels closer than this to the previous one are left to the hover tip
+// (imported device logs can add a mark every few minutes).
+const MARK_LABEL_GAP_PX = 14;
+
 function drawMarks(g, map) {
-  for (const m of A.annotations || []) {
-    const s = markSpan(g, m);
-    if (!s) continue;
-    const n = Math.max(1, g.rows.length), d = document.createElement("div");
+  const n = Math.max(1, g.rows.length), height = map.clientHeight || 400;
+  const spans = (A.annotations || []).map((m) => [m, markSpan(g, m)]).filter(([, s]) => s).sort((a, b) => a[1][0] - b[1][0]);
+  let lastLabel = -Infinity, lastText = null;
+  for (const [m, s] of spans) {
+    const d = document.createElement("div");
     d.className = m.end_utc_ns != null ? "mark span" : "mark";
     d.style.top = (s[0] / n) * 100 + "%";
     if (m.end_utc_ns != null) d.style.height = Math.max(0.3, ((s[1] - s[0]) / n) * 100) + "%";
-    const label = document.createElement("span");
-    label.textContent = m.text.length > 60 ? m.text.slice(0, 57) + "…" : m.text;
-    d.appendChild(label);
+    const px = (s[0] / n) * height;
+    // A repeat of the last labelled note (an unchanged device state) is not
+    // labelled again.
+    if (px - lastLabel >= MARK_LABEL_GAP_PX && m.text !== lastText) {
+      const label = document.createElement("span");
+      label.textContent = m.text.length > 60 ? m.text.slice(0, 57) + "…" : m.text;
+      d.appendChild(label);
+      lastLabel = px;
+      lastText = m.text;
+    }
     map.appendChild(d);
   }
 }
@@ -224,7 +243,19 @@ function table(id, head, rows) {
     rows.map((r) => "<tr>" + r.map((v, i) => `<td class="${head[i][1] ? "l" : ""}">${v}</td>`).join("") + "</tr>").join("");
 }
 
+function pairTable() {
+  const ps = A.pair_summaries || [];
+  $("pairsec").style.display = ps.length ? "" : "none";
+  const db = (v) => (v == null ? "" : (v > 0 ? "+" : "") + v.toFixed(1));
+  const order = (b) => parseFloat(b) || 0;
+  const rows = [...ps].sort((a, b) => order(b.band_id) - order(a.band_id) || a.band_id.localeCompare(b.band_id));
+  table("pairs", [["band", 1], ["first", 1], ["second", 1], ["pairs"], ["with carriers"], ["antenna dB"], ["receiver dB"], ["floor antenna dB"], ["floor receiver dB"], ["first", 1], ["last", 1], ["flags", 1]],
+    rows.map((s) => [s.band_id, s.first_antenna, s.second_antenna, `${s.pairs[0]} + ${s.pairs[1]}`, `${s.snr_pairs[0]} + ${s.snr_pairs[1]}`,
+      db(s.snr_antenna_db), db(s.snr_receiver_db), db(s.floor_antenna_db), db(s.floor_receiver_db), fmtTime(s.first_utc_ns), fmtTime(s.last_utc_ns), s.flags.join(", ") || "-"]));
+}
+
 function tables() {
+  pairTable();
   const mins = (s) => (s == null ? "-" : (s / 60).toFixed(1));
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
   table("marks", [["start", 1], ["end", 1], ["note", 1], ["written", 1]],
@@ -261,7 +292,7 @@ function tables() {
 
 function summary() {
   const span = P.first_utc_ns ? `${fmtTime(P.first_utc_ns)} to ${fmtTime(P.last_utc_ns)}` : "no data";
-  $("summary").textContent = `${P.visits_analyzed} visits (${P.visits_skipped} incomplete skipped) · ${span} · ${P.sessions.length} session(s) · profiles ${P.profiles.join(", ") || "-"} · ${A.carriers.length} carriers · ${A.families.length} families · ${D.report} / ${P.algorithm} · generated ${fmtTime(D.generated_utc_ns)}`;
+  $("summary").textContent = `${P.visits_analyzed} visits (${P.visits_skipped} incomplete skipped) · ${span} · ${P.sessions.length} session(s) · profiles ${P.profiles.join(", ") || "-"} · ${A.carriers.length} carriers · ${A.families.length} families · ${(A.pairs || []).length} pairs · ${D.report} / ${P.algorithm} · generated ${fmtTime(D.generated_utc_ns)}`;
   $("prov").textContent = JSON.stringify(P, null, 2);
 }
 

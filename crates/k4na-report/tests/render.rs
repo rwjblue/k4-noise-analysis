@@ -28,6 +28,9 @@ fn an_empty_root_renders_a_self_contained_document() {
     assert_eq!(d["analysis"]["provenance"]["visits_analyzed"], 0);
     assert!(d["analysis"]["harmonic_series"].as_array().unwrap().is_empty());
     assert!(a.contains("id=\"series\""));
+    // The paired comparison section exists and is hidden without pairs.
+    assert!(a.contains("id=\"pairs\"") && a.contains("id=\"pairsec\" style=\"display:none\""));
+    assert!(d["analysis"]["pair_summaries"].as_array().unwrap().is_empty());
     assert!(d["grids"].as_array().unwrap().is_empty());
 }
 
