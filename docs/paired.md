@@ -104,7 +104,10 @@ receiver's (per band on band change, and at the end), only when they still
 hold a value the collector set; `k4na recovery` restores them after a
 crash. The interlock watches VFO B, the sub's band, input, span and
 settings, and `BI`; a change the collector did not make stops the survey
-without restoring.
+without restoring. Like the main `#REF`, the sub pan's reference level
+`#REF$` is recorded with each visit but not watched: it is a display level
+the radio moves itself (on 2026-10-29 the K4D moved it from -121 to -108
+when `SB1` turned the sub on, and it drifts by a dB with auto-ref).
 
 **Diversity.** Refused at preflight (see Requirements): in diversity
 mode VFO A controls both receivers ("RIT applied to VFO A affects both

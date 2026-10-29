@@ -72,6 +72,10 @@ pub struct RadioModel {
     pub krx4: bool,
     /// Band independence (`BI`): off means VFO B follows the main band.
     pub band_independent: bool,
+    /// Sub pan reference level (`#REF$`, display only). A K4D (R39) moved
+    /// it from -121 to -108 when the sub was turned on (2026-10-29); the sim
+    /// moves it by +13 on `SB1` and back on `SB0`.
+    pub sub_ref_level: i32,
     /// The sub band (`BN$`) while band independent; `None` = the main band.
     /// `BI0` puts the sub back on the main band.
     pub sub_bn: Option<u8>,
@@ -357,6 +361,7 @@ impl Default for RadioModel {
             krx4: true,
             band_independent: false,
             sub_bn: None,
+            sub_ref_level: -121,
             sub_span: 40_000,
             sub_input: 4,
             sub: RxSettings::default(),
@@ -542,7 +547,7 @@ impl SimRadio {
             "BI" => format!("BI{}", flag(m.band_independent)),
             "BN$" => format!("BN${:02}", m.sub_bn.filter(|_| m.band_independent).unwrap_or(m.bn)),
             "#SPN$" => format!("#SPN${}", m.sub_span),
-            "#REF$" => "#REF$-110".to_owned(),
+            "#REF$" => format!("#REF${}", m.sub_ref_level),
             "#NB$" => format!("#NB${}", m.sub_pan_nb),
             "OV$" => "OV$00".to_owned(),
             "AR$" => format!("AR${}", m.sub_input),
@@ -609,7 +614,11 @@ impl SimRadio {
                 }
                 if let Some(v) = cmd.strip_prefix("SB").and_then(|v| v.parse::<u8>().ok()) {
                     if v <= 1 && !m.transmitting {
-                        m.sub_rx = v == 1;
+                        let on = v == 1;
+                        if on != m.sub_rx {
+                            m.sub_ref_level += if on { 13 } else { -13 };
+                        }
+                        m.sub_rx = on;
                     }
                     return None;
                 }

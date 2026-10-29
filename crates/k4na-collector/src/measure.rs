@@ -112,6 +112,7 @@ pub fn main_form(q: Query) -> Option<Query> {
 pub fn label(q: Query) -> &'static str {
     match q {
         Query::SubRx => "sub receiver on/off",
+        Query::BandIndependent => "band independence",
         Query::VfoB => "VFO B frequency",
         Query::SubBand => "sub band",
         Query::SubSpan => "sub pan span",

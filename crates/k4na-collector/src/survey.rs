@@ -439,7 +439,10 @@ struct PairedState {
 /// Sub-receiver fields a paired survey watches and records.
 fn sub_watch() -> Vec<Query> {
     let mut q = vec![Query::SubRx, Query::BandIndependent];
-    q.extend(Query::SUB_STATE);
+    // `#REF$` is recorded with each visit but, like the main `#REF`, not
+    // watched: it is a display level the radio moves itself (a K4D moved it
+    // from -121 to -108 on SB1 and drifts it with auto-ref).
+    q.extend(Query::SUB_STATE.into_iter().filter(|s| *s != Query::SubRefLevel));
     q.extend(measure::SUB_KEYS);
     q.sort();
     q.dedup();
