@@ -627,6 +627,8 @@ pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreRe
     // the sub receiver's on/off last.
     scopes.sort_by_key(|s| (s.is_session(), *s == Scope::SubSession));
     let mut sent = Vec::new();
+    // Bands the restore would change to (BN) to put their memory back.
+    let mut elsewhere: Vec<u8> = Vec::new();
     for scope in scopes {
         let here = match &scope {
             Scope::Session | Scope::SubSession => true,
@@ -634,6 +636,12 @@ pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreRe
             Scope::Context(b, ar) => Some(*b) == band && rb.raw(Query::RxAntenna) == Some(ar.as_str()),
             Scope::SubContext(b, ar) => Some(*b) == band && rb.raw(Query::SubRxAntenna) == Some(ar.as_str()),
         };
+        if !here
+            && let Some(b) = scope.band()
+            && !elsewhere.contains(&b)
+        {
+            elsewhere.push(b);
+        }
         for d in decide(ledger, &scope, &rb, false) {
             let field = d.field().to_owned();
             let result = match (&d, here) {
@@ -660,8 +668,21 @@ pub async fn plan<C: CatQuery>(ledger: &Ledger, cat: &mut C) -> Result<RestoreRe
             });
         }
     }
+    elsewhere.sort_unstable();
+    let visits = if elsewhere.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", and would change bands to {} to put each band's memory back, then return",
+            elsewhere
+                .iter()
+                .map(|b| format!("BN{b:02}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let msg = format!(
-        "would send {} for the current band (other bands are settled on arrival); nothing was sent",
+        "would send {} on the current band{visits}; nothing was sent",
         if sent.is_empty() {
             "nothing".to_owned()
         } else {

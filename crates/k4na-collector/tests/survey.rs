@@ -1159,6 +1159,15 @@ async fn a_survey_killed_mid_run_is_restored_from_its_journal_alone() {
         .unwrap();
     assert!(plan.dry_run && !plan.fields.is_empty(), "{plan:?}");
     assert_eq!(radio.setters_received().len(), setters, "dry run sent a setter");
+    // The preview says when the restore would change bands, and to which.
+    for f in plan.fields.iter().filter(|f| f.result == "unvisited") {
+        let band = format!("BN{:02}", f.scope.band().unwrap());
+        assert!(
+            plan.message.contains("change bands to") && plan.message.contains(&band),
+            "{band}: {}",
+            plan.message
+        );
+    }
 
     let report = recover(&run, &radio).await;
     assert_eq!(report.outcome, recovery::Outcome::Complete, "{report:?}");
