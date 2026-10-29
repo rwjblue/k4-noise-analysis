@@ -66,8 +66,11 @@ SQLite shards with an independent 64 MiB cap, 4 MiB/hourly rotation, free-space
 reserve, transactional checkpoints and restartable import bookkeeping. The RF
 quota does not cover those files. The helper never deletes telemetry and stops
 logging at its cap; RF continues with explicit missing HVAC coverage. It also
-refuses unattended imports once annotations exceed 16 MiB. No measurement
-schema or existing annotation contract changes.
+refuses unattended imports once annotations exceed 16 MiB. Native sample JSON
+also retains three non-identifying equipment categories and bounded anonymous
+zone conditioning for later reclassification. These optional version-1 fields
+need no SQL migration; older samples lack that context, not implicit idle states.
+No measurement schema or existing annotation contract changes.
 
 - One writer owns shards; readers open completed shards read-only.
 - Hourly UTC rotation, by shard timestamp, not estimated size. At rotation

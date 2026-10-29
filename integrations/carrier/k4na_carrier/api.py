@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .context import ZoneAliases, capture_context
+
 
 class Unavailable(Exception):
     """A redacted reason why there is no usable observation."""
@@ -21,6 +23,20 @@ class Reading:
     reported_utc_ns: int | None
     values: dict[str, Any]
     quality: str
+
+    @property
+    def outdoor_percent(self) -> float | None:
+        # Profile categories and runtime unit-family codes are different domains.
+        equipment = self.values.get("equipment", {})
+        category = equipment.get("odutype") if isinstance(equipment, dict) else None
+        if (
+            self.quality != "observed"
+            or not isinstance(category, str)
+            or category.strip().lower() not in ("varcaphp", "varcapac")
+        ):
+            return None
+        value = numeric(self.values.get("odu", {}).get("opstat"))
+        return value if value is not None and 0 <= value <= 100 else None
 
     @property
     def label(self) -> str:
@@ -44,10 +60,12 @@ class Reading:
 
 
 def numeric(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         n = float(value)
         return n if math.isfinite(n) else None
-    except ValueError, TypeError:
+    except ValueError, TypeError, OverflowError:
         return None
 
 
@@ -94,6 +112,7 @@ class CarrierClient:
 
         self._api = ApiConnectionGraphql(username=username, password=password)
         self._aliases: dict[str, str] = {}
+        self._zone_aliases: dict[str, ZoneAliases] = {}
         self._max_age_ns = int(max_age_seconds * 1_000_000_000)
 
     async def read(self, now_ns: int) -> list[Reading]:
@@ -118,8 +137,15 @@ class CarrierClient:
         for serial, alias in self._aliases.items():
             status = by_id.get(serial, {}).get("status")
             values = equipment_values(status) if isinstance(status, dict) else {}
+            if isinstance(status, dict):
+                aliases = self._zone_aliases.setdefault(serial, ZoneAliases())
+                values.update(
+                    capture_context(
+                        by_id.get(serial, {}).get("profile"), status.get("zones"), aliases
+                    )
+                )
             reported = timestamp_ns(values.get("utcTime"))
-            if not values:
+            if not isinstance(status, dict) or not status:
                 quality = "missing system/status"
             elif values.get("isDisconnected") is not False:
                 quality = "disconnected or connection unknown"

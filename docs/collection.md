@@ -215,7 +215,9 @@ logger and passive capture together. It does not change this CLI's consent,
 interlock, restoration or storage behavior. Active use requires `--mode survey
 --allow-retune` plus station consent, and the usual attended preview/checks.
 See [carrier.md](carrier.md) for setup, tool/dependency locks, status and explicit
-RF-only operation.
+RF-only operation. The same existing Carrier query now retains bounded anonymous
+zone conditioning and non-identifying equipment categories for later offline
+classification; it adds no request, websocket, retune or thermostat mutation.
 
 ## Implemented behavior (v0.1)
 

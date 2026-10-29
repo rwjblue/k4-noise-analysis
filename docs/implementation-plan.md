@@ -144,7 +144,13 @@ mise Python/uv toolchains and `uv.lock`, ignored mise-loaded `.env`
 credentials, supervised `mise run record` (passive default; explicit survey
 consent), versioned/capped auxiliary shards, unknown/stale/restart coverage,
 and deduplicated completed intervals through `import-marks`. Offline checks
-run in CI and `mise run ci`; see [carrier.md](carrier.md).
+run in CI and `mise run ci`; see [carrier.md](carrier.md). Additive version-1
+sample JSON now retains anonymous zone enabled/conditioning values and three
+non-identifying equipment categories from the same query. Bounds, stable aliases,
+missing-zone unknowns, privacy and old-file compatibility have offline tests.
+Profile categories govern percentage display; native values and imported mark
+labels remain unchanged. No websocket transport or automatic heat-source
+classifier is added.
 
 Completed live smoke validation: Carrier authentication, repeated read-only
 status polling, private auxiliary recording, detailed console output and the

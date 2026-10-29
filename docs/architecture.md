@@ -207,8 +207,12 @@ Carrier client, isolated from the Rust collector. A file-based mise `record`
 task supervises the adapter and existing RF CLI; passive mode remains the
 default, and active survey still requires both consents and all interlocks.
 Auxiliary source observations have their own versioned, capped storage outside
-the measurement root. Derived completed intervals enter the existing marks
-importer; offline reports do not need Python, Carrier access or the helper.
+the measurement root. Native readings, three equipment-category hints and
+anonymous per-unit zone conditioning remain independent of the mark labels so
+later classifiers can re-bucket them offline. Raw identities, zone names,
+setpoints, schedules and occupancy are excluded. Derived completed intervals
+enter the existing marks importer; offline reports do not need Python, Carrier
+access or the helper.
 Neither a cloud outage nor a telemetry-storage failure changes radio state or
 silently stops RF recording. See [carrier.md](carrier.md) for startup refusal,
 coverage gaps, supervision and lockfile/environment contracts. Carrier-only
