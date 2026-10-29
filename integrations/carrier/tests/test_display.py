@@ -9,8 +9,9 @@ NOW = 1_800_000_000_000_000_000
 
 def reading(output="35", quality="observed", **extra):
     values = {
-        "odu": {"type": "varcaphp", "opstat": output},
+        "odu": {"type": "synthetic-family", "opstat": output},
         "idu": {"opstat": "heat1", "cfm": "800", "blwrpm": "900"},
+        "equipment": {"odutype": "varcaphp", "idutype": "furnace", "idusource": "gas"},
     }
     values.update(extra)
     return Reading("unit-1", NOW, values, quality)
@@ -30,6 +31,54 @@ class DisplayTests(unittest.TestCase):
         self.assertIn("ODU=35", text)
         self.assertNotIn("%", text)
         self.assertIn("IDU=unknown", text)
+
+    def test_runtime_type_is_not_a_profile_category_or_an_indoor_percentage(self):
+        value = reading(equipment={}, odu={"type": "varcaphp", "opstat": "35"})
+        self.assertNotIn("%", equipment(value))
+        value = reading(idu={"type": "varcaphp", "opstat": "35"})
+        self.assertIn("ODU=35% output", equipment(value))
+        self.assertIn("IDU=35;", equipment(value))
+        self.assertNotIn("IDU=35%", equipment(value))
+
+    def test_percent_requires_known_category_observed_status_and_valid_numeric_range(self):
+        for category in (None, "unknown", 35):
+            self.assertNotIn("%", equipment(reading(equipment={"odutype": category})))
+        for output in (True, False, 10**1000, "NaN", "inf", "-1", "101", "off", "dehumidify"):
+            self.assertNotIn("%", equipment(reading(output)))
+        self.assertIn("ODU=35% output", equipment(reading(equipment={"odutype": " VarCapHP "})))
+        self.assertIn("ODU=0% output", equipment(reading("0")))
+
+    def test_conditioning_changes_are_visible_without_becoming_heat_source_marks(self):
+        changes = Changes()
+        labels = set()
+        for index, state in enumerate(("prep_heat", "pending_heat", "active_heat", "idle")):
+            value = reading(
+                zones=[{"zone": "zone-1", "enabled": "on", "zoneconditioning": state}],
+                conditioning_quality="observed",
+            )
+            labels.add(value.label)
+            self.assertIn(f"zone-1[on]:{state}", equipment(value))
+            self.assertEqual(changes.observe(value), "initial" if index == 0 else "change")
+        self.assertEqual(len(labels), 1)
+
+    def test_missing_conditioning_is_unknown_and_context_is_terminal_safe(self):
+        text = equipment(reading(zones=[], conditioning_quality="missing zones"))
+        self.assertIn("conditioning unknown (missing zones)", text)
+        value = reading(
+            zones=[
+                {
+                    "zone": "zone-1",
+                    "enabled": "on",
+                    "zoneconditioning": "active_heat\nINJECTED\x1b[31m",
+                    "name": "PRIVATE",
+                }
+            ],
+            conditioning_quality="observed",
+        )
+        text = equipment(value)
+        self.assertNotIn("PRIVATE", text)
+        self.assertNotIn("\n", text)
+        self.assertNotIn("\x1b", text)
 
     def test_initial_change_cache_refresh_unknown_and_resume(self):
         changes = Changes()

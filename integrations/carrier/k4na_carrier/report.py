@@ -9,7 +9,8 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from .api import Reading, equipment_values, numeric
+from .api import Reading, equipment_values
+from .context import retained_context
 from .display import Changes, clean, equipment
 from .store import JournalError, checked_connection, iso
 
@@ -36,14 +37,8 @@ class Unit:
         self.changes += event == "change"
         self.last_ns = observed_ns
         self.last = reading
-        outdoor = reading.values.get("odu", {})
-        value = numeric(outdoor.get("opstat"))
-        if (
-            reading.quality == "observed"
-            and outdoor.get("type") in ("varcaphp", "varcapac")
-            and value is not None
-            and 0 <= value <= 100
-        ):
+        value = reading.outdoor_percent
+        if value is not None:
             self.minimum_output = (
                 value if self.minimum_output is None else min(self.minimum_output, value)
             )
@@ -106,7 +101,12 @@ def write_report(directory: Path, limit=25, stream=None):
                     values = json.loads(raw)
                     if not isinstance(values, dict):
                         raise ValueError("invalid sample values")
-                    reading = Reading(alias, reported, equipment_values(values), quality)
+                    reading = Reading(
+                        alias,
+                        reported,
+                        equipment_values(values) | retained_context(values),
+                        quality,
+                    )
                     key = session, alias
                     if key not in units:
                         if len(units) >= 4096:
@@ -192,6 +192,8 @@ def write_report(directory: Path, limit=25, stream=None):
     print(
         "\nChanges compare saved snapshots, not exact hardware switching times. "
         "Unknown coverage is not off; percent output is not electrical power. "
-        "Unit aliases are session-scoped; same-state five-minute chunks are not new cycles.",
+        "Unit/zone aliases are session-scoped; same-state five-minute chunks are not new cycles. "
+        "Conditioning keeps active/prep/pending distinct and does not identify the heat source. "
+        "Older samples may lack equipment categories and conditioning context.",
         file=out,
     )

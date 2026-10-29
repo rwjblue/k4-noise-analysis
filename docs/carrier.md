@@ -86,11 +86,14 @@ there is no installed service, login item, or automatic recording on boot.
 The console prints and flushes a safe summary after each saved observation:
 UTC receive time, unit alias, initial/change/unchanged/unknown/resumed status,
 reported indoor/outdoor operation, numeric output, airflow and blower RPM when
-present, and source timestamp age. Percent units are shown only for recognized
-variable-capacity equipment types; other values remain native. Closed intervals,
-successful mark imports, and final observed/unknown/change counts are also
-printed. A change means the equipment snapshots differ, not that exact hardware
-switching time is known. No profiles, credentials, or raw account responses are
+present, equipment categories, anonymous zone conditioning and source timestamp
+age. Percent output requires the profile's `odutype` category to be `varcaphp` or
+`varcapac` and an observed numeric value in 0–100; runtime `odu.type` is a different
+field domain. Other values remain native, including unknown categories and
+non-numeric states. Closed intervals, successful mark imports, and final
+observed/unknown/change counts are also printed. A change means the retained
+equipment/context snapshots differ, not that exact hardware switching time is
+known. No account profiles, identity fields, credentials, or raw responses are
 printed; terminal controls in returned strings are removed.
 
 ## Offline event report
@@ -109,9 +112,9 @@ intervals with their import status. `--limit` bounds rows in each section
 (default 25, maximum 1000); totals still cover the whole selected directory.
 The reader streams rows with explicit shard, unit/session and payload limits.
 
-Events are derived from consecutive equipment snapshots: initial, change,
-unknown and resumed. Cache timestamp refreshes alone are not changes; blower
-RPM or pressure changes are. Repeated states across shard rotation are not new
+Events are derived from consecutive equipment/context snapshots: initial,
+change, unknown and resumed. Cache timestamp refreshes alone are not changes;
+blower RPM, pressure, equipment-category or anonymous conditioning changes are. Repeated states across shard rotation are not new
 cycles. Unit aliases are grouped by logger session, not assumed identical
 across reconnects/restarts. A short run may show no heating/cooling transition;
 that is different from showing no observations. Reported `opstat=off` does not
@@ -131,11 +134,47 @@ are conservative software defaults, not verified thermostat cadence guarantees.
 Each source sample preserves host UTC nanoseconds, monotonic elapsed time,
 Carrier's source timestamp (including its original string), native equipment
 status strings, airflow, blower RPM, static pressure, temperature and units
-when supplied. Missing values are not zero. The explicit allowlist excludes
-profile names, serials, addresses, schedules, zones and occupancy. Generic
-`unit-1`, `unit-2`, etc. aliases are connection-scoped; do not assume permanent
-unit identity after the account's system roster changes. Shard metadata records
-format/client versions and a random logger-session ID.
+when supplied. It also retains only the profile's `idutype`, `idusource` and
+`odutype` categories, plus each zone's enabled flag and native `zoneconditioning`.
+These fields already arrive in `get_systems`: no extra query, changed polling
+cadence or websocket connection is needed. Missing values are not zero. The
+allowlist excludes names, serials, addresses, schedules, raw zone IDs, zone names,
+room temperatures, setpoints and occupancy. Generic unit aliases are scoped to
+the connection/session; zone aliases (`zone-1`, etc.) are scoped to each unit in
+that session. Aliases remain stable on response reordering. Do not assume
+permanent identity across logger sessions or account roster changes. Shard
+metadata records format/client versions and a random logger-session ID.
+
+Zone context is bounded to 32 identities per unit/session. A known zone omitted
+from a later response is retained as an unknown placeholder, not silently idle.
+Missing, incomplete, malformed or over-cap zone context has its own
+`conditioning_quality`; it does not discard otherwise valid equipment readings.
+Unknown future conditioning strings are retained unchanged, not mapped to off.
+The existing overall sample-quality, transaction and storage caps still apply.
+
+### Equipment context and later classification
+
+The SDK recognizes `active_heat`, `prep_heat`, `pending_heat`, the corresponding
+three `_cool` values, and `idle`. Preserve those distinctions: a pending or
+preparing zone does not prove that a compressor or burner is running. Neither a
+zone's conditioning direction nor the selected thermostat mode identifies the
+active heat source by itself. Furnace `opstat` can be a stage word; its complete
+value set for each equipment family has not been validated. Missing or unknown
+values must not become a claim of off, gas firing, or heat-pump heating.
+
+Equipment profile categories and runtime unit-family `type` codes are different.
+Only the former enable the supported outdoor percentage interpretation. Numeric
+output remains a reported level, not measured electrical power or calibrated
+heat. An older sample without category metadata stays native; the report does
+not invent a percentage or backfill missing historical context.
+
+The source remains suitable for later offline bucketing without changing its
+measurements. The smarter classifier, RF capacity overlays and websocket
+compressor/inducer diagnostics are not implemented by this capture-only change.
+The SDK is unofficial; known mappings are evidence, not an exhaustive vendor
+contract. Source definitions: [pinned SDK status model](https://github.com/dahlb/carrier_api/blob/v3.6.2/src/carrier_api/status.py),
+[queried fields](https://github.com/dahlb/carrier_api/blob/v3.6.2/src/carrier_api/api_connection_graphql.py),
+and [upstream category/output mapping](https://github.com/dahlb/ha_carrier/blob/dad11c52631a2ac6b8a92e474614b9cc2932465e/custom_components/ha_carrier/sensor.py#L90-L96).
 
 The helper derives intervals for reported indoor/outdoor operating states,
 including explicitly reported off states. Changing numeric output stays in the
@@ -186,9 +225,24 @@ Shard sequence numbers, not wall-clock names, establish recovery order.
 
 `values_json` allows `utcTime`, `isDisconnected`, `mode`, `cfgem`, `oat`,
 `odu.{type,opstat,iducfm}`, and `idu.{type,opstat,cfm,statpress,blwrpm}` when
-supplied. Numeric-looking source strings remain strings; the original source
-UTC string is retained as well as its parsed timestamp. `mode` is the selected
-thermostat mode, not proof that equipment is running. Status and measured
+supplied. Additive, optional version-1 context fields are:
+
+- `equipment.{idutype,idusource,odutype}`: only the three non-identifying profile
+  categories, never the entire profile;
+- `zones[]`: generic `zone` alias plus native `enabled` and `zoneconditioning`
+  when supplied; never a source ID, name, temperature, setpoint or occupancy;
+- `conditioning_quality`: `observed`, `incomplete zones`, `missing zones`,
+  `invalid zone identities`, or `too many zone identities`; a reader reports
+  `invalid conditioning quality` for an unrecognized saved quality flag. Here
+  `observed` means the context fields were received, not that their values prove
+  activity.
+
+These are JSON additions, not SQL/schema migrations. Older shards remain
+readable; absent context remains unavailable. Native strings remain strings,
+including categorical hints and numeric-looking values; the original source UTC
+string is retained as well as its parsed timestamp. `cfgem` denotes temperature
+units (`C`/`F`), not emergency heat. `mode` alone is not proof that equipment is
+running or which heat source is active. Status and measured
 blower/airflow values are kept independently, without inventing consistency or
 missing zeroes. There is no new `events` table: console/report events are views
 over canonical samples, while intervals feed the existing RF annotations.
@@ -224,5 +278,9 @@ Tests cover redaction, native values, stale/disconnected/missing status, mark
 idempotency and nanosecond placement, bounded/rotated shards, crash checkpoints,
 clock jumps, startup refusal, cloud/write failures, safe child shutdown, actual
 SIGTERM, exit-code forwarding, and explicit survey consent. No test needs
-credentials, the radio, or Carrier's service. Dependency installation needs a
-package registry unless already cached.
+credentials, the radio, or Carrier's service. Context tests additionally cover
+anonymous/stable aliases, disappearing zones, bounded rosters, native unknown
+states, profile-versus-runtime type domains, unchanged mark labels, read-only
+old/new-file reporting, and privacy filtering. New context fields and their
+physical meaning remain unverified on the operator's live account. Dependency
+installation needs a package registry unless already cached.

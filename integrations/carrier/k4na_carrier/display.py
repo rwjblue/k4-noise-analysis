@@ -3,7 +3,8 @@
 import json
 import sys
 
-from .api import Reading, numeric
+from .api import Reading
+from .context import retained_context
 from .store import iso
 
 
@@ -20,7 +21,7 @@ def equipment(reading: Reading) -> str:
         unit = reading.values.get(name, {})
         status = unit.get("opstat")
         rendered = "unknown" if status is None else clean(status, 64)
-        if unit.get("type") in ("varcaphp", "varcapac") and numeric(status) is not None:
+        if name == "odu" and reading.outdoor_percent is not None:
             rendered += "% output"
         parts.append(f"{name.upper()}={rendered}")
     indoor = reading.values.get("idu", {})
@@ -31,6 +32,28 @@ def equipment(reading: Reading) -> str:
     ):
         if indoor.get(key) is not None:
             parts.append(f"{label}={clean(indoor[key], 64)} {unit}")
+    context = retained_context(reading.values)
+    categories = context.get("equipment", {})
+    if categories:
+        parts.append(
+            "equipment="
+            + ", ".join(
+                f"{key}:{clean(value, 48) if value is not None else 'unknown'}"
+                for key, value in categories.items()
+            )
+        )
+    if context.get("zones"):
+        parts.append(
+            "conditioning="
+            + ", ".join(
+                f"{zone['zone']}[{clean(zone.get('enabled', 'unknown'), 16)}]:"
+                f"{clean(zone.get('zoneconditioning', 'unknown'), 64)}"
+                for zone in context["zones"]
+            )
+        )
+    quality = context.get("conditioning_quality")
+    if quality is not None and quality != "observed":
+        parts.append(f"conditioning unknown ({clean(quality, 64)})")
     return "; ".join(parts)
 
 
@@ -38,7 +61,9 @@ def fingerprint(reading: Reading) -> tuple:
     # Exclude timestamp, outdoor temperature and desired mode. These are
     # equipment snapshot changes, not cache refreshes or thermostat setpoints.
     return reading.quality, json.dumps(
-        {key: reading.values.get(key, {}) for key in ("odu", "idu")}, sort_keys=True
+        {key: reading.values.get(key, {}) for key in ("odu", "idu")}
+        | retained_context(reading.values),
+        sort_keys=True,
     )
 
 

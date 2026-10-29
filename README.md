@@ -87,6 +87,8 @@ mise run record --duration 8h
 For a Carrier-only check, use `mise run carrier:log --duration 2m`.
 The logger prints equipment observations and changes to the console;
 `mise run carrier:report` prints an offline event summary from saved telemetry.
+Native readings, equipment-category hints and anonymous zone-conditioning states
+are retained for later bucketing; current mark labels do not limit reanalysis.
 
 This defaults to passive RF capture and refuses startup without fresh HVAC
 readings unless you explicitly pass `--without-hvac`. Python and uv are

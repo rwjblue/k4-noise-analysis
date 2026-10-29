@@ -244,6 +244,13 @@ readings remain in separately versioned auxiliary shards. HVAC marks distinguish
 reported off states from missing telemetry; they do not add capacity plots or
 automatic source attribution. Their time resolution is limited by polling and
 Carrier's cached status/source timestamps, not just the annotation nanoseconds.
+Native samples also preserve equipment-category hints and anonymous zone
+conditioning for later offline bucketing. Active, preparing and pending states
+stay distinct; zone heating direction does not identify the active heat source.
+Outdoor percentages require a known profile category, not the runtime unit-family
+code. Older files without these optional fields remain readable but cannot
+reconstruct discarded runtime context. The existing coarse imported-mark labels
+are unchanged; no automatic heat-source classifier or new RF overlay is implied.
 
 `k4na report --data DIR --out report.html` (crate `k4na-report`,
 `k4na-report/1`) writes one self-contained HTML file: no network

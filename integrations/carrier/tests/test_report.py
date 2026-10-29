@@ -42,8 +42,19 @@ class ReportTests(unittest.TestCase):
             ):
                 values = {
                     "utcTime": f"synthetic timestamp {i}",
-                    "odu": {"type": "varcaphp", "opstat": output},
+                    "odu": {"type": "synthetic-family", "opstat": output},
                     "idu": {"opstat": "heat1", "cfm": "800"},
+                    "equipment": {"odutype": "varcaphp", "idutype": "furnace", "name": "PRIVATE"},
+                    "zones": [
+                        {
+                            "zone": "zone-1",
+                            "enabled": "on",
+                            "zoneconditioning": "active_heat",
+                            "id": "PRIVATE",
+                            "name": "PRIVATE",
+                        }
+                    ],
+                    "conditioning_quality": "observed",
                     "profile": {"password": "PRIVATE", "serial": "PRIVATE"},
                 }
                 recorder.tick(
@@ -74,9 +85,48 @@ class ReportTests(unittest.TestCase):
             self.assertIn(f"[{kind}]", text)
         self.assertIn("ODU=60% output", text)
         self.assertIn("reported output range=35..60%", text)
+        self.assertIn("odutype:varcaphp", text)
+        self.assertIn("zone-1[on]:active_heat", text)
         self.assertIn("pending import", text)
         self.assertNotIn("PRIVATE", text)
         self.assertIn("not exact hardware switching times", text)
+
+    def test_old_version_one_samples_remain_readable_without_invented_percent_units(self):
+        with self.journal() as journal:
+            Recorder(journal, 100).tick(
+                [Reading("unit-1", NOW, {"odu": {"type": "varcaphp", "opstat": "35"}}, "observed")],
+                NOW,
+                0,
+            )
+        before = self.fingerprint()
+        text = self.render()
+        self.assertIn("ODU=35;", text)
+        self.assertNotIn("ODU=35%", text)
+        self.assertNotIn("reported output range=", text)
+        self.assertEqual(self.fingerprint(), before)
+
+    def test_context_transitions_are_reported_but_not_imported_as_new_source_claims(self):
+        with self.journal() as journal:
+            recorder = Recorder(journal, 100)
+            for index, state in enumerate(("prep_heat", "pending_heat", "active_heat", "idle")):
+                values = {
+                    "odu": {"opstat": "off"},
+                    "idu": {"opstat": "off"},
+                    "zones": [{"zone": "zone-1", "enabled": "on", "zoneconditioning": state}],
+                    "conditioning_quality": "observed",
+                }
+                recorder.tick(
+                    [Reading("unit-1", NOW, values, "observed")],
+                    NOW + index * 30 * SECOND,
+                    index * 30 * SECOND,
+                )
+            recorder.finish(NOW + 90 * SECOND)
+        text = self.render()
+        self.assertIn("Equipment snapshot changes: 3 | Timeline events: 4", text)
+        for state in ("prep_heat", "pending_heat", "active_heat", "idle"):
+            self.assertIn(f"zone-1[on]:{state}", text)
+        self.assertNotIn("state transition between polls", text)
+        self.assertIn("does not identify the heat source", text)
 
     def test_report_changes_no_files_and_needs_no_credentials_or_writer(self):
         self.snapshots()
