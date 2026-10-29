@@ -310,11 +310,16 @@ pub enum Setter {
     Receiver(ReceiverSetter),
     /// `SB0;`/`SB1;` sub receiver off/on.
     SubRx(bool),
+    /// `BI0;`/`BI1;` band independence off/on. A paired survey sends `BI0`
+    /// only when the sub is already on the main band (`BN$` = `BN`), so
+    /// putting `BI1` back returns the found state; the sub band itself is
+    /// never set.
+    BandIndependent(bool),
     /// `FBnnnnnnnnnnn;` VFO B in Hz, same range as VFO A. Only sent with
     /// split off (`FT0`), where VFO B is not the transmit frequency.
     VfoB(u64),
     /// `#SPN$n;` sub pan span in Hz. (The sub band is never set: paired
-    /// surveys require `BI0`, where VFO B follows VFO A's band.)
+    /// surveys run with `BI0`, where VFO B follows VFO A's band.)
     SubSpan(u32),
     /// `AR$n;` sub-RX input (receive routing only).
     SubRxInput(RxInput),
@@ -406,6 +411,7 @@ impl Setter {
             Setter::RxInput(i) => format!("AR{};", i.0),
             Setter::Receiver(r) => r.wire(),
             Setter::SubRx(on) => format!("SB{};", u8::from(on)),
+            Setter::BandIndependent(on) => format!("BI{};", u8::from(on)),
             Setter::VfoB(hz) => format!("FB{hz:011};"),
             Setter::SubSpan(hz) => format!("#SPN${hz};"),
             Setter::SubRxInput(i) => format!("AR${};", i.0),
@@ -425,6 +431,7 @@ impl Setter {
             Setter::RxInput(_) => Query::RxAntenna,
             Setter::Receiver(r) => r.query(),
             Setter::SubRx(_) => Query::SubRx,
+            Setter::BandIndependent(_) => Query::BandIndependent,
             Setter::VfoB(_) => Query::VfoB,
             Setter::SubSpan(_) => Query::SubSpan,
             Setter::SubRxInput(_) => Query::SubRxAntenna,
@@ -436,7 +443,12 @@ impl Setter {
     pub fn is_sub(self) -> bool {
         matches!(
             self,
-            Setter::SubRx(_) | Setter::VfoB(_) | Setter::SubSpan(_) | Setter::SubRxInput(_) | Setter::SubReceiver(_)
+            Setter::SubRx(_)
+                | Setter::BandIndependent(_)
+                | Setter::VfoB(_)
+                | Setter::SubSpan(_)
+                | Setter::SubRxInput(_)
+                | Setter::SubReceiver(_)
         )
     }
 
@@ -540,7 +552,7 @@ fn setter_params_ok(prefix: &str, params: &str) -> bool {
         "#SPN" | "#SPN$" => (6_000..=368_000).contains(&n),
         "#FXT" => len == 1 && n <= 1,
         "AR" | "AR$" => len == 1 && rx_input_ok(n as u8),
-        "SB" => len == 1 && n <= 1,
+        "SB" | "BI" => len == 1 && n <= 1,
         // PAn (basic level) or PAnm (level, on/off).
         "PA" => (len == 1 && n <= 3) || (len == 2 && digit(0) <= 3 && digit(1) <= 1),
         // RA00 (basic off) or RAnnm (dB in 3 dB steps, on/off).
@@ -859,6 +871,8 @@ mod tests {
             Setter::Receiver(ReceiverSetter::PanAveraging(20)),
             Setter::SubRx(true),
             Setter::SubRx(false),
+            Setter::BandIndependent(false),
+            Setter::BandIndependent(true),
             Setter::VfoB(14_045_000),
             Setter::SubSpan(40_000),
             Setter::SubRxInput(RxInput::for_port(k4na_core::config::K4Port::RxAntIn1)),
@@ -964,7 +978,9 @@ mod tests {
             "FB0001400000;",
             "BN$05;",
             "BN$$05;",
-            "BI0;",
+            "BI2;",
+            "BI$0;",
+            "BI01;",
             "MD3;",
             "MD$3;",
             "PA4;",
@@ -976,7 +992,6 @@ mod tests {
             "SB$1;",
             "DV1;",
             "DV0;",
-            "BI1;",
             "FT1;",
             "FT0;",
             "RA1;",

@@ -26,8 +26,12 @@ for `k4na analyze pairs`. The shipped profile is
 - Diversity off (`DV0`): in diversity VFO A controls both receivers. The
   station was found with `DV1` during the hardware check; turn it off on
   the radio before a paired survey.
-- Band independence off (`BI0`), so VFO B follows the main band and the
-  collector never needs `BN$`.
+- VFO B on the main band, so the collector never needs `BN$`. With band
+  independence off (`BI0`) that always holds. Found `BI1` is accepted only
+  when the sub is already on the main band (`BN$` = `BN`, as on the K4D on
+  2026-10-29): the survey turns band independence off with `BI0` and puts
+  `BI1` back at the end, after the original band is back. With the sub on
+  another band it refuses.
 
 The sub receiver may be on or off; the survey turns it on (`SB1`) and puts
 back what it found. Preflight checks all of this with GET queries only and
@@ -91,9 +95,10 @@ the receivers are not comparable (unequal settings or one is limited by
 its own noise), and the antenna estimate is flagged.
 
 **Safety.** The sub-receiver setters are typed and range-checked like the
-main ones (`SB`, `FB`, `#SPN$`, `AR$`, `PA$`, `RA$`, `RG$`, `GT$`, `NB$`,
-`NR$`, `#NB$`) and need the control link's retune consent; `BN$`, `DV`,
-`BI`, `AN` and `FT` are read but never set. Their found values are
+main ones (`SB`, `BI`, `FB`, `#SPN$`, `AR$`, `PA$`, `RA$`, `RG$`, `GT$`,
+`NB$`, `NR$`, `#NB$`) and need the control link's retune consent; `BI` is
+only ever sent as `BI0` (found `BI1`) and `BI1` (putting it back). `BN$`,
+`DV`, `AN` and `FT` are read but never set. Their found values are
 journaled before the first change and put back the same way as the main
 receiver's (per band on band change, and at the end), only when they still
 hold a value the collector set; `k4na recovery` restores them after a

@@ -161,13 +161,17 @@ pub fn expected_readback(s: Setter) -> String {
 /// The whitelisted setter after which `q` reads back `raw` in `mode`, or
 /// `None` when the collector cannot produce that value.
 pub fn setter_for(q: Query, mode: MetaMode, raw: &str) -> Option<Setter> {
-    if q == Query::SubRx {
-        let s = match raw {
-            "0" => Setter::SubRx(false),
-            "1" => Setter::SubRx(true),
+    if q == Query::SubRx || q == Query::BandIndependent {
+        let on = match raw {
+            "0" => false,
+            "1" => true,
             _ => return None,
         };
-        return Some(s);
+        return Some(if q == Query::SubRx {
+            Setter::SubRx(on)
+        } else {
+            Setter::BandIndependent(on)
+        });
     }
     if let Some(main) = main_form(q) {
         // The sub receiver shares the main grammar with `$` setters.

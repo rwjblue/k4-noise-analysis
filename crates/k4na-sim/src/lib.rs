@@ -72,6 +72,9 @@ pub struct RadioModel {
     pub krx4: bool,
     /// Band independence (`BI`): off means VFO B follows the main band.
     pub band_independent: bool,
+    /// The sub band (`BN$`) while band independent; `None` = the main band.
+    /// `BI0` puts the sub back on the main band.
+    pub sub_bn: Option<u8>,
     /// Sub pan span (`#SPN$`) and sub-RX input (`AR$`).
     pub sub_span: u32,
     pub sub_input: u8,
@@ -353,6 +356,7 @@ impl Default for RadioModel {
             atu: true,
             krx4: true,
             band_independent: false,
+            sub_bn: None,
             sub_span: 40_000,
             sub_input: 4,
             sub: RxSettings::default(),
@@ -536,7 +540,7 @@ impl SimRadio {
             "K4" => format!("K4{}", flag(m.meta_advanced)),
             "OM" => format!("OM -P-{}----4---", if m.krx4 { 'S' } else { '-' }),
             "BI" => format!("BI{}", flag(m.band_independent)),
-            "BN$" => format!("BN${:02}", m.bn),
+            "BN$" => format!("BN${:02}", m.sub_bn.filter(|_| m.band_independent).unwrap_or(m.bn)),
             "#SPN$" => format!("#SPN${}", m.sub_span),
             "#REF$" => "#REF$-110".to_owned(),
             "#NB$" => format!("#NB${}", m.sub_pan_nb),
@@ -609,6 +613,14 @@ impl SimRadio {
                     }
                     return None;
                 }
+                if let Some(v) = cmd.strip_prefix("BI").and_then(|v| v.parse::<u8>().ok()) {
+                    if v <= 1 && !m.transmitting {
+                        m.band_independent = v == 1;
+                        // BI0 puts the sub on the main band; BI1 keeps it there.
+                        m.sub_bn = None;
+                    }
+                    return None;
+                }
                 if sub_input_setter {
                     let v: u8 = cmd[3..].parse().unwrap_or(0);
                     if !m.transmitting && m.krx4 && (m.atu || !(5..=7).contains(&v)) {
@@ -646,6 +658,10 @@ impl SimRadio {
                         m.band_fixed.insert(cur, fixed);
                         let new_input = m.band_rx_input.get(&v).copied().unwrap_or(m.rx_input);
                         m.switch_rx_context(v, new_input);
+                        if m.band_independent && m.sub_bn.is_none() {
+                            // The independent sub stays on its band.
+                            m.sub_bn = Some(cur);
+                        }
                         if !m.band_independent {
                             // VFO B follows the main band with its own memory.
                             let (fb, sub_span, sub_input) = (m.fb, m.sub_span, m.sub_input);

@@ -136,15 +136,21 @@ async fn survey_with(
     for s in radio.setters_received() {
         let rx_input = s.starts_with("AR") && cfg.collection.allow_rx_antenna_switch;
         let measuring = MEASUREMENT_SETTERS.iter().any(|p| s.starts_with(p));
-        let sub = cfg.collection.allow_sub_receiver && (s.starts_with("SB") || s.starts_with("FB"));
+        let sub = cfg.collection.allow_sub_receiver
+            && (s.starts_with("SB") || s.starts_with("FB") || s == "BI0;" || s == "BI1;");
         assert!(
             rx_input || measuring || sub || ALLOWED_SETTERS.iter().any(|p| s.starts_with(p)),
             "unexpected setter {s}"
         );
         assert!(!s.starts_with("AN"), "the TX antenna must never be set: {s}");
-        for p in ["BI", "DV", "FT", "BN$"] {
+        for p in ["DV", "FT", "BN$"] {
             assert!(!s.starts_with(p), "{p} must never be set: {s}");
         }
+        // Only a paired survey switches band independence (and back).
+        assert!(
+            !s.starts_with("BI") || cfg.collection.allow_sub_receiver,
+            "BI without sub consent: {s}"
+        );
     }
     Run {
         cfg,
@@ -706,6 +712,35 @@ async fn paired_visits_measure_both_antennas_at_once_and_put_the_sub_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_paired_survey_turns_band_independence_off_and_back_on() {
+    // As found on the K4D: BI1 with the sub on the main band.
+    let radio = paired_radio();
+    radio.update(|m| m.band_independent = true);
+    let before = radio.model();
+    let run = survey_with(
+        radio,
+        600,
+        None,
+        |root| paired_config(root, &fast(RX_VS_DXC_PAIRED)),
+        |_| {},
+    )
+    .await;
+    let r = &run.report;
+    assert_eq!(r.halt, "stop", "{r:?}");
+    assert!(r.restore.starts_with("restored"), "{}", r.restore);
+    assert!(r.pairs > 0 && r.cycles >= 2, "{r:?}");
+    let setters = run.radio.setters_received();
+    assert_eq!(setters.first().map(String::as_str), Some("BI0;"), "{setters:?}");
+    assert_eq!(setters.iter().filter(|s| s.starts_with("BI")).count(), 2, "{setters:?}");
+    let bi1 = setters.iter().position(|s| s == "BI1;").expect("BI1 put back");
+    let last_band = setters.iter().rposition(|s| s.starts_with("BN")).unwrap();
+    assert!(bi1 > last_band, "BI1 only after the original band is back: {setters:?}");
+    let m = run.radio.model();
+    assert!(m.band_independent && !m.sub_rx);
+    assert_eq!((m.fa, m.fb, m.bn), (before.fa, before.fb, before.bn));
+}
+
+#[tokio::test(start_paused = true)]
 async fn paired_preflight_refuses_without_krx4_band_independence_off_or_consent() {
     let dir = tempfile::tempdir().unwrap();
     let profile = fast(RX_VS_DXC_PAIRED);
@@ -715,7 +750,14 @@ async fn paired_preflight_refuses_without_krx4_band_independence_off_or_consent(
             true,
             "no KRX4",
         ),
-        (|m: &mut RadioModel| m.band_independent = true, true, "BI1"),
+        (
+            |m: &mut RadioModel| {
+                m.band_independent = true;
+                m.sub_bn = Some(m.bn + 1);
+            },
+            true,
+            "never sets BN$",
+        ),
         (|m: &mut RadioModel| m.split = true, true, "FT"),
         (|_: &mut RadioModel| {}, false, "allow_sub_receiver"),
     ] {
@@ -1103,6 +1145,8 @@ fn paired_recovery_radio() -> SimRadio {
     radio.update(|m| {
         m.fb = 14_060_000;
         m.sub = operator_rx();
+        // Found band independent (sub on the main band), as on the K4D.
+        m.band_independent = true;
     });
     radio
 }
@@ -1131,8 +1175,15 @@ async fn a_paired_survey_killed_at_any_point_is_recoverable() {
         assert_as_found(&radio, &before);
         let m = radio.model();
         assert_eq!(
-            (m.sub_rx, m.fb, m.sub_input, m.sub_span, m.sub),
-            (before.sub_rx, before.fb, before.sub_input, before.sub_span, before.sub),
+            (m.sub_rx, m.band_independent, m.fb, m.sub_input, m.sub_span, m.sub),
+            (
+                before.sub_rx,
+                before.band_independent,
+                before.fb,
+                before.sub_input,
+                before.sub_span,
+                before.sub
+            ),
             "{secs} s"
         );
         for band in [3, 5] {

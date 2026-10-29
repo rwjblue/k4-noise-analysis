@@ -90,7 +90,9 @@ pub fn fields(scope: &Scope) -> Vec<Query> {
         Scope::Session => vec![Query::Band],
         Scope::Band(_) => BAND_FIELDS.to_vec(),
         Scope::Context(..) => measure::KEYS.to_vec(),
-        Scope::SubSession => vec![Query::SubRx],
+        // BI was added with paired BI1 support; older journals captured
+        // SB alone and restore what they recorded.
+        Scope::SubSession => vec![Query::SubRx, Query::BandIndependent],
         Scope::SubBand(_) => SUB_BAND_FIELDS.to_vec(),
         Scope::SubContext(..) => measure::SUB_KEYS.to_vec(),
     }

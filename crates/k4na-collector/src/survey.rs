@@ -35,9 +35,10 @@
 //! * A paired profile (docs/paired.md, with `collection.allow_sub_receiver`)
 //!   also tunes the sub receiver to each tile (`SB1`, `FB`, `#SPN$`,
 //!   `AR$` and the `$` receiver settings) and records pans A and B over the
-//!   same dwell as two linked visits. It needs a KRX4, split, diversity and
-//!   band independence off (`BI0`, so VFO B follows the main band), and
-//!   watches and puts back the sub receiver like the main one.
+//!   same dwell as two linked visits. It needs a KRX4, split and diversity
+//!   off, and VFO B on the main band: found `BI1` (with `BN$` = `BN`) is
+//!   turned off with `BI0` and put back. It watches and puts back the sub
+//!   receiver like the main one.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -224,10 +225,21 @@ fn paired_problems(rb: &Readback, cfg: &Config) -> Vec<String> {
     }
     match rb.flag(Query::BandIndependent) {
         Some(false) => {}
-        Some(true) => p.push(
-            "band independence is on (BI1); a paired survey needs VFO B on the main band, so turn it off (BI0)"
-                .to_owned(),
-        ),
+        // The survey turns band independence off itself (journaled) and
+        // puts BI1 back at the end. That returns the found state only if
+        // the sub is already on the main band: BN$ is never set.
+        Some(true) => {
+            let band = |q| rb.raw(q).map(|b| measure::norm(Query::Band, b));
+            if band(Query::SubBand).is_none() || band(Query::SubBand) != band(Query::Band) {
+                p.push(format!(
+                    "band independence is on (BI1) with the sub on BN${} and the main on BN{}; a paired survey \
+                     needs VFO B on the main band and never sets BN$, so put the sub on the main band or turn \
+                     band independence off (BI0)",
+                    rb.raw(Query::SubBand).unwrap_or("?"),
+                    rb.raw(Query::Band).unwrap_or("?")
+                ));
+            }
+        }
         None => p.push("band independence (BI) is unreadable".to_owned()),
     }
     if rb.flag(Query::SubRx).is_none() {
@@ -514,7 +526,7 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                 Scope::Band(self.band_now()?)
             }
             Setter::Receiver(_) => Scope::Context(self.band_now()?, self.input_now()?),
-            Setter::SubRx(_) => Scope::SubSession,
+            Setter::SubRx(_) | Setter::BandIndependent(_) => Scope::SubSession,
             // BI0: VFO B is on the main band, so its memory is keyed by it.
             Setter::VfoB(_) | Setter::SubSpan(_) | Setter::SubRxInput(_) => Scope::SubBand(self.band_now()?),
             Setter::SubReceiver(_) => Scope::SubContext(self.band_now()?, self.sub_input_now()?),
@@ -649,6 +661,14 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
                     may_change.extend([Query::VfoB, Query::SubSpan, Query::SubRxAntenna]);
                     may_change.extend(measure::SUB_KEYS);
                     rb.flag(Query::SubRx) == Some(on)
+                }
+                Setter::BandIndependent(on) => {
+                    // With BI0 the sub follows the main band and may
+                    // recall that band's sub memory (unverified).
+                    may_change.extend([Query::BandIndependent, Query::SubBand]);
+                    may_change.extend([Query::VfoB, Query::SubSpan, Query::SubRxAntenna]);
+                    may_change.extend(measure::SUB_KEYS);
+                    rb.flag(Query::BandIndependent) == Some(on)
                 }
                 Setter::VfoB(hz) => {
                     may_change.push(Query::VfoB);
@@ -846,6 +866,19 @@ impl<S: SpectrumSource, C: CatControl> Survey<'_, S, C> {
     /// Turns the sub receiver on for a paired survey (journaled; put back
     /// at the end).
     async fn sub_on(&mut self) -> Step<()> {
+        // Preflight allowed BI1 only with the sub on the main band.
+        match self.baseline.flag(Query::BandIndependent) {
+            Some(false) => {}
+            Some(true) => {
+                self.apply(&[Setter::BandIndependent(false)], Purpose::Survey).await?;
+                self.record(self.event(
+                    EventKind::StateChanged,
+                    "turned band independence off with BI0 so VFO B follows the main band",
+                ))
+                .await?;
+            }
+            None => return Err(Halt::Conflict("band independence (BI) unreadable".into())),
+        }
         match self.baseline.flag(Query::SubRx) {
             Some(true) => Ok(()),
             Some(false) => {
